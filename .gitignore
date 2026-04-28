@@ -1,0 +1,36 @@
+# --- runtime artefacts ----------------------------------------------------
+workspace/
+*.sqlite
+*.sqlite-journal
+*.log
+
+# --- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- virtualenvs ----------------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- editors / OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- secrets --------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+config.local.yaml

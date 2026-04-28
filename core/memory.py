@@ -1,0 +1,205 @@
+"""Persistent memory layer.
+
+Stores findings, payload effectiveness scores, and per-target intelligence so
+SamaritanX can learn across runs. SQLite is used so there are no external
+dependencies and a single .sqlite file is portable across hosts.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS targets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug        TEXT UNIQUE NOT NULL,
+    root        TEXT NOT NULL,
+    first_seen  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    metadata    TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target      TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    cvss        REAL NOT NULL DEFAULT 0,
+    url         TEXT,
+    parameter   TEXT,
+    payload     TEXT,
+    evidence    TEXT,
+    request     TEXT,
+    response    TEXT,
+    discovered  INTEGER NOT NULL,
+    metadata    TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_target ON findings(target);
+CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);
+
+CREATE TABLE IF NOT EXISTS payload_stats (
+    payload     TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    hits        INTEGER NOT NULL DEFAULT 0,
+    misses      INTEGER NOT NULL DEFAULT 0,
+    last_used   INTEGER NOT NULL,
+    PRIMARY KEY (payload, category)
+);
+
+CREATE TABLE IF NOT EXISTS assets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    discovered  INTEGER NOT NULL,
+    UNIQUE (target, kind, value)
+);
+"""
+
+
+class Memory:
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._connect() as conn:
+            conn.executescript(SCHEMA)
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    # ---------- targets ----------
+    def upsert_target(self, slug: str, root: str, metadata: dict[str, Any] | None = None) -> None:
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO targets (slug, root, first_seen, last_seen, metadata)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(slug) DO UPDATE SET last_seen=excluded.last_seen,
+                                                metadata=excluded.metadata
+                """,
+                (slug, root, now, now, json.dumps(metadata or {})),
+            )
+
+    # ---------- findings ----------
+    def record_finding(self, finding: dict[str, Any]) -> int:
+        finding = dict(finding)
+        finding.setdefault("discovered", int(time.time()))
+        finding.setdefault("metadata", {})
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO findings
+                    (target, category, title, severity, cvss, url, parameter,
+                     payload, evidence, request, response, discovered, metadata)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    finding["target"],
+                    finding["category"],
+                    finding["title"],
+                    finding.get("severity", "info"),
+                    float(finding.get("cvss", 0)),
+                    finding.get("url"),
+                    finding.get("parameter"),
+                    finding.get("payload"),
+                    finding.get("evidence"),
+                    finding.get("request"),
+                    finding.get("response"),
+                    finding["discovered"],
+                    json.dumps(finding.get("metadata") or {}),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_findings(self, target: str | None = None) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            if target:
+                rows = conn.execute(
+                    "SELECT * FROM findings WHERE target=? ORDER BY discovered DESC",
+                    (target,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM findings ORDER BY discovered DESC").fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["metadata"] = json.loads(d["metadata"] or "{}")
+                out.append(d)
+            return out
+
+    # ---------- assets ----------
+    def add_asset(self, target: str, kind: str, value: str, metadata: dict | None = None) -> bool:
+        with self._lock, self._connect() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO assets (target, kind, value, metadata, discovered) VALUES (?,?,?,?,?)",
+                    (target, kind, value, json.dumps(metadata or {}), int(time.time())),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def list_assets(self, target: str, kind: str | None = None) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            q = "SELECT * FROM assets WHERE target=?"
+            args: tuple = (target,)
+            if kind:
+                q += " AND kind=?"
+                args = (target, kind)
+            rows = conn.execute(q + " ORDER BY discovered DESC", args).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- payload learning ----------
+    def record_payload_result(self, payload: str, category: str, hit: bool) -> None:
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO payload_stats (payload, category, hits, misses, last_used)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(payload, category) DO UPDATE SET
+                    hits = hits + excluded.hits,
+                    misses = misses + excluded.misses,
+                    last_used = excluded.last_used
+                """,
+                (payload, category, 1 if hit else 0, 0 if hit else 1, now),
+            )
+
+    def best_payloads(self, category: str, limit: int = 25) -> list[str]:
+        """Return payloads sorted by hit-rate (Wilson lower bound) for a category."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload, hits, misses FROM payload_stats WHERE category=?",
+                (category,),
+            ).fetchall()
+        scored = []
+        for r in rows:
+            n = r["hits"] + r["misses"]
+            if n == 0:
+                continue
+            p = r["hits"] / n
+            # Wilson score interval lower bound (z=1.96)
+            z = 1.96
+            denom = 1 + z * z / n
+            centre = (p + z * z / (2 * n)) / denom
+            margin = (z * ((p * (1 - p) + z * z / (4 * n)) / n) ** 0.5) / denom
+            scored.append((centre - margin, r["payload"]))
+        scored.sort(reverse=True)
+        return [p for _, p in scored[:limit]]

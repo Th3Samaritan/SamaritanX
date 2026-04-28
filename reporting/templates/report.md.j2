@@ -1,0 +1,100 @@
+# SamaritanX — Bug Bounty Report
+**Target:** `{{ target }}`
+**Operator:** {{ operator }}
+**Date:** {{ generated_at }}
+**Findings:** {{ findings|length }}  ({{ severity_counts.critical }} critical, {{ severity_counts.high }} high, {{ severity_counts.medium }} medium, {{ severity_counts.low }} low, {{ severity_counts.info }} info)
+
+---
+
+## Executive summary
+
+{{ executive_summary }}
+
+{% if chains %}
+### Vulnerability chains identified
+{% for c in chains %}
+- **{{ c.categories|join(' + ') }}** — {{ c.narrative }}
+{% endfor %}
+{% endif %}
+
+### Top 10 priority findings
+| # | Severity | CVSS | Category | Title |
+|---|----------|------|----------|-------|
+{% for f in priority[:10] %}
+| {{ loop.index }} | {{ f.severity|upper }} | {{ "%.1f"|format(f.cvss) }} | {{ f.category }} | {{ f.title }} |
+{% endfor %}
+
+---
+
+## Detailed findings
+
+{% for f in findings %}
+### {{ loop.index }}. {{ f.title }}
+
+- **Severity:** `{{ f.severity|upper }}`  (CVSS {{ "%.1f"|format(f.cvss) }})
+- **Category:** `{{ f.category }}`
+- **URL:** `{{ f.url or "—" }}`
+{% if f.parameter %}- **Parameter:** `{{ f.parameter }}`{% endif %}
+
+#### Steps to reproduce
+{% if f.playbook %}
+{% for step in f.playbook %}
+{{ step }}
+{% endfor %}
+{% else %}
+1. Re-issue the recorded request below in Burp / curl.
+2. Confirm the response indicator described under *Evidence*.
+{% endif %}
+
+#### Proof of Concept
+**Payload**
+```
+{{ f.payload or "—" }}
+```
+
+**Request**
+```http
+{{ f.request or "—" }}
+```
+
+**Response (truncated)**
+```
+{{ (f.response or "—")[:1200] }}
+```
+
+#### Evidence
+{{ f.evidence or "Recorded above." }}
+
+#### Impact
+{{ f.impact }}
+
+#### Remediation
+{{ f.remediation }}
+
+{% if walkthrough and f.walkthrough %}
+#### Walkthrough — what happened, why, and how it was found
+{{ f.walkthrough }}
+{% endif %}
+
+---
+{% endfor %}
+
+## Appendix A — Methodology
+
+SamaritanX (operator: `{{ operator }}`) ran an agentic pipeline against the target:
+
+1. **Recon Agent** — passive sources (crt.sh, certspotter, hackertarget) plus subfinder / amass when present, DNS brute force, and live HTTP probing with tech fingerprinting.
+2. **Crawler Agent** — depth-bounded HTML walk, headless JS render, GraphQL introspection probe, secret regex sweep.
+3. **Vulnerability Agent** — fan-out to {{ scanner_count }} scanners (SQLi, XSS, SSRF, IDOR, CSRF, upload, open-redirect, CORS, cache poisoning, RCE/SSTI, API top-10, prompt injection) plus an optional nuclei sweep.
+4. **Logic Agent** — sensitive path enumeration, anonymous admin checks, pricing tampering, race-condition probes.
+5. **Exploit Agent** — per-finding playbook + chain detection.
+6. **Reporting Agent** — this document.
+
+Stealth: rate-limited at {{ rate_limit }} req/s globally, per-host capped, jittered, randomized user-agents{% if proxy %} via `{{ proxy }}`{% endif %}.
+
+## Appendix B — Asset inventory
+
+- Subdomains discovered: {{ counters.subdomains }}
+- Endpoints crawled: {{ counters.endpoints }}
+- Parameters extracted: {{ counters.params }}
+- Total HTTP requests: {{ counters.requests }}

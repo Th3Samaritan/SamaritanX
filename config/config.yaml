@@ -1,0 +1,108 @@
+# =====================================================================
+# SamaritanX — default configuration
+# Override at runtime via CLI flags or a custom --config file.
+# =====================================================================
+
+operator:
+  handle: th3Samaritan
+  contact: ai@technoguard.tech
+
+workspace:
+  root: ./workspace            # all per-target output goes here
+  keep_raw_tool_output: true
+
+http:
+  user_agents:
+    - "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15"
+  timeout: 20
+  max_redirects: 5
+  verify_tls: false
+  default_headers:
+    Accept: "*/*"
+    Accept-Language: "en-US,en;q=0.9"
+
+stealth:
+  enabled: true
+  rate_limit_rps: 6              # global cap (requests/second)
+  per_host_rps: 2                # per-host cap
+  jitter_ms: [80, 350]           # random delay between requests
+  rotate_user_agent: true
+  rotate_referer: true
+
+proxy:
+  enabled: false
+  url: ""                        # e.g. socks5h://127.0.0.1:9050 for Tor
+  tor: false                     # convenience flag — uses 127.0.0.1:9050
+
+waf_evasion:
+  enabled: true
+  techniques:
+    - case_swap
+    - comment_injection
+    - unicode_encoding
+    - double_url_encoding
+    - parameter_pollution
+    - chunked_transfer
+
+concurrency:
+  recon_workers: 8
+  crawler_workers: 4
+  scanner_workers: 12
+  browser_contexts: 2
+
+recon:
+  passive_only: false
+  subfinder: true
+  amass: true
+  amass_timeout: 600
+  resolve_dns: true
+  port_scan: false              # toggle on for in-scope authorized targets
+  tech_fingerprint: true
+
+crawler:
+  max_depth: 3
+  max_urls_per_host: 1500
+  parse_javascript: true
+  follow_subdomains: true
+  honor_robots: false           # bug bounty hunters typically ignore robots
+  extract_secrets: true
+
+scanners:
+  enabled:
+    - sqli
+    - xss
+    - ssrf
+    - idor
+    - csrf
+    - upload
+    - open_redirect
+    - cors
+    - cache_poisoning
+    - rce
+    - api
+    - prompt_injection
+  nuclei: true
+  nuclei_severity: "low,medium,high,critical"
+
+logic_analysis:
+  enabled: true
+  test_auth_flows: true
+  test_idor: true
+  test_privilege_escalation: true
+
+reporting:
+  format: ["markdown", "pdf"]
+  include_walkthrough: true
+  cvss_baseline: 5.0
+
+memory:
+  db_path: ./workspace/.samaritanx.sqlite
+  remember_payloads: true
+  remember_findings: true
+
+llm:
+  enabled: false                # toggle for AI-assisted reasoning
+  provider: "anthropic"         # anthropic | openai
+  model: "claude-opus-4-7"

@@ -1,0 +1,38 @@
+# SamaritanX — Agentic Bug Bounty Framework
+# Python >= 3.10
+
+# HTTP / async networking
+httpx[http2,socks]>=0.27.0
+aiohttp>=3.9.0
+requests>=2.31.0
+urllib3>=2.0.0
+
+# Headless browser
+playwright>=1.44.0
+
+# DNS / recon helpers
+dnspython>=2.6.0
+tldextract>=5.1.0
+
+# HTML / parsing
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+jsbeautifier>=1.15.0
+
+# CLI / dashboard
+rich>=13.7.0
+typer>=0.12.0
+pyfiglet>=1.0.2
+
+# Reporting
+jinja2>=3.1.0
+markdown>=3.6
+weasyprint>=61.0          # PDF rendering (HTML -> PDF)
+
+# Storage / data
+pyyaml>=6.0
+sqlalchemy>=2.0.0
+
+# Optional LLM reasoning layer
+anthropic>=0.39.0
+openai>=1.30.0

