@@ -39,13 +39,18 @@ Each layer of work is isolated as an asynchronous agent that consumes and produc
 | Layer | What it does |
 | ----- | ------------ |
 | **Recon** | subfinder, amass-passive, crt.sh / certspotter / hackertarget, DNS brute force, live HTTP probe with tech fingerprint |
+| **Discovery** | content discovery (ffuf or async wordlist), Wayback / URLScan / OTX historical URLs, JS LinkFinder regex sweep, OpenAPI/Swagger ingestion (auto-emits scan tasks per operation), cloud-bucket enumeration (S3/GCS/Azure), GitHub dorks |
 | **Crawler** | depth-bounded BFS, Playwright-driven JS render, GraphQL `__schema` probe, 13 secret regex rules |
-| **Vuln scanners** | SQLi (error/boolean/time), XSS, SSRF (incl. cloud metadata), IDOR, CSRF, Insecure Upload, Open Redirect, CORS, Cache Poisoning, RCE + SSTI, **API Top-10** (BOLA/Mass-assign/JWT/rate-limit/excessive exposure), **LLM prompt injection**, optional `nuclei` sweep |
+| **Authentication** | static / form-login / bearer-from-JSON recipes, env-var expansion for credentials, periodic token refresh, **second-session** mode for cross-tenant BOLA testing |
+| **Scope enforcement** | allow/deny rules (glob, regex, CIDR) checked at the HTTP boundary — every out-of-scope request is dropped before egress |
+| **Vuln scanners** | SQLi (error/boolean/time), reflected XSS, **DOM XSS via Playwright** (real browser sink hooks), SSRF (cloud metadata + **interactsh OOB**), IDOR (heuristic) + **deep IDOR/BOLA** with second session, CSRF, **hardened upload** (.phtml / .phar / .htaccess / double-extension / null-byte / GIF polyglot), Open Redirect, CORS, Cache Poisoning, RCE + SSTI (in-band, time-based, **OOB**), **HTTP request smuggling** (CL.TE / TE.CL via raw socket), **WebSocket CSWH**, API Top-10 (BOLA / Mass-assign / JWT / rate-limit / excessive exposure), LLM prompt injection, optional `nuclei` sweep |
+| **Subdomain takeover** | 25-service CNAME fingerprint sweep across every collected host |
+| **OOB collaborator** | interactsh client (RSA / AES decrypt of polled events) — proves blind SSRF / RCE / DNSlog with attributable callbacks |
 | **Logic** | sensitive-path enumeration, anonymous admin probe, pricing tampering, race-condition probe |
-| **Exploit** | per-finding playbook, chain detection (e.g. SSRF→IMDS, prompt-injection→tool-call SSRF, upload→RCE) |
-| **Reporting** | Markdown + PDF (weasyprint) with executive summary, top-10 priority table, per-finding PoC + impact + remediation, and a long-form **walkthrough** explaining what/why/how |
-| **Memory** | SQLite store of findings + payload effectiveness; payloads are re-ranked by Wilson-bound hit rate across runs |
-| **Stealth** | global + per-host token-bucket rate limit, jitter, UA / Referer rotation, optional Tor or HTTP/SOCKS proxy, six WAF evasion transforms |
+| **Exploit** | per-finding playbook, 8 chain rules (SSRF→IMDS, prompt-injection→tool-call SSRF, upload→RCE, IDOR+mass-assign, etc.) |
+| **Reporting** | Markdown + PDF (weasyprint) with executive summary, top-10 priority table, per-finding PoC + impact + remediation + walkthrough, **plus per-finding HackerOne-style submissions ready to paste**, plus **Playwright PoC screenshots** |
+| **Memory** | SQLite store of findings (deduplicated by stable fingerprint) + payload effectiveness re-ranked by Wilson lower-bound + scan-resume cursors |
+| **Stealth** | global + per-host token-bucket rate limit, **reactive 429/503 backoff with Retry-After**, jitter, UA / Referer rotation, Tor or HTTP/SOCKS proxy, six WAF evasion transforms |
 
 ## Project layout
 
@@ -111,26 +116,69 @@ python samaritanx.py self-check
 ## Usage
 
 ```bash
-# full scan with default config
+# full scan with auto-derived scope (target's apex + all subs)
 python samaritanx.py scan example.com
 
-# pipe everything through Tor, deeper crawl, no PDF
+# real bug bounty workflow: explicit scope + authenticated session
+export TARGET_USER=alice && export TARGET_PASS=hunter2
+python samaritanx.py scan example.com \
+    --scope config/scope.example.txt \
+    --auth  config/auth.example.yaml
+
+# cross-tenant BOLA / IDOR with two identities
+export TARGET_USER=alice TARGET_PASS=... ; export USER2=bob USER2_PASS=...
+python samaritanx.py scan example.com --auth alice.yaml --second-session bob.yaml
+
+# pipe through Tor, deeper crawl, skip PDF
 python samaritanx.py scan https://api.example.com --tor --depth 5 --no-pdf
 
-# subset of scanners, custom proxy (e.g. Burp on 8080)
+# subset of scanners, Burp proxy
 python samaritanx.py scan example.com \
-    --only sqli,rce,prompt_injection,api \
+    --only sqli,rce,prompt_injection,api,smuggling \
     --proxy http://127.0.0.1:8080 --rate 2
 
-# passive recon only (no DNS brute force, no httpx probes)
-python samaritanx.py scan example.com --passive
+# passive recon only, no OOB callback host (offline-friendly)
+python samaritanx.py scan example.com --passive --no-oob
 
-# rebuild the report later from memory (no network calls)
+# resume a long scan that was interrupted
+python samaritanx.py scan example.com --resume
+
+# rebuild reports later from memory (no network calls)
 python samaritanx.py report example.com
 
-# inspect findings table in terminal
+# inspect findings + reset scan state
 python samaritanx.py memory list example.com
+python samaritanx.py memory reset example.com
 ```
+
+## Auth recipes
+
+`config/auth.example.yaml` ships with three template shapes — `static`,
+`form`, `bearer_json`. Pick one, fill it in, point `--auth` at it. The
+HTTP client attaches the resulting cookies + headers to every request and
+periodically re-runs the login flow when `refresh_every` elapses.
+
+Credentials use `{ENV:VAR_NAME}` expansion so secrets never sit in the
+repo. For BOLA testing, supply a second recipe via `--second-session` —
+the deep IDOR scanner will replay every recorded request with that
+identity and report any responses where session B sees session A's data.
+
+## Scope file
+
+`config/scope.example.txt` — one rule per line:
+
+```
+*.example.com           # allow glob
+api.example.com         # exact
+!corp.example.com       # deny (deny rules win)
+re:^https://x\.example\.com/admin/    # regex against full URL
+!cidr:10.0.0.0/8        # deny CIDR (host resolved at request time)
+```
+
+Every outbound URL is checked against the policy before the request
+leaves the box. Out-of-scope requests are dropped, counted on the
+dashboard, and surface in the run summary. **Use this on every real bug
+bounty engagement.**
 
 ## Walkthrough mode
 

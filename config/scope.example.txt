@@ -1,0 +1,21 @@
+# =====================================================================
+# SamaritanX scope file. One rule per line.
+#   *.example.com         allow glob match against host
+#   api.example.com       exact host
+#   !beta.example.com     deny rule (evaluated before allow rules)
+#   re:^https://x\.example\.com/admin/   regex against full URL
+#   cidr:10.0.0.0/8       deny / allow by CIDR (host is resolved)
+# =====================================================================
+
+*.example.com
+example.com
+
+# explicit deny — never touch these even if they match the glob above
+!corp.example.com
+!internal.example.com
+
+# never resolve to RFC1918 — defence-in-depth
+!cidr:10.0.0.0/8
+!cidr:192.168.0.0/16
+!cidr:172.16.0.0/12
+!cidr:127.0.0.0/8

@@ -1,11 +1,13 @@
 """Persistent memory layer.
 
-Stores findings, payload effectiveness scores, and per-target intelligence so
-SamaritanX can learn across runs. SQLite is used so there are no external
-dependencies and a single .sqlite file is portable across hosts.
+Stores findings, payload effectiveness scores, scan-resume cursors, and
+per-target intelligence so SamaritanX can learn — and resume — across runs.
+SQLite is used so there are no external dependencies and a single .sqlite
+file is portable across hosts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -13,6 +15,19 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+
+def _fingerprint(finding: dict[str, Any]) -> str:
+    """Stable hash so the same bug isn't recorded twice on re-runs."""
+    parts = [
+        finding.get("target") or "",
+        finding.get("category") or "",
+        finding.get("url") or "",
+        finding.get("parameter") or "",
+        # title strips dynamic tokens by trimming after last colon/space digit
+        (finding.get("title") or "").lower(),
+    ]
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
 
 
 SCHEMA = """
@@ -39,11 +54,21 @@ CREATE TABLE IF NOT EXISTS findings (
     request     TEXT,
     response    TEXT,
     discovered  INTEGER NOT NULL,
+    fingerprint TEXT,
     metadata    TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_target ON findings(target);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_fingerprint
+    ON findings(target, fingerprint) WHERE fingerprint IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS scan_state (
+    target      TEXT PRIMARY KEY,
+    cursor      TEXT NOT NULL DEFAULT '{}',
+    completed   TEXT NOT NULL DEFAULT '[]',
+    updated     INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS payload_stats (
     payload     TEXT NOT NULL,
@@ -99,16 +124,26 @@ class Memory:
 
     # ---------- findings ----------
     def record_finding(self, finding: dict[str, Any]) -> int:
+        """Insert a finding, deduplicated on (target, fingerprint).
+        Returns existing row id if the same finding was already recorded."""
         finding = dict(finding)
         finding.setdefault("discovered", int(time.time()))
         finding.setdefault("metadata", {})
+        fp = _fingerprint(finding)
         with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM findings WHERE target=? AND fingerprint=?",
+                (finding["target"], fp),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
             cur = conn.execute(
                 """
                 INSERT INTO findings
                     (target, category, title, severity, cvss, url, parameter,
-                     payload, evidence, request, response, discovered, metadata)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     payload, evidence, request, response, discovered,
+                     fingerprint, metadata)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     finding["target"],
@@ -123,10 +158,54 @@ class Memory:
                     finding.get("request"),
                     finding.get("response"),
                     finding["discovered"],
+                    fp,
                     json.dumps(finding.get("metadata") or {}),
                 ),
             )
             return int(cur.lastrowid)
+
+    def has_finding(self, target: str, finding: dict[str, Any]) -> bool:
+        fp = _fingerprint({**finding, "target": target})
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM findings WHERE target=? AND fingerprint=?",
+                (target, fp),
+            ).fetchone()
+            return bool(row)
+
+    # ---------- resume support ----------
+    def mark_completed(self, target: str, key: str) -> None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT completed FROM scan_state WHERE target=?", (target,),
+            ).fetchone()
+            done = json.loads(row["completed"]) if row else []
+            if key not in done:
+                done.append(key)
+            if row:
+                conn.execute(
+                    "UPDATE scan_state SET completed=?, updated=? WHERE target=?",
+                    (json.dumps(done), int(time.time()), target),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO scan_state (target, cursor, completed, updated) "
+                    "VALUES (?,?,?,?)",
+                    (target, "{}", json.dumps(done), int(time.time())),
+                )
+
+    def is_completed(self, target: str, key: str) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT completed FROM scan_state WHERE target=?", (target,),
+            ).fetchone()
+            if not row:
+                return False
+            return key in json.loads(row["completed"])
+
+    def reset_scan_state(self, target: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM scan_state WHERE target=?", (target,))
 
     def list_findings(self, target: str | None = None) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:

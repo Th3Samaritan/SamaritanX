@@ -1,4 +1,5 @@
-"""ReportingAgent — assembles the final Markdown + PDF deliverables."""
+"""ReportingAgent — assembles the final Markdown + PDF deliverables and
+emits per-finding HackerOne-style submissions ready to paste."""
 from __future__ import annotations
 
 import json
@@ -6,7 +7,7 @@ from collections import Counter
 from typing import TYPE_CHECKING
 
 from core.task_queue import Task
-from reporting.markdown_report import render_markdown
+from reporting.markdown_report import render_markdown, render_hackerone
 from reporting.pdf_report import render_pdf
 from . import walkthrough_agent
 from .base import BaseAgent
@@ -103,3 +104,13 @@ class ReportingAgent(BaseAgent):
         # also drop a machine-readable bundle
         (ctx.workspace / "reports" / "findings.json").write_text(
             json.dumps(findings, indent=2, default=str), encoding="utf-8")
+
+        # per-finding HackerOne submissions
+        h1_dir = ctx.workspace / "reports" / "hackerone"
+        h1_dir.mkdir(parents=True, exist_ok=True)
+        operator = ctx.config.get("operator", {}).get("handle", "th3Samaritan")
+        for f in findings:
+            md = render_hackerone(f, operator)
+            slug = f"{f['id']:04d}_{f['category']}_{(f.get('severity') or 'info')}.md"
+            (h1_dir / slug).write_text(md, encoding="utf-8")
+        ctx.dashboard.event("ok", f"report: {len(findings)} HackerOne submissions -> {h1_dir}")

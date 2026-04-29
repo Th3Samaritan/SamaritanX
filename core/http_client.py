@@ -1,11 +1,16 @@
 """Stealth-aware async HTTP client.
 
 Wraps httpx.AsyncClient with:
+    * scope enforcement (request blocked before egress if out of scope)
+    * session injection (cookies + headers from SessionStore)
     * global + per-host token bucket rate limiting
+    * reactive backoff on 429 / 503 (Retry-After honored, host bucket
+      temporarily slowed for the duration)
     * randomized User-Agent / Referer rotation
     * configurable jitter to mimic human cadence
     * proxy / Tor (socks5h://127.0.0.1:9050) support
     * detailed request/response capture for evidence in reports
+    * request counter wired to Dashboard
 """
 from __future__ import annotations
 
@@ -14,12 +19,16 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 
 from .logger import get_logger
+
+if TYPE_CHECKING:
+    from .auth import SessionStore
+    from .scope import ScopePolicy
 
 log = get_logger("http")
 
@@ -55,14 +64,24 @@ class HttpEvidence:
 class _TokenBucket:
     def __init__(self, rate: float, capacity: float | None = None) -> None:
         self.rate = max(rate, 0.1)
+        self.base_rate = self.rate
         self.capacity = capacity if capacity is not None else max(self.rate, 1.0)
         self.tokens = self.capacity
         self.last = time.monotonic()
+        self.cooldown_until = 0.0
         self._lock = asyncio.Lock()
+
+    def slow_down(self, seconds: float, factor: float = 0.25) -> None:
+        """React to rate-limit responses by halving (default x0.25) the effective rate
+        until `seconds` elapse."""
+        self.cooldown_until = time.monotonic() + seconds
+        self.rate = max(0.1, self.base_rate * factor)
 
     async def take(self) -> None:
         async with self._lock:
             now = time.monotonic()
+            if now > self.cooldown_until and self.rate != self.base_rate:
+                self.rate = self.base_rate
             self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
             self.last = now
             if self.tokens < 1:
@@ -116,6 +135,13 @@ class StealthHttpClient:
             http2=True,
         )
 
+        # injected by orchestrator after construction
+        self.session: "SessionStore | None" = None
+        self.scope: "ScopePolicy | None" = None
+        self.dashboard = None  # set by orchestrator
+        self.request_count = 0
+        self.scoped_out = 0
+
     async def __aenter__(self) -> "StealthHttpClient":
         return self
 
@@ -125,15 +151,34 @@ class StealthHttpClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    def attach(self, *, session=None, scope=None, dashboard=None) -> None:
+        if session is not None:
+            self.session = session
+        if scope is not None:
+            self.scope = scope
+        if dashboard is not None:
+            self.dashboard = dashboard
+
     def _build_headers(self, extra: dict[str, str] | None, target_host: str) -> dict[str, str]:
         h = dict(self.default_headers)
         if self.rotate_ua:
             h["User-Agent"] = random.choice(self.user_agents)
         if self.rotate_referer:
             h.setdefault("Referer", f"https://{target_host}/")
+        # session-attached headers (auth, tenant, etc.)
+        if self.session and self.session.headers:
+            h.update(self.session.headers)
         if extra:
             h.update(extra)
         return h
+
+    def _cookies(self, extra: dict[str, str] | None) -> dict[str, str]:
+        c: dict[str, str] = {}
+        if self.session and self.session.cookies:
+            c.update(self.session.cookies)
+        if extra:
+            c.update(extra)
+        return c
 
     async def _stealth_pause(self, host: str) -> None:
         if not self.stealth_enabled:
@@ -155,10 +200,35 @@ class StealthHttpClient:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         allow_redirects: bool = True,
+        bypass_scope: bool = False,
     ) -> HttpEvidence:
+        # 1) scope check
+        if self.scope and not bypass_scope:
+            ok, reason = self.scope.allows(url)
+            if not ok:
+                self.scoped_out += 1
+                if self.dashboard:
+                    self.dashboard.event("info", f"scope-block: {url} ({reason})")
+                return HttpEvidence(
+                    method=method.upper(), url=url, request_headers={},
+                    request_body=None, status=0, response_headers={},
+                    response_body="", elapsed_ms=0.0,
+                    error=f"scope-block: {reason}",
+                )
+
+        # 2) refresh session if needed
+        if self.session:
+            try:
+                await self.session.maybe_refresh()
+            except Exception as exc:
+                if self.dashboard:
+                    self.dashboard.event("err", f"auth refresh failed: {exc}")
+
         host = urlparse(url).netloc or "unknown"
         await self._stealth_pause(host)
         hdrs = self._build_headers(headers, host)
+        cookies = self._cookies(cookies)
+
         start = time.perf_counter()
         try:
             resp = await self._client.request(
@@ -176,6 +246,25 @@ class StealthHttpClient:
                 body = resp.text
             except Exception:
                 body = ""
+            self.request_count += 1
+            if self.dashboard:
+                self.dashboard.add_count("requests")
+
+            # 3) reactive backoff on 429 / 503
+            if resp.status_code in (429, 503):
+                retry = resp.headers.get("retry-after")
+                wait = 30.0
+                if retry:
+                    try:
+                        wait = float(retry)
+                    except ValueError:
+                        wait = 30.0
+                wait = min(wait, 120.0)
+                self._host_buckets[host].slow_down(wait, factor=0.2)
+                if self.dashboard:
+                    self.dashboard.event("info",
+                        f"backoff: host={host} status={resp.status_code} cooldown={wait:.0f}s")
+
             return HttpEvidence(
                 method=method.upper(),
                 url=str(resp.url),

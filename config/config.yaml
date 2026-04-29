@@ -73,8 +73,10 @@ scanners:
   enabled:
     - sqli
     - xss
+    - dom_xss
     - ssrf
     - idor
+    - idor_deep            # only fires when --second-session is set
     - csrf
     - upload
     - open_redirect
@@ -83,8 +85,23 @@ scanners:
     - rce
     - api
     - prompt_injection
+    - smuggling
+    - websocket
   nuclei: true
   nuclei_severity: "low,medium,high,critical"
+
+oob:
+  prefer_local: false       # set true to skip interactsh handshake
+  server: oast.fun
+  local_server: oob.local.invalid
+
+discovery:
+  enabled: true
+  ffuf: true                # use ffuf if installed
+  wayback: true
+  cloud_buckets: true
+  github_dorks: true
+  openapi: true
 
 logic_analysis:
   enabled: true

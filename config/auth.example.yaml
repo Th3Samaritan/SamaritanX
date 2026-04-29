@@ -1,0 +1,41 @@
+# =====================================================================
+# SamaritanX — example auth recipe
+# Pass with:  --auth config/auth.example.yaml
+# Set credentials via env vars first:
+#     export TARGET_USER=alice
+#     export TARGET_PASS=hunter2
+# =====================================================================
+
+# ---------- option 1: static cookies / headers (no login flow) -----------
+# type: static
+# label: alice-static
+# cookies:
+#   session: abc123
+# headers:
+#   Authorization: "Bearer eyJhbGciOi..."
+#   X-Tenant: acme
+
+# ---------- option 2: form login -----------------------------------------
+type: form
+label: alice
+login_url: https://example.com/login
+method: POST
+fields:
+  username: "{ENV:TARGET_USER}"
+  password: "{ENV:TARGET_PASS}"
+success_indicator: "Logout"     # text that proves login worked
+refresh_every: 1800             # re-login every 30 minutes
+extra_headers:
+  X-Tenant: acme
+
+# ---------- option 3: JSON login -> bearer token -------------------------
+# type: bearer_json
+# label: alice-bearer
+# login_url: https://example.com/api/auth
+# json:
+#   email: "{ENV:TARGET_USER}"
+#   password: "{ENV:TARGET_PASS}"
+# token_path: data.access_token
+# header: Authorization
+# header_template: "Bearer {token}"
+# refresh_every: 3300

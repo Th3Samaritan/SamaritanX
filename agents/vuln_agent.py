@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from core.task_queue import Task
 from core.utils import host_of
 from scanners import REGISTRY
+from scanners.subdomain_takeover import scan_takeover
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -23,13 +24,17 @@ if TYPE_CHECKING:
 
 class VulnerabilityAgent(BaseAgent):
     name = "vuln"
-    handles = ("scan", "scan.graphql")
+    handles = ("scan", "scan.graphql", "scan.takeover")
 
     def __init__(self) -> None:
         super().__init__()
         self._nuclei_done: set[str] = set()
 
     async def handle(self, task: Task, ctx: "Context") -> None:
+        if task.kind == "scan.takeover":
+            await scan_takeover(ctx, task)
+            return
+
         url = task.payload["url"]
         params = task.payload.get("params", []) or []
         method = task.payload.get("method", "GET")
@@ -38,7 +43,6 @@ class VulnerabilityAgent(BaseAgent):
         enabled = ctx.config.get("scanners", {}).get("enabled", [])
         runners = [(name, REGISTRY[name]) for name in enabled if name in REGISTRY]
         if task.kind == "scan.graphql":
-            # GraphQL gets a focused subset
             runners = [(n, f) for n, f in runners if n in ("api", "sqli", "rce", "prompt_injection")]
 
         results = await asyncio.gather(

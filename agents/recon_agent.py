@@ -71,6 +71,13 @@ class ReconAgent(BaseAgent):
         for host in subs:
             if ctx.memory.add_asset(ctx.target_slug, "subdomain", host):
                 ctx.dashboard.add_count("subdomains")
+
+        # subdomain takeover scan against all collected hosts
+        await ctx.queue.put(
+            "scan.takeover", {"hosts": sorted(subs)},
+            target=ctx.target_slug, priority=2, producer=self.name,
+        )
+
         for entry in live:
             ctx.memory.add_asset(ctx.target_slug, "endpoint", entry["url"], metadata=entry)
             await ctx.queue.put(
@@ -80,7 +87,12 @@ class ReconAgent(BaseAgent):
                 priority=3,
                 producer=self.name,
             )
-        ctx.dashboard.event("ok", f"recon: emitted {len(live)} live endpoints to crawler")
+            await ctx.queue.put(
+                "discover",
+                {"host": entry["host"], "base": entry["url"]},
+                target=ctx.target_slug, priority=3, producer=self.name,
+            )
+        ctx.dashboard.event("ok", f"recon: emitted {len(live)} hosts to crawler + discovery")
 
     # ---------- collectors ----------
     async def _run_subfinder(self, root: str, ctx: "Context") -> set[str]:

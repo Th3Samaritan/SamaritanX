@@ -33,6 +33,9 @@ weasyprint>=61.0          # PDF rendering (HTML -> PDF)
 pyyaml>=6.0
 sqlalchemy>=2.0.0
 
+# OOB collaborator (interactsh) — RSA + AES decryption of poll payloads
+cryptography>=42.0.0
+
 # Optional LLM reasoning layer
 anthropic>=0.39.0
 openai>=1.30.0
