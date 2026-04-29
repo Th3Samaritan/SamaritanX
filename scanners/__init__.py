@@ -4,6 +4,7 @@ and returns findings matching the memory.record_finding schema.
 
 `subdomain_takeover.scan_takeover(ctx, task)` is a host-level scanner
 invoked once per run from the `scan.takeover` task kind.
+`graphql.scan(...)` runs on its own `scan.graphql` task kind.
 """
 
 from .sqli import scan as scan_sqli
@@ -22,6 +23,8 @@ from .prompt_injection import scan as scan_prompt_injection
 from .dom_xss import scan as scan_dom_xss
 from .request_smuggling import scan as scan_request_smuggling
 from .websocket import scan as scan_websocket
+from .oauth import scan as scan_oauth
+from .graphql import scan as scan_graphql
 from .subdomain_takeover import scan_takeover
 
 REGISTRY = {
@@ -41,4 +44,6 @@ REGISTRY = {
     "prompt_injection": scan_prompt_injection,
     "smuggling": scan_request_smuggling,
     "websocket": scan_websocket,
+    "oauth": scan_oauth,
+    "graphql": scan_graphql,
 }

@@ -43,7 +43,11 @@ class VulnerabilityAgent(BaseAgent):
         enabled = ctx.config.get("scanners", {}).get("enabled", [])
         runners = [(name, REGISTRY[name]) for name in enabled if name in REGISTRY]
         if task.kind == "scan.graphql":
-            runners = [(n, f) for n, f in runners if n in ("api", "sqli", "rce", "prompt_injection")]
+            # On a confirmed GraphQL endpoint, run the deep graphql scanner
+            # plus the API top-10 / RCE / SSTI / prompt-injection bundle —
+            # GraphQL is a great surface for those classes too.
+            runners = [(n, f) for n, f in runners
+                       if n in ("graphql", "api", "sqli", "rce", "prompt_injection")]
 
         results = await asyncio.gather(
             *[self._safe(name, fn, ctx, url, params, method, form) for name, fn in runners]

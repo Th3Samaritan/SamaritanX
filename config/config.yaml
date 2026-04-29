@@ -87,6 +87,8 @@ scanners:
     - prompt_injection
     - smuggling
     - websocket
+    - oauth                # only fires on OAuth-shaped paths / .well-known
+    - graphql              # only fires on /graphql / /api/graphql / etc.
   nuclei: true
   nuclei_severity: "low,medium,high,critical"
 

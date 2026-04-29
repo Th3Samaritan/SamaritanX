@@ -295,6 +295,96 @@ CATEGORY_NARRATIVE = {
         "remediation": "Disable introspection in production. Apply field-level "
                        "authorization. Persisted-queries-only when possible.",
     },
+    "graphql": {
+        "what": "Five focused checks were fired at the discovered GraphQL "
+                "endpoint: alias-batched single request (100 aliases), "
+                "10-level nested self-referencing query, mutation enumeration "
+                "without auth, query via GET / form-encoded body, and a "
+                "typo-suggestion probe to leak schema info even when "
+                "introspection is disabled.",
+        "why": "GraphQL servers expose a single endpoint that runs arbitrary "
+               "operations. Without alias / depth limits, per-mutation "
+               "authorization, and content-type pinning, the surface is "
+               "wider than a comparable REST API.",
+        "how": "The detection rule that fired is in the finding title — "
+               "`100 aliases resolved`, `nested 10 levels`, `mutation "
+               "accessible anonymously`, `query accepted via GET`, or "
+               "`'Did you mean ...' suggestion leak`.",
+        "impact": "Brute force / DoS amplification, stealth schema discovery, "
+                  "or unauthenticated state changes depending on the rule.",
+        "remediation": "Enforce a maximum query depth and complexity. Cap "
+                       "aliases per request. Apply per-mutation authorization "
+                       "middleware. Reject GET / form-encoded GraphQL requests "
+                       "(JSON-only). Disable typo-suggestions in production. "
+                       "Adopt persisted queries when the client list is closed.",
+    },
+    "oauth": {
+        "what": "The OAuth / OIDC authorize endpoint (or a discovered "
+                "`/.well-known/openid-configuration`) was probed for the "
+                "common high-payout bug classes: open redirect via "
+                "`redirect_uri`, missing `state`, response_type=token "
+                "(implicit) acceptance, missing PKCE on code flow, scope "
+                "escalation, and JWKS hygiene.",
+        "why": "OAuth flows pre-authorize a user-controlled redirect target, "
+               "so any laxness in redirect_uri matching, CSRF defences, or "
+               "PKCE enforcement directly translates into account takeover.",
+        "how": "Each rule asserts a specific server response — Location "
+               "pointing at attacker host, code= without state= , #access_token= "
+               "in the fragment, consent UI for excessive scopes, etc.",
+        "impact": "Account takeover via authorization-code / token theft, "
+                  "login CSRF, or scope-escalation depending on the rule.",
+        "remediation": "Match `redirect_uri` exactly (no prefix matching, no "
+                       "wildcard subdomains, no path traversal). Require "
+                       "`state` for every authorize request. Disable implicit "
+                       "flow. Require PKCE for public clients. Whitelist "
+                       "scopes per client. Rotate JWKS keys, never ship empty.",
+    },
+    "smuggling": {
+        "what": "Two raw HTTP/1.1 payloads were sent over a TCP socket — "
+                "one CL.TE-shaped, one TE.CL-shaped — and the time taken "
+                "for each was compared.",
+        "why": "When the front-end proxy and back-end app server disagree "
+               "on whether to use Content-Length or Transfer-Encoding, an "
+               "attacker can prepend a hidden second request to the next "
+               "client's connection.",
+        "how": "One of the two payload shapes hung for ≥5s while the other "
+               "returned promptly — a strong timing oracle for the disagreement.",
+        "impact": "Cache poisoning, request hijacking, credential theft, or "
+                  "internal route reach depending on the architecture.",
+        "remediation": "Reject ambiguous requests at the front-end (both "
+                       "CL and TE present, or chunked + CL). Use HTTP/2 end-"
+                       "to-end where possible. Patch front-end to strict-parse.",
+    },
+    "websocket": {
+        "what": "A WebSocket Upgrade request was sent with a forged Origin "
+                "header (`https://evil.samaritanx.test`).",
+        "why": "WebSocket handshakes are HTTP requests — browsers send the "
+               "user's session cookie automatically. Without an Origin check, "
+               "any third-party page can open an authenticated socket on "
+               "behalf of the user.",
+        "how": "The server returned HTTP 101 + Sec-WebSocket-Accept despite "
+               "the attacker Origin.",
+        "impact": "Cross-Site WebSocket Hijacking — attacker reads / writes "
+                  "the session-bound stream.",
+        "remediation": "Validate Origin on every WebSocket handshake. Use a "
+                       "per-session anti-CSRF token in the first message.",
+    },
+    "takeover": {
+        "what": "Each subdomain's CNAME was resolved and matched against a "
+                "list of 25 SaaS services with known unclaimed-subdomain "
+                "fingerprints (GitHub Pages, Heroku, S3, Azure, Shopify, "
+                "Netlify, Vercel, Fastly, etc.).",
+        "why": "When a subdomain CNAMEs to a SaaS provider but the SaaS-side "
+               "resource is no longer claimed, an attacker can claim it and "
+               "serve content under the victim's domain.",
+        "how": "DNS resolution returned a CNAME to a known service AND the "
+               "live response carried the service's unclaimed fingerprint.",
+        "impact": "Stored XSS at scale, OAuth bypass, cookie theft, brand "
+                  "impersonation — all on a real domain owned by the target.",
+        "remediation": "Remove dangling CNAMEs immediately. Audit DNS exports "
+                       "monthly. Where SaaS providers support it, claim the "
+                       "subdomain back and disable.",
+    },
     "nuclei": {
         "what": "Nuclei was run with the configured severity floor against "
                 "the host root.",

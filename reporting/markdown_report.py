@@ -37,6 +37,9 @@ CWE_MAP = {
     "broken_auth": ("CWE-287", "Improper Authentication"),
     "race_condition": ("CWE-362", "Concurrent Execution / Race"),
     "graphql_introspection": ("CWE-200", "Information Exposure via GraphQL"),
+    "graphql": ("CWE-770", "Allocation of Resources Without Limits / GraphQL"),
+    "oauth": ("CWE-601", "OAuth / OIDC Misconfiguration"),
+    "logic": ("CWE-840", "Business Logic Errors"),
 }
 
 
