@@ -67,14 +67,19 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
     for label, fname, ctype, body in payloads:
         files = {field_name: (fname, body, ctype)}
-        try:
-            resp = await ctx.http._client.post(
-                form["action"], data=base_data, files=files,
-                headers={"User-Agent": "SamaritanX/1.0"},
-            )
-        except Exception:
+        # Route through the stealth client so scope, auth, rate limiting,
+        # UA rotation, and request counting all apply to upload payloads too.
+        ev = await ctx.http.request(
+            "POST", form["action"], data=base_data, files=files,
+        )
+        if ev.error:
             continue
-        text = resp.text or ""
+        text = ev.response_body or ""
+        # provide a resp-shaped object for downstream code paths
+        class _R:
+            status_code = ev.status
+            text = text
+        resp = _R()
         if resp.status_code not in (200, 201, 202):
             continue
         # extract candidate public URL from response

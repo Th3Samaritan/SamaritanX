@@ -25,6 +25,11 @@ from .request_smuggling import scan as scan_request_smuggling
 from .websocket import scan as scan_websocket
 from .oauth import scan as scan_oauth
 from .graphql import scan as scan_graphql
+from .crlf import scan as scan_crlf
+from .xxe import scan as scan_xxe
+from .deserialization import scan as scan_deserialization
+from .version_bypass import scan as scan_version_bypass
+from .jwt_priv_esc import scan as scan_jwt_priv_esc
 from .subdomain_takeover import scan_takeover
 
 REGISTRY = {
@@ -46,4 +51,14 @@ REGISTRY = {
     "websocket": scan_websocket,
     "oauth": scan_oauth,
     "graphql": scan_graphql,
+    "crlf": scan_crlf,
+    "xxe": scan_xxe,
+    "deserialization": scan_deserialization,
+    "version_bypass": scan_version_bypass,
+    "jwt_priv_esc": scan_jwt_priv_esc,
 }
+
+# Scanners that justify an auth pre-flight before firing — high CVSS, slow,
+# or with side-effects expensive enough that we want a fresh session.
+HIGH_VALUE = {"rce", "ssrf", "idor_deep", "upload", "smuggling", "xxe",
+              "jwt_priv_esc", "version_bypass", "oauth"}

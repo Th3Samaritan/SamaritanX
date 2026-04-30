@@ -89,6 +89,11 @@ scanners:
     - websocket
     - oauth                # only fires on OAuth-shaped paths / .well-known
     - graphql              # only fires on /graphql / /api/graphql / etc.
+    - crlf
+    - xxe                  # only fires on XML-shaped endpoints
+    - deserialization      # detection-only — flags candidates for manual review
+    - version_bypass       # only fires when canonical URL returns 401/403
+    - jwt_priv_esc         # only fires when a JWT is observed
   nuclei: true
   nuclei_severity: "low,medium,high,critical"
 

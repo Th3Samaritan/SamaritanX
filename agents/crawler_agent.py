@@ -196,8 +196,9 @@ class CrawlerAgent(BaseAgent):
         except ImportError:
             log.debug("playwright not installed — skipping JS render")
             return
+        from core.browser_pool import browser_slot
         try:
-            async with async_playwright() as pw:
+            async with browser_slot(ctx.config), async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
                 context = await browser.new_context(ignore_https_errors=True)
                 page = await context.new_page()

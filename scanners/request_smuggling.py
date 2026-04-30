@@ -28,8 +28,14 @@ if TYPE_CHECKING:
     from core.orchestrator import Context
 
 
-async def _raw_send(host: str, port: int, payload: bytes, use_tls: bool, timeout: float = 10.0) -> tuple[float, bytes]:
-    """Open a raw TCP/TLS connection, write the payload, read until close or timeout."""
+async def _raw_send(host: str, port: int, payload: bytes, use_tls: bool,
+                    bucket=None, timeout: float = 10.0) -> tuple[float, bytes]:
+    """Open a raw TCP/TLS connection, write the payload, read until close or timeout.
+
+    *bucket* is the host's stealth token bucket — taken before egress so this
+    raw-socket path doesn't bypass the rate limiter the rest of the tool honors."""
+    if bucket is not None:
+        await bucket.take()
     ctx_ssl = ssl.create_default_context() if use_tls else None
     if ctx_ssl:
         ctx_ssl.check_hostname = False
@@ -91,8 +97,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         f"{te_cl_body}"
     ).encode()
 
-    elapsed_cl_te, _ = await _raw_send(host, port, cl_te, use_tls)
-    elapsed_te_cl, _ = await _raw_send(host, port, te_cl, use_tls)
+    bucket = ctx.http.host_bucket(parsed.netloc)
+    elapsed_cl_te, _ = await _raw_send(host, port, cl_te, use_tls, bucket=bucket)
+    elapsed_te_cl, _ = await _raw_send(host, port, te_cl, use_tls, bucket=bucket)
 
     if elapsed_cl_te > 5.0 and elapsed_te_cl < 5.0:
         findings.append(_finding(url, "CL.TE", elapsed_cl_te))

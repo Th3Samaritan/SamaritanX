@@ -103,6 +103,29 @@ class SessionStore:
             await self._refresh_fn()
             self._refreshed_at = time.time()
 
+    async def preflight(self, http, validate_url: str | None = None) -> bool:
+        """Pre-flight check used by high-value scanners (RCE / SSRF / BOLA).
+
+        Forces a refresh if one is overdue and, when *validate_url* is supplied,
+        confirms the session is actually valid by hitting that URL and looking
+        for a 2xx-ish response. Returns True if the session is usable."""
+        if not self._refresh_fn:
+            return self.is_authed()
+        async with self._lock:
+            try:
+                await self._refresh_fn()
+                self._refreshed_at = time.time()
+            except Exception:
+                return False
+        if validate_url:
+            try:
+                ev = await http.request("GET", validate_url, bypass_scope=True)
+                if ev.status in (0, 401, 403):
+                    return False
+            except Exception:
+                return False
+        return self.is_authed()
+
 
 async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
     """Build a SessionStore from a recipe file. `http` is a StealthHttpClient

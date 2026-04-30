@@ -23,6 +23,7 @@ import asyncio
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from core.browser_pool import browser_slot
 from core.utils import random_token
 
 if TYPE_CHECKING:
@@ -135,7 +136,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
     candidate_params = params or list(qs.keys()) or ["q", "search", "name", "id"]
 
-    async with async_playwright() as pw:
+    async with browser_slot(ctx.config), async_playwright() as pw:
         try:
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         except Exception:

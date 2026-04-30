@@ -36,6 +36,7 @@ class ScreenshotAgent(BaseAgent):
             from playwright.async_api import async_playwright
         except ImportError:
             return
+        from core.browser_pool import browser_slot
         findings = ctx.memory.list_findings(ctx.target_slug)
         showable = [f for f in findings if f.get("url") and not f.get("metadata", {}).get("screenshot")]
         if not showable:
@@ -50,7 +51,7 @@ class ScreenshotAgent(BaseAgent):
             except Exception:
                 index = {}
 
-        async with async_playwright() as pw:
+        async with browser_slot(ctx.config), async_playwright() as pw:
             try:
                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
             except Exception:

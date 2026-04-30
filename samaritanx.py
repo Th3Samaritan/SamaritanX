@@ -37,6 +37,7 @@ from agents.discovery_agent import DiscoveryAgent  # noqa: E402
 from agents.vuln_agent import VulnerabilityAgent  # noqa: E402
 from agents.logic_agent import LogicAgent  # noqa: E402
 from agents.exploit_agent import ExploitAgent  # noqa: E402
+from agents.secret_validator import SecretValidatorAgent  # noqa: E402
 from agents.screenshot_agent import ScreenshotAgent  # noqa: E402
 from agents.reporting_agent import ReportingAgent  # noqa: E402
 
@@ -129,6 +130,7 @@ def scan(
     orch.register(VulnerabilityAgent())
     orch.register(LogicAgent())
     orch.register(ExploitAgent())
+    orch.register(SecretValidatorAgent())
     if not no_screenshots:
         orch.register(ScreenshotAgent())
     orch.register(ReportingAgent())

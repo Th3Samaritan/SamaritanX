@@ -189,6 +189,11 @@ class StealthHttpClient:
         if hi > 0:
             await asyncio.sleep(random.uniform(lo, hi) / 1000.0)
 
+    def host_bucket(self, host: str) -> "_TokenBucket":
+        """Expose the per-host bucket so non-httpx code (raw sockets, Playwright)
+        can take a token before sending — keeps stealth posture honest."""
+        return self._host_buckets[host]
+
     async def request(
         self,
         method: str,
@@ -197,6 +202,7 @@ class StealthHttpClient:
         params: dict | None = None,
         data: Any | None = None,
         json_body: Any | None = None,
+        files: Any | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         allow_redirects: bool = True,
@@ -237,6 +243,7 @@ class StealthHttpClient:
                 params=params,
                 data=data,
                 json=json_body,
+                files=files,
                 headers=hdrs,
                 cookies=cookies,
                 follow_redirects=allow_redirects,

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from core.task_queue import Task
 from core.utils import host_of
-from scanners import REGISTRY
+from scanners import REGISTRY, HIGH_VALUE
 from scanners.subdomain_takeover import scan_takeover
 from .base import BaseAgent
 
@@ -43,11 +43,22 @@ class VulnerabilityAgent(BaseAgent):
         enabled = ctx.config.get("scanners", {}).get("enabled", [])
         runners = [(name, REGISTRY[name]) for name in enabled if name in REGISTRY]
         if task.kind == "scan.graphql":
-            # On a confirmed GraphQL endpoint, run the deep graphql scanner
-            # plus the API top-10 / RCE / SSTI / prompt-injection bundle —
-            # GraphQL is a great surface for those classes too.
             runners = [(n, f) for n, f in runners
                        if n in ("graphql", "api", "sqli", "rce", "prompt_injection")]
+
+        # Pre-flight: if any high-value scanner is in this batch and we have
+        # an auth session, refresh + validate it before firing — guarantees
+        # the critical payloads aren't wasted on an expired token.
+        if ctx.session and ctx.session.is_authed() \
+                and any(n in HIGH_VALUE for n, _ in runners):
+            try:
+                ok = await ctx.session.preflight(ctx.http, validate_url=url)
+                if not ok:
+                    ctx.dashboard.event("err",
+                        f"auth pre-flight FAILED on {url} — skipping high-value scanners")
+                    runners = [(n, f) for n, f in runners if n not in HIGH_VALUE]
+            except Exception as exc:
+                ctx.dashboard.event("err", f"auth pre-flight error: {exc}")
 
         results = await asyncio.gather(
             *[self._safe(name, fn, ctx, url, params, method, form) for name, fn in runners]

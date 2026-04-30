@@ -1,11 +1,16 @@
-"""SSRF scanner.
+"""SSRF scanner — broader parameter set + header-based SSRF + OOB.
 
-Heuristics:
-  * inject internal / cloud-metadata / file:// URLs into each parameter
-  * detect:
-        - direct response containing 'iam', 'ami-id', 'computeMetadata', etc.
-        - leaked file:// content (root:x:0:0:)
-        - **out-of-band callbacks** via interactsh — proves blind SSRF
+Coverage:
+  * **expanded candidate parameter list** — also includes endpoint, path,
+    file, resource, link, proxy, forward, load, fetch, ref, data, content,
+    template, render, source, target, location, host_url
+  * in-band cloud-metadata / file:// / Redis / Memcached indicators
+  * **header-based SSRF** — injects internal/OOB targets via the headers
+    proxies and routers most often re-emit:
+        X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Server,
+        X-Original-URL, X-Rewrite-URL, X-Custom-IP-Authorization,
+        Forwarded, Referer, X-Real-IP, X-Host, Client-IP
+  * out-of-band callbacks via interactsh — proves blind SSRF
 """
 from __future__ import annotations
 
@@ -27,21 +32,37 @@ INDICATORS = [
     ("memcached_stats", "STAT pid"),
 ]
 
+CANDIDATE_PARAM_HINTS = (
+    # url-shaped
+    "url", "uri", "src", "dest", "redirect", "next", "image", "callback",
+    "webhook", "feed", "site", "domain", "host", "host_url", "target",
+    # alternative names that also commonly drive server-side fetchers
+    "endpoint", "path", "file", "resource", "link", "proxy", "forward",
+    "load", "fetch", "ref", "data", "content", "template", "render",
+    "source", "location", "remote", "page",
+)
+
+# headers worth abusing for header-based SSRF — the value gets fetched
+# server-side by the proxy / router in many architectures
+SSRF_HEADERS = (
+    "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Server",
+    "X-Original-URL", "X-Rewrite-URL", "X-Custom-IP-Authorization",
+    "Forwarded", "Referer", "X-Real-IP", "X-Host", "Client-IP",
+    "True-Client-IP", "X-Originating-IP", "X-Backend-Server",
+    "X-Forwarded-Proto",
+)
+
 
 async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
     findings: list[dict] = []
     payloads = ctx.payloads.for_category("ssrf", limit=18)
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
 
-    candidate_params = [p for p in params if any(k in p.lower() for k in
-        ("url", "uri", "src", "dest", "redirect", "next", "image",
-         "callback", "webhook", "feed", "site", "domain", "host", "target"))]
-    if not candidate_params:
-        candidate_params = params
-
-    # fire OOB payloads in parallel with in-band probes — each parameter gets
-    # a unique token so the polling result can be attributed back to it
-    oob_tokens: dict[str, tuple[str, str]] = {}    # param -> (token, oob_url)
+    # candidate filter — score every param, keep those with hints, fall back
+    # to the full list if nothing scores
+    scored = [p for p in params if any(k in p.lower() for k in CANDIDATE_PARAM_HINTS)]
+    candidate_params = scored or params
+    oob_param_tokens: dict[str, tuple[str, str]] = {}
 
     async def test_param(param: str) -> None:
         # 1) in-band cloud-metadata / file:// indicators
@@ -62,17 +83,27 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if ctx.oob and ctx.oob.registered:
             token = ctx.oob.token()
             oob_url = ctx.oob.url_for(token)
-            oob_tokens[param] = (token, oob_url)
+            oob_param_tokens[param] = (token, oob_url)
             async with sem:
                 await _request(ctx, url, method, param, oob_url, form)
 
     await asyncio.gather(*(test_param(p) for p in candidate_params))
 
-    # poll the OOB server once after firing — single round-trip is fine,
-    # interactsh keeps interactions for ~10 minutes
-    if ctx.oob and ctx.oob.registered and oob_tokens:
-        await asyncio.sleep(2.0)  # let DNS hops settle
-        for param, (token, oob_url) in oob_tokens.items():
+    # 3) header-based SSRF — fire OOB tokens through every headers we expect
+    #    intermediaries to consume
+    oob_header_tokens: dict[str, tuple[str, str]] = {}
+    if ctx.oob and ctx.oob.registered:
+        for header in SSRF_HEADERS:
+            token = ctx.oob.token()
+            target = ctx.oob.host_for(token)  # raw host — most proxies want a host:port
+            oob_header_tokens[header] = (token, target)
+            async with sem:
+                await ctx.http.get(url, headers={header: target})
+
+    # 4) poll OOB once for both param- and header-based callbacks
+    if ctx.oob and ctx.oob.registered and (oob_param_tokens or oob_header_tokens):
+        await asyncio.sleep(2.0)
+        for param, (token, oob_url) in oob_param_tokens.items():
             events = await ctx.oob.poll(token)
             if events:
                 kinds = sorted({(e.get("protocol") or "?").lower() for e in events})
@@ -83,6 +114,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     f"OOB callback received via {kinds} — confirms blind SSRF "
                     f"({len(events)} interactions)",
                     label="oob"))
+        for header, (token, oob_url) in oob_header_tokens.items():
+            events = await ctx.oob.poll(token)
+            if events:
+                kinds = sorted({(e.get("protocol") or "?").lower() for e in events})
+                findings.append(_finding(
+                    url, f"header:{header}", oob_url, "oob-header",
+                    type("E", (), {"method": "GET", "url": url,
+                                   "response_body": ""})(),
+                    f"OOB callback received via {kinds} after injecting `{header}` — "
+                    f"header-based SSRF ({len(events)} interactions)",
+                    label=f"header:{header}"))
     return findings
 
 
@@ -95,7 +137,7 @@ async def _request(ctx, url, method, param, value, form):
 
 
 def _finding(url, param, payload, kind, ev, evidence, *, label="") -> dict:
-    sev, cvss = ("critical", 9.1) if kind in ("in-band", "oob") else ("high", 8.1)
+    sev, cvss = ("critical", 9.1)
     return {
         "category": "ssrf",
         "title": f"Server-Side Request Forgery in `{param}` "
