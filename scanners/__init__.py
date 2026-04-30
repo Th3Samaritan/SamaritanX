@@ -9,6 +9,7 @@ invoked once per run from the `scan.takeover` task kind.
 
 from .sqli import scan as scan_sqli
 from .xss import scan as scan_xss
+from .stored_xss import scan as scan_stored_xss
 from .ssrf import scan as scan_ssrf
 from .idor import scan as scan_idor
 from .idor_deep import scan as scan_idor_deep
@@ -22,6 +23,7 @@ from .api import scan as scan_api
 from .prompt_injection import scan as scan_prompt_injection
 from .dom_xss import scan as scan_dom_xss
 from .request_smuggling import scan as scan_request_smuggling
+from .h2_smuggling import scan as scan_h2_smuggling
 from .websocket import scan as scan_websocket
 from .oauth import scan as scan_oauth
 from .graphql import scan as scan_graphql
@@ -35,6 +37,7 @@ from .subdomain_takeover import scan_takeover
 REGISTRY = {
     "sqli": scan_sqli,
     "xss": scan_xss,
+    "stored_xss": scan_stored_xss,
     "dom_xss": scan_dom_xss,
     "ssrf": scan_ssrf,
     "idor": scan_idor,
@@ -48,6 +51,7 @@ REGISTRY = {
     "api": scan_api,
     "prompt_injection": scan_prompt_injection,
     "smuggling": scan_request_smuggling,
+    "h2_smuggling": scan_h2_smuggling,
     "websocket": scan_websocket,
     "oauth": scan_oauth,
     "graphql": scan_graphql,
@@ -60,5 +64,5 @@ REGISTRY = {
 
 # Scanners that justify an auth pre-flight before firing — high CVSS, slow,
 # or with side-effects expensive enough that we want a fresh session.
-HIGH_VALUE = {"rce", "ssrf", "idor_deep", "upload", "smuggling", "xxe",
-              "jwt_priv_esc", "version_bypass", "oauth"}
+HIGH_VALUE = {"rce", "ssrf", "idor_deep", "upload", "smuggling", "h2_smuggling",
+              "xxe", "jwt_priv_esc", "version_bypass", "oauth", "stored_xss"}

@@ -36,6 +36,14 @@ sqlalchemy>=2.0.0
 # OOB collaborator (interactsh) — RSA + AES decryption of poll payloads
 cryptography>=42.0.0
 
+# Raw HTTP/2 frame control for h2_smuggling scanner
+h2>=4.1.0
+hpack>=4.0.0
+hyperframe>=6.0.0
+
+# WebSocket message-level injection scanner
+websockets>=12.0
+
 # Optional LLM reasoning layer
 anthropic>=0.39.0
 openai>=1.30.0

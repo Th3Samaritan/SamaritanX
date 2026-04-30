@@ -43,8 +43,11 @@ waf_evasion:
     - comment_injection
     - unicode_encoding
     - double_url_encoding
+    - encoding_chain          # URL -> Unicode -> HTML entity (3 stages)
+    - utf8_overlong           # over-long UTF-8 of <, >, ", '
     - parameter_pollution
     - chunked_transfer
+  transport_mutations: true   # scanners may try multipart/JSON-in-GET/h2 pseudo-header tricks
 
 concurrency:
   recon_workers: 8
@@ -72,7 +75,8 @@ crawler:
 scanners:
   enabled:
     - sqli
-    - xss
+    - xss                  # context-aware reflected XSS
+    - stored_xss           # multi-step inject -> crawl -> verify in browser
     - dom_xss
     - ssrf
     - idor
@@ -85,15 +89,16 @@ scanners:
     - rce
     - api
     - prompt_injection
-    - smuggling
-    - websocket
-    - oauth                # only fires on OAuth-shaped paths / .well-known
-    - graphql              # only fires on /graphql / /api/graphql / etc.
+    - smuggling            # HTTP/1.1 CL.TE / TE.CL
+    - h2_smuggling         # HTTP/2 CRLF in pseudo-headers, CONTINUATION abuse, h2c upgrade
+    - websocket            # CSWH + message-level SQLi/RCE/SSTI injection
+    - oauth
+    - graphql
     - crlf
-    - xxe                  # only fires on XML-shaped endpoints
-    - deserialization      # detection-only — flags candidates for manual review
-    - version_bypass       # only fires when canonical URL returns 401/403
-    - jwt_priv_esc         # only fires when a JWT is observed
+    - xxe
+    - deserialization
+    - version_bypass
+    - jwt_priv_esc
   nuclei: true
   nuclei_severity: "low,medium,high,critical"
 

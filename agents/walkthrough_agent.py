@@ -340,34 +340,85 @@ CATEGORY_NARRATIVE = {
                        "scopes per client. Rotate JWKS keys, never ship empty.",
     },
     "smuggling": {
-        "what": "Two raw HTTP/1.1 payloads were sent over a TCP socket — "
-                "one CL.TE-shaped, one TE.CL-shaped — and the time taken "
-                "for each was compared.",
+        "what": "Multiple smuggling shapes were tested over both HTTP/1.1 "
+                "(CL.TE / TE.CL via raw TCP) and HTTP/2 (CRLF inside the "
+                ":path pseudo-header, a 50-frame CONTINUATION flood, and "
+                "an h2c upgrade with body-side smuggling). Each was "
+                "compared against a baseline RTT to detect disagreement "
+                "between the front-end and back-end parsers.",
         "why": "When the front-end proxy and back-end app server disagree "
-               "on whether to use Content-Length or Transfer-Encoding, an "
+               "on where one HTTP request ends and the next begins, an "
                "attacker can prepend a hidden second request to the next "
-               "client's connection.",
-        "how": "One of the two payload shapes hung for ≥5s while the other "
-               "returned promptly — a strong timing oracle for the disagreement.",
-        "impact": "Cache poisoning, request hijacking, credential theft, or "
-                  "internal route reach depending on the architecture.",
-        "remediation": "Reject ambiguous requests at the front-end (both "
-                       "CL and TE present, or chunked + CL). Use HTTP/2 end-"
-                       "to-end where possible. Patch front-end to strict-parse.",
+               "client's connection. HTTP/2 introduces a fresh class of "
+               "smuggling because pseudo-headers carry semantics the H1 "
+               "back-end may re-parse as headers when the front-end "
+               "downgrades the request.",
+        "how": "Detection rule that fired is in the finding title — "
+               "CL.TE / TE.CL timing oracle, H2 CRLF-in-:path hang, "
+               "CONTINUATION-flood acceptance, or h2c upgrade with "
+               "smuggled body returning evidence the second request "
+               "executed.",
+        "impact": "Cache poisoning, request hijacking, credential theft, "
+                  "bypass of front-end auth on internal admin routes, or "
+                  "OOM denial-of-service depending on the rule.",
+        "remediation": "Reject ambiguous H1 requests (both CL and TE "
+                       "present). Cap CONTINUATION frames per stream. "
+                       "Strip / normalise CRLF in pseudo-headers at the "
+                       "front-end. Disable h2c if not needed. Use HTTP/2 "
+                       "end-to-end so the front-end never downgrades.",
     },
     "websocket": {
-        "what": "A WebSocket Upgrade request was sent with a forged Origin "
-                "header (`https://evil.samaritanx.test`).",
-        "why": "WebSocket handshakes are HTTP requests — browsers send the "
-               "user's session cookie automatically. Without an Origin check, "
-               "any third-party page can open an authenticated socket on "
-               "behalf of the user.",
-        "how": "The server returned HTTP 101 + Sec-WebSocket-Accept despite "
-               "the attacker Origin.",
-        "impact": "Cross-Site WebSocket Hijacking — attacker reads / writes "
-                  "the session-bound stream.",
-        "remediation": "Validate Origin on every WebSocket handshake. Use a "
-                       "per-session anti-CSRF token in the first message.",
+        "what": "Two phases were tested: (1) the WebSocket handshake was "
+                "issued with a forged `Origin: evil.samaritanx.test` "
+                "header; (2) after a successful handshake, a curated set "
+                "of injection payloads (SQLi, time-based SQLi, OS command "
+                "injection with marker echo, blind RCE via OOB, SSTI, "
+                "NoSQL operator injection, raw HTML for stored-XSS) were "
+                "fired in three message shapes — raw text, JSON object, "
+                "and JSON-RPC 2.0.",
+        "why": "WebSocket handshakes are HTTP requests, so browsers send "
+               "the user's cookies automatically — without Origin "
+               "validation, any third-party page can open an "
+               "authenticated socket. Once open, the WS message channel "
+               "often reaches admin / RPC handlers that don't appear on "
+               "the REST surface and that re-use the same back-end query "
+               "/ command code paths as legacy endpoints.",
+        "how": "Detection rule per finding: Sec-WebSocket-Accept on a "
+               "forged-origin handshake (CSWH), SQL error string in a WS "
+               "frame reply, ≥5s delay after a sleep payload, marker echo "
+               "in a frame reply (RCE), OOB callback (blind RCE), or "
+               "{{7*7}} → 49 (SSTI).",
+        "impact": "Cross-Site WebSocket Hijacking, plus full back-end "
+                  "exploitation (SQLi / RCE / SSTI) on a channel that "
+                  "rarely sees a WAF.",
+        "remediation": "Validate Origin on every WS handshake. Apply the "
+                       "same input validation, parameterized queries, "
+                       "and authorization checks to WS message handlers "
+                       "that you apply to REST. Treat WS frames as "
+                       "untrusted input.",
+    },
+    "h2_smuggling": {
+        "what": "Three HTTP/2-specific smuggling primitives were tested: "
+                "CRLF embedded inside the `:path` pseudo-header (timing "
+                "oracle), 50 CONTINUATION frames sent without END_HEADERS "
+                "carrying ~100 KB of header padding, and an h2c upgrade "
+                "with a CL-bearing body containing a smuggled HTTP/1.1 "
+                "request.",
+        "why": "Some intermediaries downgrade HTTP/2 to HTTP/1.1 between "
+               "the front-end and back-end — pseudo-headers that contain "
+               "CRLF then become a header-injection primitive on the "
+               "downgraded request. Servers without strict CONTINUATION "
+               "limits can be DoSed or coerced into smuggling. h2c "
+               "upgrades that aren't honoured by the back-end leave the "
+               "request body interpreted as a follow-on H1 request.",
+        "how": "See finding metadata — `kind` is one of "
+               "`h2_crlf_path`, `h2_continuation_flood`, `h2c_upgrade`.",
+        "impact": "Bypass of front-end auth, cache poisoning, request "
+                  "hijacking, and OOM denial-of-service.",
+        "remediation": "Strict CRLF rejection in pseudo-headers; cap "
+                       "CONTINUATION frames per stream; refuse h2c "
+                       "upgrades unless explicitly required; prefer "
+                       "HTTP/2 end-to-end from edge to origin.",
     },
     "takeover": {
         "what": "Each subdomain's CNAME was resolved and matched against a "
