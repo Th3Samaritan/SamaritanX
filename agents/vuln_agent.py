@@ -81,8 +81,16 @@ class VulnerabilityAgent(BaseAgent):
             await self._run_nuclei(host, ctx)
 
     async def _safe(self, name, fn, ctx, url, params, method, form):
+        deadline = 30.0 if name in ("smuggling", "h2_smuggling", "request_smuggling") else 15.0
         try:
-            return await fn(ctx, url, params, method, form)
+            return await asyncio.wait_for(
+                fn(ctx, url, params, method, form),
+                timeout=deadline,
+            )
+        except asyncio.TimeoutError:
+            self.log.warning("scanner %s timed out on %s (%.0fs)", name, url, deadline)
+            ctx.dashboard.event("err", f"{name} timed out on {url}")
+            return []
         except Exception as exc:  # noqa: BLE001
             self.log.exception("scanner %s crashed on %s: %s", name, url, exc)
             ctx.dashboard.event("err", f"{name} crashed on {url}: {exc}")
@@ -94,12 +102,20 @@ class VulnerabilityAgent(BaseAgent):
         out_path = ctx.workspace / "vulns" / f"{host}_nuclei.jsonl"
         sev = ctx.config.get("scanners", {}).get("nuclei_severity", "medium,high,critical")
         ctx.dashboard.event("info", f"nuclei: scanning {host} (sev={sev})")
-        proc = await asyncio.create_subprocess_exec(
-            "nuclei", "-u", f"https://{host}", "-silent", "-jsonl",
-            "-severity", sev, "-o", str(out_path),
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nuclei", "-u", f"https://{host}", "-silent", "-jsonl",
+                "-severity", sev, "-o", str(out_path),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=600.0)
+        except asyncio.TimeoutError:
+            ctx.dashboard.event("err", f"nuclei timed out on {host}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return
         if not out_path.exists():
             return
         for line in out_path.read_text(encoding="utf-8", errors="ignore").splitlines():

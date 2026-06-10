@@ -79,9 +79,15 @@ class DiscoveryAgent(BaseAgent):
     # ---------- content discovery ----------
     async def _content_discovery(self, base: str, host: str, ctx: "Context") -> None:
         if shutil.which("ffuf"):
-            await self._run_ffuf(base, host, ctx)
-            return
+            try:
+                await self._run_ffuf(base, host, ctx)
+                return
+            except Exception:
+                ctx.dashboard.event("err", f"discovery: ffuf failed on {host}, falling back to async wordlist")
         wordlist = Path(__file__).resolve().parent.parent / "config" / "payloads" / "wordlist_paths.txt"
+        if not wordlist.exists():
+            ctx.dashboard.event("err", f"discovery: wordlist not found at {wordlist} — skipping path discovery")
+            return
         words = [w.strip() for w in wordlist.read_text(encoding="utf-8").splitlines()
                  if w.strip() and not w.startswith("#")]
         ctx.dashboard.task(f"discovery:{host}", len(words))
@@ -97,7 +103,6 @@ class DiscoveryAgent(BaseAgent):
                 hits.append({"url": url, "status": ev.status,
                              "size": len(ev.response_body or ""),
                              "ctype": ev.response_headers.get("content-type", "")})
-                # 200 with substantive body -> queue for crawl + scan
                 if ev.status == 200 and len(ev.response_body or "") > 50:
                     await ctx.queue.put("crawl", {"url": url, "host": host},
                                         target=ctx.target_slug, priority=4,
@@ -111,13 +116,21 @@ class DiscoveryAgent(BaseAgent):
     async def _run_ffuf(self, base: str, host: str, ctx: "Context") -> None:
         wordlist = Path(__file__).resolve().parent.parent / "config" / "payloads" / "wordlist_paths.txt"
         out_path = ctx.workspace / "discovery" / f"{host}_ffuf.json"
-        proc = await asyncio.create_subprocess_exec(
-            "ffuf", "-u", f"{base}/FUZZ", "-w", str(wordlist),
-            "-mc", "200,201,204,301,302,401,403", "-fs", "0",
-            "-of", "json", "-o", str(out_path), "-t", "20", "-s",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffuf", "-u", f"{base}/FUZZ", "-w", str(wordlist),
+                "-mc", "200,201,204,301,302,401,403", "-fs", "0",
+                "-of", "json", "-o", str(out_path), "-t", "20", "-s",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=600.0)
+        except asyncio.TimeoutError:
+            ctx.dashboard.event("err", f"ffuf timed out on {host}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return
         if not out_path.exists():
             return
         try:

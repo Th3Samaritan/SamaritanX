@@ -131,6 +131,7 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
                 continue
             tok = ctx.oob.token()
             host = ctx.oob.host_for(tok)
+            oob_tokens[label] = tok
             payloads.append((label, p.replace("{OOB}", host), tok))
         else:
             payloads.append((label, p, None))

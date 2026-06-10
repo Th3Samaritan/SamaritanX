@@ -39,12 +39,12 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
 
     async def test(param: str) -> None:
+        from core.injection import send
         for tpl in PAYLOAD_TEMPLATES:
             tok = random_token(6)
             payload = tpl.format(tok=tok)
-            target = merge_query(url, {param: payload})
             async with sem:
-                ev = await ctx.http.get(target, allow_redirects=False)
+                ev = await send(ctx, url, method, param, payload, form, allow_redirects=False)
             if ev.error or not ev.response_headers:
                 continue
             for hk, hv in ev.response_headers.items():
@@ -60,11 +60,11 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                         "evidence": f"Injected header surfaced in the response header map "
                                     f"as `{hk}: {hv_s[:80]}` — server is concatenating user "
                                     "input into the response header section.",
-                        "request": f"GET {target}",
+                        "request": f"{ev.method} {ev.url}",
                         "response": str({k: v for k, v in ev.response_headers.items()})[:1500],
                         "metadata": {"injected_header": hk, "token": tok},
                     })
                     return
 
     await asyncio.gather(*(test(p) for p in params))
-    return findings
+    

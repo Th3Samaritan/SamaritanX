@@ -55,12 +55,24 @@ concurrency:
   scanner_workers: 12
   browser_contexts: 2
 
+safety:
+  aggressive: false   # destructive checks (auth lockout probe, 25x race POSTs,
+                      # pricing-tamper submits). Enable only on authorized targets.
+
+scan:
+  task_timeout_seconds: 60          # per-scanner task cap (snappy)
+  long_phase_timeout_seconds: 600   # recon/crawl/discover budget (fan-out phases)
+  deadline_seconds: 0               # 0 = no global wall-clock limit
+
 recon:
   passive_only: false
   subfinder: true
+  subfinder_timeout: 120        # seconds; process is killed if it overruns
   amass: true
-  amass_timeout: 600
+  amass_timeout: 180            # seconds; process is killed if it overruns
   resolve_dns: true
+  max_probe_hosts: 750          # cap live-probe set after DNS resolution
+  probe_timeout: 8              # per-host HTTP probe timeout (seconds)
   port_scan: false              # toggle on for in-scope authorized targets
   tech_fingerprint: true
 

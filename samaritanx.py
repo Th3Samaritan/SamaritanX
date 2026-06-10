@@ -28,6 +28,7 @@ from rich.table import Table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from core.config_validator import validate_config  # noqa: E402
 from core.logger import configure_logging  # noqa: E402
 from core.orchestrator import Orchestrator  # noqa: E402
 
@@ -67,6 +68,8 @@ def scan(
     second_auth: Path = typer.Option(None, "--second-session", help="second auth recipe for IDOR/BOLA cross-tenant tests"),
     scope: Path = typer.Option(None, "--scope", help="scope file (allow/deny rules) — see config/scope.example.txt"),
     resume: bool = typer.Option(False, "--resume", help="reuse memory state from a prior run (skip already-completed phases)"),
+    deadline: float = typer.Option(0.0, "--deadline", help="max scan duration in seconds (0 = no limit). Kills the run gracefully when exceeded"),
+    task_timeout: float = typer.Option(60.0, "--task-timeout", help="max seconds a single agent task may run before being cancelled"),
     wordlist: Path = typer.Option(None, "--wordlist", help="custom wordlist for content discovery"),
     tor: bool = typer.Option(False, "--tor", help="route all traffic via Tor (socks5://127.0.0.1:9050)"),
     proxy: str = typer.Option("", "--proxy", help="HTTP/SOCKS proxy URL (overrides config)"),
@@ -80,11 +83,19 @@ def scan(
     walkthrough: bool = typer.Option(True, "--walkthrough/--no-walkthrough",
                                      help="include long-form walkthrough text in the report"),
     passive: bool = typer.Option(False, "--passive", help="passive recon only (no active probes)"),
+    aggressive: bool = typer.Option(False, "--aggressive", help="enable DESTRUCTIVE checks: auth rate-limit probe (account lockout), 25x race-condition POSTs, pricing-tamper form submits. Authorized targets only."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Run the full agentic pipeline against a target."""
     banner()
     cfg = load_config(config)
+
+    # validate config schema before spinning up the pipeline
+    cfg_issues = validate_config(cfg)
+    if cfg_issues:
+        console.print("[yellow]config warnings:[/yellow]")
+        for msg in cfg_issues:
+            console.print(f"  [dim]- {msg}[/dim]")
 
     # CLI overrides
     if tor:
@@ -113,6 +124,8 @@ def scan(
     cfg.setdefault("reporting", {})["include_walkthrough"] = walkthrough
     if passive:
         cfg.setdefault("recon", {})["passive_only"] = True
+    if aggressive:
+        cfg.setdefault("safety", {})["aggressive"] = True
 
     log_path = Path(cfg.get("workspace", {}).get("root", "./workspace")) / "samaritanx.log"
     configure_logging(verbose=verbose, log_file=log_path)
@@ -123,6 +136,8 @@ def scan(
         second_auth_recipe=str(second_auth) if second_auth else None,
         scope_file=str(scope) if scope else None,
         resume=resume,
+        deadline=deadline,
+        task_timeout=task_timeout,
     )
     orch.register(ReconAgent())
     orch.register(CrawlerAgent())

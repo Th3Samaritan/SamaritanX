@@ -6,35 +6,43 @@ and returns findings matching the memory.record_finding schema.
 invoked once per run from the `scan.takeover` task kind.
 `graphql.scan(...)` runs on its own `scan.graphql` task kind.
 """
+from __future__ import annotations
 
-from .sqli import scan as scan_sqli
-from .xss import scan as scan_xss
-from .stored_xss import scan as scan_stored_xss
-from .ssrf import scan as scan_ssrf
-from .idor import scan as scan_idor
-from .idor_deep import scan as scan_idor_deep
-from .csrf import scan as scan_csrf
-from .upload import scan as scan_upload
-from .open_redirect import scan as scan_open_redirect
-from .cors import scan as scan_cors
-from .cache_poisoning import scan as scan_cache_poisoning
-from .rce import scan as scan_rce
-from .api import scan as scan_api
-from .prompt_injection import scan as scan_prompt_injection
-from .dom_xss import scan as scan_dom_xss
-from .request_smuggling import scan as scan_request_smuggling
-from .h2_smuggling import scan as scan_h2_smuggling
-from .websocket import scan as scan_websocket
-from .oauth import scan as scan_oauth
-from .graphql import scan as scan_graphql
-from .crlf import scan as scan_crlf
-from .xxe import scan as scan_xxe
-from .deserialization import scan as scan_deserialization
-from .version_bypass import scan as scan_version_bypass
-from .jwt_priv_esc import scan as scan_jwt_priv_esc
-from .subdomain_takeover import scan_takeover
+from typing import Any, Callable, Coroutine
 
-REGISTRY = {
+ScanFn = Callable[
+    ["core.orchestrator.Context", str, list[str], str, dict[str, Any] | None],
+    Coroutine[Any, Any, list[dict[str, Any]]],
+]
+
+from .sqli import scan as scan_sqli  # noqa: E402
+from .xss import scan as scan_xss  # noqa: E402
+from .stored_xss import scan as scan_stored_xss  # noqa: E402
+from .ssrf import scan as scan_ssrf  # noqa: E402
+from .idor import scan as scan_idor  # noqa: E402
+from .idor_deep import scan as scan_idor_deep  # noqa: E402
+from .csrf import scan as scan_csrf  # noqa: E402
+from .upload import scan as scan_upload  # noqa: E402
+from .open_redirect import scan as scan_open_redirect  # noqa: E402
+from .cors import scan as scan_cors  # noqa: E402
+from .cache_poisoning import scan as scan_cache_poisoning  # noqa: E402
+from .rce import scan as scan_rce  # noqa: E402
+from .api import scan as scan_api  # noqa: E402
+from .prompt_injection import scan as scan_prompt_injection  # noqa: E402
+from .dom_xss import scan as scan_dom_xss  # noqa: E402
+from .request_smuggling import scan as scan_request_smuggling  # noqa: E402
+from .h2_smuggling import scan as scan_h2_smuggling  # noqa: E402
+from .websocket import scan as scan_websocket  # noqa: E402
+from .oauth import scan as scan_oauth  # noqa: E402
+from .graphql import scan as scan_graphql  # noqa: E402
+from .crlf import scan as scan_crlf  # noqa: E402
+from .xxe import scan as scan_xxe  # noqa: E402
+from .deserialization import scan as scan_deserialization  # noqa: E402
+from .version_bypass import scan as scan_version_bypass  # noqa: E402
+from .jwt_priv_esc import scan as scan_jwt_priv_esc  # noqa: E402
+from .subdomain_takeover import scan_takeover  # noqa: E402
+
+REGISTRY: dict[str, ScanFn] = {
     "sqli": scan_sqli,
     "xss": scan_xss,
     "stored_xss": scan_stored_xss,

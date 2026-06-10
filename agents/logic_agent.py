@@ -81,7 +81,8 @@ class LogicAgent(BaseAgent):
         for url in endpoints:
             if not any(h in url.lower() for h in ADMIN_HINTS):
                 continue
-            ev = await ctx.http.get(url, headers={"Cookie": "", "Authorization": ""})
+            anon_cookies = {k: "" for k in (ctx.session.cookies if ctx.session else {})}
+            ev = await ctx.http.get(url, headers={"Authorization": ""}, cookies=anon_cookies)
             if ev.status == 200 and len(ev.response_body or "") > 200:
                 self.report_finding(ctx, {
                     "category": "broken_auth",
@@ -94,6 +95,8 @@ class LogicAgent(BaseAgent):
                 })
 
     async def _pricing_tamper(self, forms: list[dict], ctx: "Context") -> None:
+        if not ctx.config.get("safety", {}).get("aggressive"):
+            return  # mutating check — requires --aggressive
         for form in forms:
             inputs = form.get("inputs", [])
             tamperable = [i["name"] for i in inputs if any(h in (i.get("name") or "").lower() for h in PRICING_HINTS)]
@@ -120,6 +123,8 @@ class LogicAgent(BaseAgent):
                     })
 
     async def _race_conditions(self, endpoints: list[str], ctx: "Context") -> None:
+        if not ctx.config.get("safety", {}).get("aggressive"):
+            return  # fires 25 real POSTs — requires --aggressive
         for url in endpoints:
             if not any(h in url.lower() for h in RACE_HINTS):
                 continue

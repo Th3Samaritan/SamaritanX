@@ -163,14 +163,16 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
             indicator = recipe.get("success_indicator") or ""
             if indicator and indicator not in (ev.response_body or ""):
                 raise RuntimeError(f"form login failed — '{indicator}' not in response")
-            # capture cookies from Set-Cookie headers in the chain
-            for k, v in ev.response_headers.items():
-                if k.lower() == "set-cookie":
-                    for piece in v.split(","):
-                        if "=" in piece:
-                            name, val = piece.split("=", 1)
-                            val = val.split(";", 1)[0]
-                            store.cookies[name.strip()] = val.strip()
+            # capture cookies from httpx's own cookie jar (robust against
+            # commas inside Expires=... / cookie values, which naive
+            # Set-Cookie splitting corrupts).
+            try:
+                jar = getattr(http, "_client", None)
+                if jar is not None:
+                    for name, val in jar.cookies.items():
+                        store.cookies[name] = val
+            except Exception:
+                pass
             for h, v in (recipe.get("extra_headers") or {}).items():
                 store.headers[h] = v
         store._refresh_fn = _refresh

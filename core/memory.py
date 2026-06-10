@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS findings (
     response    TEXT,
     discovered  INTEGER NOT NULL,
     fingerprint TEXT,
+    confidence  REAL NOT NULL DEFAULT 0.5,
     metadata    TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -88,6 +89,14 @@ CREATE TABLE IF NOT EXISTS assets (
     discovered  INTEGER NOT NULL,
     UNIQUE (target, kind, value)
 );
+
+CREATE TABLE IF NOT EXISTS processed_urls (
+    target      TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    phase       TEXT NOT NULL,
+    processed   INTEGER NOT NULL,
+    PRIMARY KEY (target, url, phase)
+);
 """
 
 
@@ -98,6 +107,11 @@ class Memory:
         self._lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            try:
+                conn.execute("ALTER TABLE findings ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5")
+            except Exception:
+                pass  # column already exists
+
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -129,6 +143,12 @@ class Memory:
         finding = dict(finding)
         finding.setdefault("discovered", int(time.time()))
         finding.setdefault("metadata", {})
+        if "confidence" not in finding:
+            try:
+                from .confidence import assign
+                finding["confidence"] = round(assign(finding)[0], 2)
+            except Exception:
+                finding["confidence"] = 0.5
         fp = _fingerprint(finding)
         with self._lock, self._connect() as conn:
             existing = conn.execute(
@@ -142,8 +162,8 @@ class Memory:
                 INSERT INTO findings
                     (target, category, title, severity, cvss, url, parameter,
                      payload, evidence, request, response, discovered,
-                     fingerprint, metadata)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     fingerprint, confidence, metadata)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     finding["target"],
@@ -159,10 +179,28 @@ class Memory:
                     finding.get("response"),
                     finding["discovered"],
                     fp,
+                    float(finding.get("confidence", 0.5)),
                     json.dumps(finding.get("metadata") or {}),
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_finding(self, finding_id: int, **fields) -> None:
+        """Update fields on an existing finding. Thread-safe, uses parameterized queries."""
+        al_lowed = {"severity", "cvss", "title", "metadata", "evidence", "url",
+                    "category", "parameter", "payload", "request", "response", "confidence"}
+        updates = {k: v for k, v in fields.items() if k in al_lowed}
+        if not updates:
+            return
+        if "metadata" in updates and not isinstance(updates["metadata"], str):
+            updates["metadata"] = json.dumps(updates["metadata"])
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [finding_id]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                f"UPDATE findings SET {set_clause} WHERE id=?",
+                values,
+            )
 
     def has_finding(self, target: str, finding: dict[str, Any]) -> bool:
         fp = _fingerprint({**finding, "target": target})
@@ -282,3 +320,34 @@ class Memory:
             scored.append((centre - margin, r["payload"]))
         scored.sort(reverse=True)
         return [p for _, p in scored[:limit]]
+
+    # ---------- mid-phase resumability ----------
+    def mark_url_processed(self, target: str, url: str, phase: str) -> None:
+        """Record that a URL was already processed in a given phase so
+        resume can skip it."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO processed_urls (target, url, phase, processed) "
+                "VALUES (?,?,?,?)",
+                (target, url, phase, int(time.time())),
+            )
+
+    def is_url_processed(self, target: str, url: str, phase: str) -> bool:
+        """Check if a URL was already handled in a given phase."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM processed_urls WHERE target=? AND url=? AND phase=?",
+                (target, url, phase),
+            ).fetchone()
+            return bool(row)
+
+    def clear_processed_urls(self, target: str, phase: str | None = None) -> None:
+        """Clear processed URL bookmarks so a fresh scan runs everything."""
+        with self._lock, self._connect() as conn:
+            if phase:
+                conn.execute(
+                    "DELETE FROM processed_urls WHERE target=? AND phase=?",
+                    (target, phase),
+                )
+            else:
+                conn.execute("DELETE FROM processed_urls WHERE target=?", (target,))

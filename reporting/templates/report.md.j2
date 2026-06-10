@@ -3,6 +3,7 @@
 **Operator:** {{ operator }}
 **Date:** {{ generated_at }}
 **Findings:** {{ findings|length }}  ({{ severity_counts.critical }} critical, {{ severity_counts.high }} high, {{ severity_counts.medium }} medium, {{ severity_counts.low }} low, {{ severity_counts.info }} info)
+**Confidence:** {{ confirmed_count }} high-confidence · {{ candidate_count }} candidates needing manual verification
 
 ---
 
@@ -33,6 +34,7 @@
 
 - **Severity:** `{{ f.severity|upper }}`  (CVSS {{ "%.1f"|format(f.cvss) }})
 - **Category:** `{{ f.category }}`
+- **Confidence:** `{{ (f.confidence_label or 'unknown')|upper }}` ({{ "%.0f"|format((f.confidence or 0)*100) }}%){% if (f.confidence or 1) < 0.6 %} — ⚠ manual verification required before submitting{% endif %}
 - **URL:** `{{ f.url or "—" }}`
 {% if f.parameter %}- **Parameter:** `{{ f.parameter }}`{% endif %}
 
@@ -83,7 +85,7 @@
 
 SamaritanX (operator: `{{ operator }}`) ran an agentic pipeline against the target:
 
-1. **Recon Agent** — passive sources (crt.sh, certspotter, hackertarget) plus subfinder / amass when present, DNS brute force, and live HTTP probing with tech fingerprinting.
+1. **Recon Agent** — keyless passive sources (crt.sh, certspotter, hackertarget, AnubisDB, RapidDNS), a bundled DNS brute-force wordlist, and live HTTP probing with tech fingerprinting. Runs fully self-contained; uses subfinder / amass only if they happen to be installed.
 2. **Crawler Agent** — depth-bounded HTML walk, headless JS render, GraphQL introspection probe, secret regex sweep.
 3. **Vulnerability Agent** — fan-out to {{ scanner_count }} scanners (SQLi, XSS, SSRF, IDOR, CSRF, upload, open-redirect, CORS, cache poisoning, RCE/SSTI, API top-10, prompt injection) plus an optional nuclei sweep.
 4. **Logic Agent** — sensitive path enumeration, anonymous admin checks, pricing tampering, race-condition probes.

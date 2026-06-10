@@ -78,16 +78,17 @@ class SecretValidatorAgent(BaseAgent):
                 new_title = f"[CONFIRMED LIVE] {f['title']}"
                 live += 1
             elif valid is False:
-                # demote noise — the regex hit, but provider rejects the value
                 new_severity = "info"
                 new_cvss = 0.0
                 new_title = f"[FALSE POSITIVE — rejected by provider] {f['title']}"
                 dead += 1
-            with ctx.memory._connect() as conn:
-                conn.execute(
-                    "UPDATE findings SET severity=?, cvss=?, title=?, metadata=? WHERE id=?",
-                    (new_severity, new_cvss, new_title, json.dumps(updated_meta), f["id"]),
-                )
+            ctx.memory.update_finding(
+                f["id"],
+                severity=new_severity,
+                cvss=new_cvss,
+                title=new_title,
+                metadata=updated_meta,
+            )
         ctx.dashboard.event("ok",
             f"validator: {live} live secrets confirmed, {dead} demoted as false positives")
 

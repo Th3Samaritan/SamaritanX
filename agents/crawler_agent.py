@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup
 
 from core.logger import get_logger
 from core.task_queue import Task
-from core.utils import normalize_url, host_of
+from core.utils import normalize_url, host_of, root_domain
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -74,7 +74,13 @@ class CrawlerAgent(BaseAgent):
             for url in frontier:
                 if url in state.visited or len(state.visited) >= max_urls:
                     continue
+                # resumability: skip URLs already processed in a prior run
+                if ctx.memory.is_url_processed(ctx.target_slug, url, "crawl"):
+                    state.visited.add(url)
+                    ctx.dashboard.advance(f"crawl:{host}")
+                    continue
                 state.visited.add(url)
+                ctx.memory.mark_url_processed(ctx.target_slug, url, "crawl")
                 ctx.dashboard.advance(f"crawl:{host}")
                 ev = await ctx.http.get(url)
                 if ev.error or ev.status == 0:
@@ -91,7 +97,12 @@ class CrawlerAgent(BaseAgent):
                             continue
                         if not follow_subs and host_of(link) != host:
                             continue
-                        if not host_of(link).endswith(host.split(":")[0].split(".", 1)[-1]):
+                        # keep links inside the same registered domain (e.g.
+                        # both example.com and api.example.com pass; evil.com
+                        # does not).
+                        link_root = root_domain(host_of(link))
+                        seed_root = root_domain(host)
+                        if link_root != seed_root:
                             continue
                         state.queued.add(link)
                         next_frontier.append(link)
@@ -253,14 +264,22 @@ class CrawlerAgent(BaseAgent):
                                     priority=2, producer=self.name)
 
     async def _emit_scan_tasks(self, state: CrawlState, ctx: "Context") -> None:
-        # Group params by URL for the scanner
+        from core.injection import candidate_points
+        # Group query params by URL
         by_url: dict[str, list[str]] = {}
         for url, p in state.params:
             by_url.setdefault(url, []).append(p)
+        # Also consider every discovered endpoint for path-segment injection,
+        # even ones with no query string — that's where REST IDOR / SQLi lives.
+        for ep in state.endpoints:
+            by_url.setdefault(ep["url"], by_url.get(ep["url"], []))
         for url, params in by_url.items():
+            points = candidate_points(url, params)
+            if not points:
+                continue
             await ctx.queue.put(
                 "scan",
-                {"url": url, "method": "GET", "params": params},
+                {"url": url, "method": "GET", "params": points},
                 target=ctx.target_slug, priority=3, producer=self.name,
             )
         for form in state.forms:
@@ -273,7 +292,7 @@ class CrawlerAgent(BaseAgent):
                  "form": form},
                 target=ctx.target_slug, priority=2, producer=self.name,
             )
-        # logic / IDOR analysis — fire once per host
+        # logic / IDOR analysis -- fire once per host
         await ctx.queue.put(
             "logic",
             {"endpoints": [e["url"] for e in state.endpoints],

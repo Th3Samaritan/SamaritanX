@@ -10,6 +10,7 @@ from core.task_queue import Task
 from reporting.markdown_report import render_markdown, render_hackerone
 from reporting.pdf_report import render_pdf
 from . import walkthrough_agent
+from core.confidence import label as conf_label
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -22,6 +23,12 @@ class ReportingAgent(BaseAgent):
 
     async def handle(self, task: Task, ctx: "Context") -> None:
         findings = ctx.memory.list_findings(ctx.target_slug)
+        for f in findings:
+            f.setdefault("confidence", 0.5)
+            f["confidence_label"] = conf_label(float(f["confidence"]))
+        findings.sort(key=lambda f: (float(f.get("confidence", 0)), f.get("cvss", 0)), reverse=True)
+        confirmed = [f for f in findings if float(f.get("confidence", 0)) >= 0.6]
+        candidates = [f for f in findings if float(f.get("confidence", 0)) < 0.6]
         exploit_path = ctx.workspace / "reports" / "exploitation.json"
         playbooks = {}
         chains: list[dict] = []
@@ -53,7 +60,9 @@ class ReportingAgent(BaseAgent):
                 f"SamaritanX produced **{n} findings** against `{ctx.target}` "
                 f"({severity_counts['critical']} critical, {severity_counts['high']} high, "
                 f"{severity_counts['medium']} medium, {severity_counts['low']} low). "
-                f"Highest-CVSS issues: {top_titles}."
+                f"**{len(confirmed)} are high-confidence** (verify and submit); "
+                f"**{len(candidates)} are lower-confidence candidates** that need manual "
+                f"confirmation before submission. Highest-CVSS issues: {top_titles}."
             )
 
         proxy_cfg = ctx.config.get("proxy", {}) or {}
@@ -75,6 +84,8 @@ class ReportingAgent(BaseAgent):
                  "severity": f["severity"], "cvss": f["cvss"]}
                 for f in sorted(findings, key=lambda f: f.get("cvss", 0), reverse=True)[:10]
             ],
+            "confirmed_count": len(confirmed),
+            "candidate_count": len(candidates),
             "scanner_count": len(ctx.config.get("scanners", {}).get("enabled", []) or []),
             "rate_limit": ctx.config.get("stealth", {}).get("rate_limit_rps", 6),
             "proxy": proxy_label,

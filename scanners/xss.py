@@ -264,8 +264,5 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 
 async def _request(ctx, url, method, param, value, form):
-    if method.upper() == "GET":
-        return await ctx.http.get(merge_query(url, {param: value}))
-    data = {i["name"]: i.get("value") or random_token(4) for i in (form or {}).get("inputs", [])}
-    data[param] = value
-    return await ctx.http.post(url, data=data)
+    from core.injection import send
+    return await send(ctx, url, method, param, value, form)

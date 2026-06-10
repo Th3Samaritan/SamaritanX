@@ -79,6 +79,8 @@ def _find_sensitive_keys(node, found=None) -> set[str]:
 
 # ---------- missing rate limit ----------
 async def _missing_rate_limit(ctx, url):
+    if not ctx.config.get("safety", {}).get("aggressive"):
+        return []  # 20 auth POSTs can lock accounts — requires --aggressive
     if "/login" not in url.lower() and "/auth" not in url.lower() and "/token" not in url.lower():
         return []
     statuses = []

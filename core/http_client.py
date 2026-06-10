@@ -70,6 +70,10 @@ class _TokenBucket:
         self.last = time.monotonic()
         self.cooldown_until = 0.0
         self._lock = asyncio.Lock()
+        # error-rate tracking for dynamic rate scaling
+        self._recent_errors = 0
+        self._recent_total = 0
+        self._error_window_start = time.monotonic()
 
     def slow_down(self, seconds: float, factor: float = 0.25) -> None:
         """React to rate-limit responses by halving (default x0.25) the effective rate
@@ -77,8 +81,38 @@ class _TokenBucket:
         self.cooldown_until = time.monotonic() + seconds
         self.rate = max(0.1, self.base_rate * factor)
 
+    def record_error(self) -> None:
+        """Call on 429/503/5xx so the bucket can scale down proactively."""
+        self._recent_errors += 1
+        self._recent_total += 1
+
+    def record_success(self) -> None:
+        self._recent_total += 1
+
+    def error_fraction(self) -> float:
+        """Fraction of requests in the last window that errored."""
+        now = time.monotonic()
+        if now - self._error_window_start > 30.0:
+            self._recent_errors = max(0, self._recent_errors / 2)
+            self._recent_total = max(self._recent_total, 1)
+            self._error_window_start = now
+        if self._recent_total == 0:
+            return 0.0
+        return self._recent_errors / max(self._recent_total, 1)
+
+    def auto_scale(self) -> None:
+        """Adjust rate based on error fraction. High errors -> slower."""
+        frac = self.error_fraction()
+        if frac > 0.3:
+            self.rate = max(0.5, self.base_rate * 0.5)
+        elif frac > 0.15:
+            self.rate = max(1.0, self.base_rate * 0.75)
+        elif frac < 0.02 and self.rate < self.base_rate:
+            self.rate = min(self.base_rate, self.rate * 1.25)
+
     async def take(self) -> None:
         async with self._lock:
+            self.auto_scale()
             now = time.monotonic()
             if now > self.cooldown_until and self.rate != self.base_rate:
                 self.rate = self.base_rate
@@ -268,9 +302,14 @@ class StealthHttpClient:
                         wait = 30.0
                 wait = min(wait, 120.0)
                 self._host_buckets[host].slow_down(wait, factor=0.2)
+                self._host_buckets[host].record_error()
                 if self.dashboard:
                     self.dashboard.event("info",
                         f"backoff: host={host} status={resp.status_code} cooldown={wait:.0f}s")
+            elif resp.status_code >= 500:
+                self._host_buckets[host].record_error()
+            elif resp.status_code < 400:
+                self._host_buckets[host].record_success()
 
             return HttpEvidence(
                 method=method.upper(),

@@ -98,12 +98,7 @@ class ScreenshotAgent(BaseAgent):
                             except Exception:
                                 meta = {}
                         meta["screenshot"] = fname
-                        # update via SQLite
-                        with ctx.memory._connect() as conn:
-                            conn.execute(
-                                "UPDATE findings SET metadata=? WHERE id=?",
-                                (json.dumps(meta), fid),
-                            )
+                        ctx.memory.update_finding(fid, metadata=meta)
                     except Exception:
                         pass
                     finally:

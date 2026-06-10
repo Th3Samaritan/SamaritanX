@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
+from core.constants import LEVEL_MAP, Severity
 from core.logger import get_logger
 from core.task_queue import Task
 
@@ -29,16 +30,15 @@ class BaseAgent(ABC):
 
     # ---------- helpers shared across agents ----------
     def report_finding(self, ctx: "Context", finding: dict) -> None:
+        from core.confidence import annotate
         finding.setdefault("target", ctx.target_slug)
+        annotate(finding)
         fid = ctx.memory.record_finding(finding)
         ctx.dashboard.add_count("findings")
-        sev = finding.get("severity", "info").lower()
-        if sev in ("critical", "high", "medium", "low", "info"):
+        sev = finding.get("severity", Severity.INFO).lower()
+        if sev in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO):
             ctx.dashboard.add_count(sev)
-        level_map = {"critical": "crit", "high": "high", "medium": "med",
-                     "low": "low", "info": "info"}
-        ctx.dashboard.event(level_map.get(sev, "info"),
+        ctx.dashboard.event(LEVEL_MAP.get(sev, "info"),
                             f"[{sev.upper()}] {finding.get('title')} "
                             f"({finding.get('url') or finding.get('parameter') or ''})")
-        # walkthrough is generated lazily by the reporter; just leave breadcrumbs
         finding["_id"] = fid
