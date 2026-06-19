@@ -40,6 +40,11 @@ from .xxe import scan as scan_xxe  # noqa: E402
 from .deserialization import scan as scan_deserialization  # noqa: E402
 from .version_bypass import scan as scan_version_bypass  # noqa: E402
 from .jwt_priv_esc import scan as scan_jwt_priv_esc  # noqa: E402
+from .nosqli import scan as scan_nosqli  # noqa: E402
+from .web_cache_deception import scan as scan_web_cache_deception  # noqa: E402
+from .account_takeover import scan as scan_account_takeover  # noqa: E402
+from .param_miner import scan as scan_param_miner  # noqa: E402
+from .prototype_pollution import scan as scan_prototype_pollution  # noqa: E402
 from .subdomain_takeover import scan_takeover  # noqa: E402
 
 REGISTRY: dict[str, ScanFn] = {
@@ -68,9 +73,15 @@ REGISTRY: dict[str, ScanFn] = {
     "deserialization": scan_deserialization,
     "version_bypass": scan_version_bypass,
     "jwt_priv_esc": scan_jwt_priv_esc,
+    "nosqli": scan_nosqli,
+    "web_cache_deception": scan_web_cache_deception,
+    "account_takeover": scan_account_takeover,
+    "param_miner": scan_param_miner,
+    "prototype_pollution": scan_prototype_pollution,
 }
 
 # Scanners that justify an auth pre-flight before firing — high CVSS, slow,
 # or with side-effects expensive enough that we want a fresh session.
 HIGH_VALUE = {"rce", "ssrf", "idor_deep", "upload", "smuggling", "h2_smuggling",
-              "xxe", "jwt_priv_esc", "version_bypass", "oauth", "stored_xss"}
+              "xxe", "jwt_priv_esc", "version_bypass", "oauth", "stored_xss",
+              "nosqli", "web_cache_deception", "account_takeover"}

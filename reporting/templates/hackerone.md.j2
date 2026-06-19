@@ -23,6 +23,14 @@
 {{ f.request or "—" }}
 ```
 
+{% if f.metadata.poc_curl %}
+**Reproduce (curl)**
+
+```bash
+{{ f.metadata.poc_curl }}
+```
+
+{% endif %}
 **Payload**
 
 ```

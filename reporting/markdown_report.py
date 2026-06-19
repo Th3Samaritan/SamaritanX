@@ -40,6 +40,11 @@ CWE_MAP = {
     "graphql": ("CWE-770", "Allocation of Resources Without Limits / GraphQL"),
     "oauth": ("CWE-601", "OAuth / OIDC Misconfiguration"),
     "logic": ("CWE-840", "Business Logic Errors"),
+    "nosqli": ("CWE-943", "NoSQL Injection"),
+    "web_cache_deception": ("CWE-525", "Web Cache Deception"),
+    "account_takeover": ("CWE-640", "Weak Password Recovery / Account Takeover"),
+    "chain": ("CWE-693", "Protection Mechanism Failure (vulnerability chain)"),
+    "prototype_pollution": ("CWE-1321", "Prototype Pollution"),
 }
 
 

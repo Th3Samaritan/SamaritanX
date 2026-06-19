@@ -37,6 +37,7 @@ from agents.crawler_agent import CrawlerAgent  # noqa: E402
 from agents.discovery_agent import DiscoveryAgent  # noqa: E402
 from agents.vuln_agent import VulnerabilityAgent  # noqa: E402
 from agents.logic_agent import LogicAgent  # noqa: E402
+from agents.authz_agent import AuthzAgent  # noqa: E402
 from agents.exploit_agent import ExploitAgent  # noqa: E402
 from agents.secret_validator import SecretValidatorAgent  # noqa: E402
 from agents.screenshot_agent import ScreenshotAgent  # noqa: E402
@@ -55,6 +56,33 @@ def load_config(path: Path | None) -> dict:
     return yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
 
 
+def _parse_sessions(specs: list[str] | None) -> list[tuple[str, str, int]]:
+    """Parse repeated --session 'label=recipe.yaml[:rank]' into (label, path, rank).
+
+    Rank defaults to 1; a label containing admin/staff/super/root infers rank 2
+    so an admin recipe lifts the privilege ceiling without extra syntax.
+    """
+    out: list[tuple[str, str, int]] = []
+    for spec in specs or []:
+        if "=" not in spec:
+            console.print(f"[yellow]ignoring --session '{spec}'[/yellow] (expected label=path)")
+            continue
+        label, rest = spec.split("=", 1)
+        label = label.strip()
+        rank = None
+        if ":" in rest and not Path(rest).exists():
+            rest, rank_s = rest.rsplit(":", 1)
+            try:
+                rank = int(rank_s)
+            except ValueError:
+                rank = None
+        path = rest.strip()
+        if rank is None:
+            rank = 2 if any(k in label.lower() for k in ("admin", "staff", "super", "root")) else 1
+        out.append((label, path, rank))
+    return out
+
+
 def banner() -> None:
     console.print("[bold magenta]SamaritanX[/bold magenta] — agentic bug bounty framework  "
                   "[dim](operator: th3Samaritan)[/dim]")
@@ -66,6 +94,7 @@ def scan(
     config: Path = typer.Option(None, "--config", "-c", help="override config.yaml path"),
     auth: Path = typer.Option(None, "--auth", help="auth recipe (static / form / bearer_json) — see config/auth.example.yaml"),
     second_auth: Path = typer.Option(None, "--second-session", help="second auth recipe for IDOR/BOLA cross-tenant tests"),
+    session: list[str] = typer.Option(None, "--session", help="extra labeled identity for the authz matrix: 'label=recipe.yaml' (optional ':rank', higher=more privileged, e.g. 'admin=admin.yaml:2'). Repeatable — add an admin row for airtight BFLA."),
     scope: Path = typer.Option(None, "--scope", help="scope file (allow/deny rules) — see config/scope.example.txt"),
     resume: bool = typer.Option(False, "--resume", help="reuse memory state from a prior run (skip already-completed phases)"),
     deadline: float = typer.Option(0.0, "--deadline", help="max scan duration in seconds (0 = no limit). Kills the run gracefully when exceeded"),
@@ -84,6 +113,7 @@ def scan(
                                      help="include long-form walkthrough text in the report"),
     passive: bool = typer.Option(False, "--passive", help="passive recon only (no active probes)"),
     aggressive: bool = typer.Option(False, "--aggressive", help="enable DESTRUCTIVE checks: auth rate-limit probe (account lockout), 25x race-condition POSTs, pricing-tamper form submits. Authorized targets only."),
+    monitor: bool = typer.Option(False, "--monitor", help="baseline the attack surface and diff against the previous run — reports new subdomains/endpoints/params (use with cron / --resume for continuous monitoring)"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Run the full agentic pipeline against a target."""
@@ -126,14 +156,22 @@ def scan(
         cfg.setdefault("recon", {})["passive_only"] = True
     if aggressive:
         cfg.setdefault("safety", {})["aggressive"] = True
+    if monitor:
+        cfg.setdefault("monitor", {})["enabled"] = True
 
     log_path = Path(cfg.get("workspace", {}).get("root", "./workspace")) / "samaritanx.log"
     configure_logging(verbose=verbose, log_file=log_path)
+
+    extra_sessions = _parse_sessions(session)
+    if extra_sessions:
+        console.print("[green]identities[/green]: " +
+                      ", ".join(f"{lbl}(rank {rank})" for lbl, _, rank in extra_sessions))
 
     orch = Orchestrator(
         cfg, target,
         auth_recipe=str(auth) if auth else None,
         second_auth_recipe=str(second_auth) if second_auth else None,
+        extra_sessions=extra_sessions,
         scope_file=str(scope) if scope else None,
         resume=resume,
         deadline=deadline,
@@ -144,6 +182,7 @@ def scan(
     orch.register(DiscoveryAgent())
     orch.register(VulnerabilityAgent())
     orch.register(LogicAgent())
+    orch.register(AuthzAgent())
     orch.register(ExploitAgent())
     orch.register(SecretValidatorAgent())
     if not no_screenshots:

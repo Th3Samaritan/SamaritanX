@@ -47,6 +47,9 @@ class Context:
     session: SessionStore | None
     scope: ScopePolicy | None
     oob: OOBClient | None
+    # Extra labeled identities for the authorization matrix (e.g. an admin row).
+    # Each: {"label": str, "client": StealthHttpClient, "rank": int}.
+    extra_identities: list[dict[str, Any]] = field(default_factory=list)
     # Dynamic rate control — updated by http_client and readable by scanners
     error_rate: float = 0.0
     global_deadline: float = 0.0
@@ -57,6 +60,7 @@ class Orchestrator:
     def __init__(self, config: dict[str, Any], target: str, *,
                  auth_recipe: str | None = None,
                  second_auth_recipe: str | None = None,
+                 extra_sessions: list[tuple[str, str, int]] | None = None,
                  scope_file: str | None = None,
                  resume: bool = False,
                  deadline: float = 0.0,
@@ -67,6 +71,7 @@ class Orchestrator:
         self.root = root_domain(target)
         self.auth_recipe = auth_recipe
         self.second_auth_recipe = second_auth_recipe
+        self.extra_session_specs = extra_sessions or []
         self.scope_file = scope_file
         self.resume = resume
         self.deadline = deadline or float(config.get("scan", {}).get("deadline_seconds", 0))
@@ -94,6 +99,7 @@ class Orchestrator:
         self.session2: SessionStore | None = None
         self.scope: ScopePolicy | None = None
         self.oob: OOBClient | None = None
+        self.extra_identities: list[dict[str, Any]] = []  # {label, client, rank}
 
         self.memory.upsert_target(self.target_slug, self.root, {"input": target})
         if not resume:
@@ -121,6 +127,7 @@ class Orchestrator:
             session=self.session,
             scope=self.scope,
             oob=self.oob,
+            extra_identities=self.extra_identities,
         )
 
     def register(self, agent: "BaseAgent") -> None:
@@ -132,7 +139,7 @@ class Orchestrator:
     # Long fan-out phases legitimately run longer than a single scanner probe.
     # Capping them at the scanner timeout (default 60s) would kill recon/crawl
     # mid-sweep before they emit downstream work.
-    _LONG_PHASES = {"recon", "crawl", "discover"}
+    _LONG_PHASES = {"recon", "crawl", "discover", "authz"}
 
     def _timeout_for(self, kind: str) -> float:
         if kind in self._LONG_PHASES:
@@ -219,6 +226,20 @@ class Orchestrator:
                 self.dashboard.event("err", f"second auth recipe failed: {exc}")
                 await self.http2.close()
                 self.http2 = None
+
+        # 3b) extra labeled sessions (admin row etc.) for the authz matrix
+        for label, path, rank in self.extra_session_specs:
+            client = StealthHttpClient(self.config)
+            client.attach(scope=self.scope, dashboard=self.dashboard)
+            try:
+                store = await load_session(path, client)
+                client.attach(session=store)
+                self.extra_identities.append({"label": label, "client": client, "rank": rank})
+                self.dashboard.event("ok",
+                    f"auth: extra session '{label}' loaded (rank {rank})")
+            except Exception as exc:
+                self.dashboard.event("err", f"extra session '{label}' failed: {exc}")
+                await client.close()
 
         # 4) OOB collaborator
         self.oob = await OOBClient.create(self.config)
@@ -311,6 +332,11 @@ class Orchestrator:
         if self.http2:
             try:
                 await self.http2.close()
+            except Exception:
+                pass
+        for ident in self.extra_identities:
+            try:
+                await ident["client"].close()
             except Exception:
                 pass
         try:
