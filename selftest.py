@@ -130,19 +130,20 @@ def check_agent_routing() -> None:
     from agents.discovery_agent import DiscoveryAgent
     from agents.vuln_agent import VulnerabilityAgent
     from agents.logic_agent import LogicAgent
+    from agents.authz_agent import AuthzAgent
     from agents.exploit_agent import ExploitAgent
     from agents.secret_validator import SecretValidatorAgent
     from agents.screenshot_agent import ScreenshotAgent
     from agents.reporting_agent import ReportingAgent
 
     agents = [ReconAgent(), CrawlerAgent(), DiscoveryAgent(), VulnerabilityAgent(),
-              LogicAgent(), ExploitAgent(), SecretValidatorAgent(),
+              LogicAgent(), AuthzAgent(), ExploitAgent(), SecretValidatorAgent(),
               ScreenshotAgent(), ReportingAgent()]
     handled: set[str] = set()
     for a in agents:
         handled.update(a.handles)
     produced = {"recon", "crawl", "discover", "scan", "scan.graphql",
-                "scan.takeover", "logic", "exploit", "validate_secrets",
+                "scan.takeover", "logic", "authz", "exploit", "validate_secrets",
                 "screenshot", "report"}
     missing = produced - handled
     if missing:

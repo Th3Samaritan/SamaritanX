@@ -241,6 +241,7 @@ class StealthHttpClient:
         cookies: dict[str, str] | None = None,
         allow_redirects: bool = True,
         bypass_scope: bool = False,
+        no_session: bool = False,
     ) -> HttpEvidence:
         # 1) scope check
         if self.scope and not bypass_scope:
@@ -266,8 +267,21 @@ class StealthHttpClient:
 
         host = urlparse(url).netloc or "unknown"
         await self._stealth_pause(host)
-        hdrs = self._build_headers(headers, host)
-        cookies = self._cookies(cookies)
+        if no_session:
+            # explicit anonymous request — used by web-cache-deception and the
+            # anonymous-admin probe to prove a victim's private response is
+            # reachable without their credentials.
+            hdrs = dict(self.default_headers)
+            if self.rotate_ua:
+                hdrs["User-Agent"] = random.choice(self.user_agents)
+            if self.rotate_referer:
+                hdrs.setdefault("Referer", f"https://{host}/")
+            if headers:
+                hdrs.update(headers)
+            cookies = dict(cookies or {})
+        else:
+            hdrs = self._build_headers(headers, host)
+            cookies = self._cookies(cookies)
 
         start = time.perf_counter()
         try:

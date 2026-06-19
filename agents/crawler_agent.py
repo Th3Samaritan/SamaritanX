@@ -22,6 +22,7 @@ from urllib.parse import urljoin, urlparse, parse_qsl
 from bs4 import BeautifulSoup
 
 from core.logger import get_logger
+from core.js_intel import _SECRET_SEV
 from core.task_queue import Task
 from core.utils import normalize_url, host_of, root_domain
 from .base import BaseAgent
@@ -40,6 +41,10 @@ class CrawlState:
     forms: list[dict] = field(default_factory=list)
     params: set[tuple[str, str]] = field(default_factory=set)  # (url, param)
     secrets: list[dict] = field(default_factory=list)
+    scripts: set[str] = field(default_factory=set)             # JS bundle URLs
+    json_points: dict[str, list[str]] = field(default_factory=dict)  # url -> json: pts
+    api_tasks: list[dict] = field(default_factory=list)        # ready-made scan tasks
+    api_calls: list[dict] = field(default_factory=list)        # browser-captured XHR
 
 
 class CrawlerAgent(BaseAgent):
@@ -90,8 +95,10 @@ class CrawlerAgent(BaseAgent):
                 ctx.dashboard.add_count("endpoints")
                 self._scan_secrets(url, ev.response_body, state, ctx)
 
-                if "html" in ev.response_headers.get("content-type", "").lower():
-                    new_links, forms = self._parse_html(url, ev.response_body)
+                ctype = ev.response_headers.get("content-type", "").lower()
+                if "html" in ctype:
+                    new_links, forms, scripts = self._parse_html(url, ev.response_body)
+                    state.scripts.update(scripts)
                     for link in new_links:
                         if link in state.queued:
                             continue
@@ -107,6 +114,13 @@ class CrawlerAgent(BaseAgent):
                         state.queued.add(link)
                         next_frontier.append(link)
                     state.forms.extend(forms)
+                elif "json" in ctype:
+                    # A JSON endpoint that returns a model usually accepts the
+                    # same fields on write — synthesize body injection points.
+                    from core.surface import synthesize_json_points
+                    pts = synthesize_json_points(ev.response_body)
+                    if pts:
+                        state.json_points[url] = pts
 
                 # extract URL parameters from the URL itself
                 self._extract_url_params(url, state, ctx)
@@ -114,9 +128,15 @@ class CrawlerAgent(BaseAgent):
             frontier = next_frontier
             depth += 1
 
-        # optional headless JS render
+        # optional headless JS render (authenticated when a session is loaded)
         if parse_js:
             await self._render_with_browser(seed_url, state, ctx)
+
+        # API surface discovery — OpenAPI/Swagger spec + JS endpoint mining.
+        # This is what feeds injection points to the scanners on param-less
+        # JSON/SPA targets, where the classic crawl finds nothing to inject.
+        if ctx.config.get("crawler", {}).get("api_discovery", True):
+            await self._discover_api_surface(seed_url, state, ctx)
 
         # GraphQL introspection probe
         await self._probe_graphql(seed_url, ctx)
@@ -155,15 +175,18 @@ class CrawlerAgent(BaseAgent):
             except re.error:
                 continue
 
-    def _parse_html(self, base: str, body: str) -> tuple[list[str], list[dict]]:
+    def _parse_html(self, base: str, body: str) -> tuple[list[str], list[dict], list[str]]:
         soup = BeautifulSoup(body or "", "lxml")
         links: list[str] = []
+        scripts: list[str] = []
         for tag in soup.find_all(["a", "link", "script", "iframe"], href=True):
             href = tag.get("href")
             if href and not href.startswith(("javascript:", "mailto:", "tel:")):
                 links.append(normalize_url(urljoin(base, href)))
         for tag in soup.find_all("script", src=True):
-            links.append(normalize_url(urljoin(base, tag["src"])))
+            src = normalize_url(urljoin(base, tag["src"]))
+            links.append(src)
+            scripts.append(src)
         forms: list[dict] = []
         for f in soup.find_all("form"):
             action = normalize_url(urljoin(base, f.get("action") or base))
@@ -176,7 +199,52 @@ class CrawlerAgent(BaseAgent):
                     "value": inp.get("value") or "",
                 })
             forms.append({"action": action, "method": method, "inputs": inputs, "discovered_at": base})
-        return links, forms
+        return links, forms, scripts
+
+    async def _discover_api_surface(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
+        """Probe for an OpenAPI/Swagger spec and mine JS bundles (incl. source
+        maps + embedded secrets), turning both into ready-to-run scan tasks."""
+        from core.surface import discover_openapi
+        try:
+            state.api_tasks.extend(await discover_openapi(ctx, seed_url))
+        except Exception as exc:
+            log.debug("openapi discovery failed: %s", exc)
+        try:
+            if ctx.config.get("crawler", {}).get("mine_javascript", True) and state.scripts:
+                await self._mine_js_intel(seed_url, state, ctx)
+        except Exception as exc:
+            log.debug("js intelligence failed: %s", exc)
+
+    async def _mine_js_intel(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
+        from core.js_intel import harvest_js
+        intel = await harvest_js(ctx, list(state.scripts), seed_url)
+        state.api_tasks.extend(intel["tasks"])
+
+        for sec in intel["secrets"]:
+            sev, cvss = _SECRET_SEV.get(sec["kind"], ("medium", 6.0))
+            self.report_finding(ctx, {
+                "category": "secret_exposure",
+                "title": f"Hardcoded {sec['kind']} in client JavaScript",
+                "severity": sev, "cvss": cvss,
+                "url": sec["url"],
+                "evidence": f"`{sec['kind']}` found in bundle/source: {sec['sample']}",
+                "metadata": {"kind": sec["kind"], "source": "js_intel"},
+            })
+        for smap in intel["sourcemaps"]:
+            self.report_finding(ctx, {
+                "category": "exposure",
+                "title": "Source map exposed in production (original source recoverable)",
+                "severity": "medium", "cvss": 5.3,
+                "url": smap,
+                "evidence": "A reachable .map with embedded sourcesContent lets anyone "
+                            "reconstruct the original front-end source (routes, comments, "
+                            "internal API shapes).",
+                "metadata": {"source": "js_intel"},
+            })
+        if intel["tasks"] or intel["secrets"] or intel["sourcemaps"]:
+            ctx.dashboard.event("ok",
+                f"js-intel: {len(intel['tasks'])} endpoints, {len(intel['secrets'])} secrets, "
+                f"{len(intel['sourcemaps'])} source maps, {len(intel['graphql_ops'])} graphql ops")
 
     def _extract_url_params(self, url: str, state: CrawlState, ctx: "Context") -> None:
         for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True):
@@ -212,12 +280,25 @@ class CrawlerAgent(BaseAgent):
             async with browser_slot(ctx.config), async_playwright() as pw:
                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
                 context = await browser.new_context(ignore_https_errors=True)
+                # Drive the browser as the authenticated user so post-login
+                # dashboards / account pages / API calls are reachable — that's
+                # where BOLA, priv-esc and admin-only bugs live.
+                authed = await self._inject_session(context, seed_url, ctx)
                 page = await context.new_page()
                 xhr_endpoints: list[str] = []
 
-                async def on_request(req):
-                    if req.resource_type in ("xhr", "fetch"):
-                        xhr_endpoints.append(req.url)
+                def on_request(req):
+                    if req.resource_type not in ("xhr", "fetch"):
+                        return
+                    xhr_endpoints.append(req.url)
+                    # capture write bodies for json-field injection
+                    if req.method in ("POST", "PUT", "PATCH"):
+                        try:
+                            body = req.post_data
+                        except Exception:
+                            body = None
+                        if body:
+                            self._record_api_call(state, req.url, req.method, body)
 
                 page.on("request", on_request)
                 try:
@@ -228,8 +309,13 @@ class CrawlerAgent(BaseAgent):
                 hrefs = await page.eval_on_selector_all(
                     "a[href]", "els => els.map(e => e.href)")
                 await browser.close()
+                if authed:
+                    ctx.dashboard.event("info",
+                        f"crawler: authenticated render harvested {len(xhr_endpoints)} XHR call(s)")
                 for href in hrefs + xhr_endpoints:
                     href = normalize_url(href)
+                    if root_domain(host_of(href)) != root_domain(host_of(seed_url)):
+                        continue
                     if href not in state.queued:
                         state.queued.add(href)
                         state.endpoints.append({"url": href, "status": -1, "ctype": "js-discovered"})
@@ -237,6 +323,31 @@ class CrawlerAgent(BaseAgent):
                         self._extract_url_params(href, state, ctx)
         except Exception as exc:
             log.debug("browser render failed: %s", exc)
+
+    async def _inject_session(self, context, seed_url: str, ctx: "Context") -> bool:
+        """Attach the primary session's cookies + headers to a Playwright
+        context. Returns True if the browser is now authenticated."""
+        session = getattr(ctx.http, "session", None)
+        if not session or not session.is_authed():
+            return False
+        try:
+            if session.cookies:
+                cookies = [{"name": k, "value": v, "url": seed_url}
+                           for k, v in session.cookies.items()]
+                await context.add_cookies(cookies)
+            if session.headers:
+                await context.set_extra_http_headers(dict(session.headers))
+        except Exception as exc:
+            log.debug("session injection into browser failed: %s", exc)
+            return False
+        return True
+
+    def _record_api_call(self, state: CrawlState, url: str, method: str, body: str) -> None:
+        from core.surface import synthesize_json_points
+        pts = synthesize_json_points(body)
+        if pts:
+            state.api_calls.append({"url": normalize_url(url), "method": method,
+                                    "params": pts, "source": "xhr"})
 
     async def _probe_graphql(self, seed_url: str, ctx: "Context") -> None:
         candidates = [
@@ -292,10 +403,37 @@ class CrawlerAgent(BaseAgent):
                  "form": form},
                 target=ctx.target_slug, priority=2, producer=self.name,
             )
+
+        # JSON request-body injection points synthesized from JSON responses.
+        for url, pts in state.json_points.items():
+            await ctx.queue.put(
+                "scan",
+                {"url": url, "method": "POST", "params": pts},
+                target=ctx.target_slug, priority=2, producer=self.name,
+            )
+
+        # Ready-made tasks from OpenAPI parsing + JS mining + captured XHR.
+        # These carry their own method and typed injection points (json:/path:).
+        for t in state.api_tasks + state.api_calls:
+            if not t.get("params"):
+                continue
+            await ctx.queue.put(
+                "scan",
+                {"url": t["url"], "method": t.get("method", "GET"),
+                 "params": t["params"]},
+                target=ctx.target_slug, priority=2, producer=self.name,
+            )
+
+        endpoint_urls = [e["url"] for e in state.endpoints]
         # logic / IDOR analysis -- fire once per host
         await ctx.queue.put(
             "logic",
-            {"endpoints": [e["url"] for e in state.endpoints],
-             "forms": state.forms},
+            {"endpoints": endpoint_urls, "forms": state.forms},
+            target=ctx.target_slug, priority=4, producer=self.name,
+        )
+        # authorization matrix (BOLA/BFLA across identities) -- once per host
+        await ctx.queue.put(
+            "authz",
+            {"endpoints": endpoint_urls},
             target=ctx.target_slug, priority=4, producer=self.name,
         )

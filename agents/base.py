@@ -31,8 +31,19 @@ class BaseAgent(ABC):
     # ---------- helpers shared across agents ----------
     def report_finding(self, ctx: "Context", finding: dict) -> None:
         from core.confidence import annotate
+        from core.poc import build_curl, build_repro
         finding.setdefault("target", ctx.target_slug)
         annotate(finding)
+        # attach a copy-paste PoC (persisted via the metadata JSON column)
+        try:
+            meta = finding.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                meta.setdefault("poc_curl", build_curl(finding))
+                repro = build_repro(finding)
+                if repro and repro != meta.get("poc_curl"):
+                    meta.setdefault("poc_repro", repro)
+        except Exception:
+            pass
         fid = ctx.memory.record_finding(finding)
         ctx.dashboard.add_count("findings")
         sev = finding.get("severity", Severity.INFO).lower()

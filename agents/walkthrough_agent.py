@@ -179,6 +179,99 @@ CATEGORY_NARRATIVE = {
                        "request Origin without validation. Don't combine `*` "
                        "with credentials.",
     },
+    "web_cache_deception": {
+        "what": "Authenticated, user-specific pages were requested with a "
+                "static-looking suffix (e.g. `/account/settings/x.css`); the "
+                "same crafted URL was then fetched with no cookies.",
+        "why": "The CDN caches by file extension while the origin ignores the "
+               "trailing path segment, so a private response gets stored under "
+               "a publicly cacheable key.",
+        "how": "The anonymous fetch returned the victim's private data — "
+               "identity markers from the authenticated response reappeared "
+               "without any credentials.",
+        "impact": "Any attacker can read another user's private page (PII, "
+                  "tokens, account data) straight from the shared cache.",
+        "remediation": "Make the cache key include the full path and auth state; "
+                       "set `Cache-Control: private/no-store` on dynamic "
+                       "responses; have the origin reject unknown trailing "
+                       "segments instead of serving the base resource.",
+    },
+    "nosqli": {
+        "what": "Query/body parameters were injected with NoSQL operators "
+                "(`$ne`, `$gt`, `$regex`, `$where`) and, on login endpoints, "
+                "credentials were replaced with operator objects.",
+        "why": "User input is interpolated into a NoSQL query (MongoDB/CouchDB) "
+               "as structured data instead of a literal value, so operators "
+               "change the query semantics.",
+        "how": "An operator flipped the result set (boolean), raised a driver "
+               "error, delayed the response (`$where` sleep), or authenticated "
+               "without a valid password.",
+        "impact": "Authentication bypass, blind data extraction, and — via "
+                  "`$where` server-side JS — potential remote code execution.",
+        "remediation": "Reject non-scalar values for credential/query fields, "
+                       "cast input to the expected type, and disable server-side "
+                       "JS (`$where`, `mapReduce`) on the database.",
+    },
+    "account_takeover": {
+        "what": "Authentication-flow endpoints (forgot/reset/confirm/register) "
+                "were probed with injected Host/X-Forwarded-Host headers, "
+                "checked for tokens carried in the URL alongside third-party "
+                "resources, and compared for known vs unknown accounts.",
+        "why": "Reset links are often built from the request Host header, tokens "
+               "leak to third-party origins via Referer, and reset endpoints "
+               "reveal whether an account exists.",
+        "how": "The attacker host was reflected into the response / a URL token "
+               "co-occurred with third-party resource loads / responses differed "
+               "by account existence.",
+        "impact": "Full account takeover — the victim's reset token is delivered "
+                  "to attacker-controlled infrastructure or leaked cross-origin.",
+        "remediation": "Build reset links from a server-side configured base URL, "
+                       "never the request Host. Keep tokens out of the URL (use "
+                       "POST bodies) and forbid third-party resources on auth "
+                       "pages. Return identical responses regardless of account "
+                       "existence.",
+    },
+    "prototype_pollution": {
+        "what": "The endpoint was loaded with `__proto__[x]` / "
+                "`constructor[prototype][x]` in the query (checked in a real "
+                "browser) and POSTed `{\"__proto__\": {...}}` JSON bodies.",
+        "why": "Untrusted keys are merged into a JavaScript object that shares "
+               "the global `Object.prototype`, so attacker keys appear on every "
+               "object in the runtime.",
+        "how": "`Object.prototype.<prop>` came back attacker-controlled in the "
+               "browser, or the server reflected/erred on the polluted key.",
+        "impact": "Gadget-dependent: DOM XSS, authentication/authorization logic "
+                  "bypass, or denial of service / RCE on the server side.",
+        "remediation": "Reject `__proto__`/`constructor`/`prototype` keys, use "
+                       "`Object.create(null)` or `Map` for untrusted data, and "
+                       "avoid recursive merge of attacker input.",
+    },
+    "param_discovery": {
+        "what": "A wordlist of undocumented parameter names was sent and the "
+                "ones the server reflected or reacted to were isolated by "
+                "binary-split.",
+        "why": "Hidden parameters often gate debug modes, authorization, or "
+               "unsafe sinks that the public UI never exposes.",
+        "how": "The named parameters changed the response (reflection / length / "
+               "status) versus a clean baseline.",
+        "impact": "Varies — the discovered parameters are re-queued for the "
+                  "injection scanners; impact depends on what they control.",
+        "remediation": "Remove debug/internal parameters from production and "
+                       "apply the same authorization checks to every accepted "
+                       "parameter.",
+    },
+    "chain": {
+        "what": "Two or more individually-scored findings on the same target "
+                "were combined and the escalation path was verified.",
+        "why": "Real-world impact often emerges only when primitives are "
+               "chained — a low-severity bug becomes critical in context.",
+        "how": "The component findings were correlated by origin/host and the "
+               "escalation step was reproduced (see evidence).",
+        "impact": "See the chain narrative — typically account takeover, "
+                  "credential theft, or cross-tenant compromise.",
+        "remediation": "Fix any single link to break the chain; prioritise the "
+                       "lowest-effort component called out in the narrative.",
+    },
     "cache_poisoning": {
         "what": "Unkeyed headers (X-Forwarded-Host, X-Host, Forwarded) were "
                 "sent with an attacker marker; the URL was then re-fetched "

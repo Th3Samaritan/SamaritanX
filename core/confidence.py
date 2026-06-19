@@ -90,8 +90,36 @@ def assign(finding: dict[str, Any]) -> tuple[float, str]:
     if cat == "open_redirect":
         return 0.85, "Location header to attacker host"
     if cat == "cors":
-        return (0.85, "origin reflected with credentials") if "credential" in title \
+        # escalated CORS: severity is driven by what actually leaked
+        if meta.get("leaked"):
+            return 0.9, "credentialed read leaks sensitive data"
+        return (0.8, "origin reflected with credentials") if "credential" in title \
             else (0.5, "permissive ACAO without credentials")
+    if cat == "web_cache_deception":
+        # the scanner only fires after confirming anonymous retrieval of private data
+        return 0.9, "victim data served from cache to anonymous request"
+    if cat == "nosqli":
+        if detection in ("auth_bypass", "error"):
+            return 0.9, "auth bypass / driver error"
+        if detection == "time":
+            return 0.88, "reproduced $where time oracle"
+        return 0.7, "boolean operator result-set flip"
+    if cat == "chain":
+        # a chain whose escalation step was actively reproduced is hard proof;
+        # an un-verified (structurally co-located) chain stays tentative-firm
+        return (0.9, "escalation reproduced") if meta.get("verified") \
+            else (0.55, "components co-located — verify escalation step")
+    if cat == "prototype_pollution":
+        return (0.9, "Object.prototype mutated in a real browser") \
+            if detection == "client_proto" else (0.45, "server-side candidate — confirm gadget")
+    if cat == "param_discovery":
+        return 0.7, "server processes an undocumented parameter"
+    if cat == "account_takeover":
+        if detection in ("host_reflection", "host_reflection_post", "referer_leak"):
+            return 0.85, "attacker host reflected / token leaks via Referer"
+        if detection == "host_blind":
+            return 0.45, "reset accepted with injected host — confirm via email"
+        return 0.4, "user enumeration heuristic"
     if cat == "cache_poisoning":
         return 0.7, "unkeyed header reflected into cached response"
     if cat in ("smuggling", "h2_smuggling"):

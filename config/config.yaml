@@ -83,6 +83,8 @@ crawler:
   follow_subdomains: true
   honor_robots: false           # bug bounty hunters typically ignore robots
   extract_secrets: true
+  api_discovery: true           # probe OpenAPI/Swagger specs -> typed injection points
+  mine_javascript: true         # mine JS bundles for endpoints + params (SPA/API targets)
 
 scanners:
   enabled:
@@ -111,6 +113,11 @@ scanners:
     - deserialization
     - version_bypass
     - jwt_priv_esc
+    - nosqli                # MongoDB/CouchDB operator injection + auth bypass
+    - web_cache_deception   # private response cached publicly (self-escalating)
+    - account_takeover      # reset poisoning, token leak, user enumeration
+    - param_miner           # Arjun-style hidden parameter discovery
+    - prototype_pollution   # client-side (browser-confirmed) + server-side
   nuclei: true
   nuclei_severity: "low,medium,high,critical"
 
@@ -132,6 +139,15 @@ logic_analysis:
   test_auth_flows: true
   test_idor: true
   test_privilege_escalation: true
+
+authz:
+  enabled: true
+  max_endpoints: 120        # endpoint templates tested across identities per host
+
+monitor:
+  enabled: false            # set true (or pass --monitor) to baseline + diff each run
+  webhook: ""               # optional POST URL for new-surface alerts (Slack/Discord/etc.)
+  keep_diffs: 30            # retain only the newest N diff artifacts (0 = keep all)
 
 reporting:
   format: ["markdown", "pdf"]
