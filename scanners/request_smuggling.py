@@ -62,18 +62,8 @@ async def _raw_send(host: str, port: int, payload: bytes, use_tls: bool,
     return time.perf_counter() - start, data
 
 
-async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
-    findings: list[dict] = []
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    if not host:
-        return findings
-    if ctx.scope and not ctx.scope.allows(url)[0]:
-        return findings
-    use_tls = parsed.scheme == "https"
-    port = parsed.port or (443 if use_tls else 80)
-    path = parsed.path or "/"
-
+def _payloads(host: str, path: str) -> dict[str, bytes]:
+    """The two timing-oracle payload shapes, keyed by smuggle class."""
     # CL.TE: front-end honors Content-Length=4 (G\r\n\r\n), back-end honors Transfer-Encoding -> reads one chunk of size 0 then waits
     cl_te = (
         f"POST {path} HTTP/1.1\r\n"
@@ -96,26 +86,117 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         f"\r\n"
         f"{te_cl_body}"
     ).encode()
+    return {"CL.TE": cl_te, "TE.CL": te_cl}
 
+
+async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
+    findings: list[dict] = []
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        return findings
+    if ctx.scope and not ctx.scope.allows(url)[0]:
+        return findings
+    use_tls = parsed.scheme == "https"
+    port = parsed.port or (443 if use_tls else 80)
+    path = parsed.path or "/"
+
+    pl = _payloads(host, path)
     bucket = ctx.http.host_bucket(parsed.netloc)
-    elapsed_cl_te, _ = await _raw_send(host, port, cl_te, use_tls, bucket=bucket)
-    elapsed_te_cl, _ = await _raw_send(host, port, te_cl, use_tls, bucket=bucket)
 
+    # Round 1: which shape (if any) hangs while its inverse stays prompt?
+    elapsed_cl_te, _ = await _raw_send(host, port, pl["CL.TE"], use_tls, bucket=bucket)
+    elapsed_te_cl, _ = await _raw_send(host, port, pl["TE.CL"], use_tls, bucket=bucket)
     if elapsed_cl_te > 5.0 and elapsed_te_cl < 5.0:
-        findings.append(_finding(url, "CL.TE", elapsed_cl_te))
+        kind, first = "CL.TE", elapsed_cl_te
     elif elapsed_te_cl > 5.0 and elapsed_cl_te < 5.0:
-        findings.append(_finding(url, "TE.CL", elapsed_te_cl))
+        kind, first = "TE.CL", elapsed_te_cl
+    else:
+        return findings  # no differential — not even a candidate
+
+    # A single timing sample flaps (CDN jitter, cold connections). Require the
+    # differential to reproduce on a confirmation round before reporting, and
+    # ship the samples so the finding carries its own proof.
+    inverse = "TE.CL" if kind == "CL.TE" else "CL.TE"
+    t_slow2, _s = await _raw_send(host, port, pl[kind], use_tls, bucket=bucket)
+    t_fast2, _f = await _raw_send(host, port, pl[inverse], use_tls, bucket=bucket)
+    if not (t_slow2 > 5.0 and t_fast2 < 5.0):
+        return findings  # did not reproduce — treat as jitter, not a finding
+
+    samples = [{"flagged_shape_s": round(first, 2),
+                "inverse_shape_s": round(elapsed_te_cl if kind == "CL.TE" else elapsed_cl_te, 2)},
+               {"flagged_shape_s": round(t_slow2, 2), "inverse_shape_s": round(t_fast2, 2)}]
+    findings.append(_finding(url, kind, t_slow2, samples=samples))
     return findings
 
 
-def _finding(url: str, kind: str, elapsed: float) -> dict:
+async def reprobe(ctx: "Context", finding: dict):
+    """Re-verify a CL.TE/TE.CL finding by re-measuring the timing differential.
+
+    Returns ``(result, proof)`` where result is True (reproduced consistently),
+    False (differential clearly gone — likely a fluke), or None (too noisy /
+    not applicable). The proof dict captures the raw payload and every timing
+    sample so the report can show the actual oracle, not a curl.
+    """
+    url = finding.get("url") or ""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        return None, {}
+    if ctx.scope and not ctx.scope.allows(url)[0]:
+        return None, {}
+    kind = (finding.get("metadata") or {}).get("kind")
+    if kind not in ("CL.TE", "TE.CL"):
+        return None, {}
+    use_tls = parsed.scheme == "https"
+    port = parsed.port or (443 if use_tls else 80)
+    path = parsed.path or "/"
+    bucket = ctx.http.host_bucket(parsed.netloc)
+    pl = _payloads(host, path)
+    inverse = "TE.CL" if kind == "CL.TE" else "CL.TE"
+
+    samples = []
+    for _ in range(2):
+        t_slow, _d = await _raw_send(host, port, pl[kind], use_tls, bucket=bucket)
+        t_fast, _d2 = await _raw_send(host, port, pl[inverse], use_tls, bucket=bucket)
+        samples.append({"flagged_shape_s": round(t_slow, 2),
+                        "inverse_shape_s": round(t_fast, 2)})
+
+    confirmed = all(s["flagged_shape_s"] > 5.0 and s["inverse_shape_s"] < 5.0
+                    for s in samples)
+    clearly_fast = all(s["flagged_shape_s"] < 5.0 for s in samples)
+    proof = {
+        "verified": confirmed, "method": "RAW-SOCKET", "url": url,
+        "request": f"{kind} timing-oracle payload (raw socket):\n"
+                   + pl[kind].decode(errors="replace"),
+        "samples": samples,
+        "rationale": (
+            f"The {kind} shape hung (>5s) while its inverse {inverse} returned "
+            f"promptly across {len(samples)} repeats — a reproducible front/back-end "
+            "header-parsing disagreement."
+            if confirmed else
+            "Timing differential did not reproduce consistently on re-test."),
+    }
+    if confirmed:
+        return True, proof
+    if clearly_fast:
+        return False, proof
+    return None, proof
+
+
+def _finding(url: str, kind: str, elapsed: float, samples: list | None = None) -> dict:
+    meta = {"kind": kind, "elapsed_s": elapsed}
+    if samples:
+        meta["samples"] = samples
+    confirmed = " (confirmed across 2 rounds)" if samples else ""
     return {
         "category": "smuggling",
         "title": f"HTTP request smuggling ({kind}) — front/back-end disagree",
         "severity": "high", "cvss": 8.1,
         "url": url,
         "evidence": f"{kind} payload triggered a {elapsed:.2f}s hang while the inverse "
-                    "shape returned promptly — strong signal of header-parsing disagreement.",
+                    f"shape returned promptly{confirmed} — strong signal of header-parsing "
+                    "disagreement.",
         "request": f"POST {url}\nTransfer-Encoding: chunked + Content-Length",
-        "metadata": {"kind": kind, "elapsed_s": elapsed},
+        "metadata": meta,
     }

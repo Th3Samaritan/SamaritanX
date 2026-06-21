@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Optional
 
 from .confidence import label as conf_label
 from .injection import send, parse_point
+from .poc import is_auth_wall, is_static_asset, proof_record
 
 if TYPE_CHECKING:
     from .orchestrator import Context
@@ -122,6 +123,87 @@ async def _re_crlf(ctx, f):
     return "samaritanx" in hdr_blob or "sx-" in hdr_blob
 
 
+async def _re_broken_auth(ctx, f):
+    """Prove (or drop) a 'reachable without authentication' finding.
+
+    The dominant false positive here is an app that 200s its *login page* — the
+    naive detector reads "200 + body" as privileged access. We re-fetch with no
+    credentials at all and decide:
+      * auth wall (login page / redirect / 401-403) → False  (drop the FP)
+      * static asset                                → False  (not a page at all)
+      * substantive page with identity/sensitive markers → True + captured PoC
+      * reachable but unprovable as privileged      → None   (skip, manual check)
+    Cross-identity / BFLA findings need a stateful identity replay we can't do
+    single-shot, so they are skipped honestly.
+    """
+    meta = f.get("metadata") or {}
+    if meta.get("detection") == "authz_matrix" and meta.get("identity") not in (None, "anon"):
+        return None  # BFLA/BOLA — needs per-identity sessions, not single-shot
+    url = f.get("url")
+    if not url:
+        return None
+    ev = await ctx.http.get(url, no_session=True,
+                            headers={"Authorization": "", "Cookie": ""})
+    if not ev or not ev.status:
+        return None
+    wall, why = is_auth_wall(ev.status, ev.response_headers, ev.response_body, url)
+    if wall:
+        meta["revalidation_proof"] = f"unauth re-fetch hit an auth wall — {why} (HTTP {ev.status})"
+        f["metadata"] = meta
+        return False
+    if is_static_asset(url, ev.response_headers):
+        meta["revalidation_proof"] = "URL serves a static asset, not privileged content"
+        f["metadata"] = meta
+        return False
+    body = ev.response_body or ""
+    if ev.status != 200 or len(body) < 200:
+        return False
+    from scanners.idor_deep import identity_markers
+    from .escalation import sensitive_hits
+    markers = sorted(identity_markers(body))[:6]
+    sensitive = [k for k, _ in sensitive_hits(body, ev.response_headers)]
+    if not markers and not sensitive:
+        meta["revalidation_proof"] = (
+            "reachable unauthenticated and not a login page, but no identity / "
+            "sensitive markers were found — confirm privileged content manually")
+        f["metadata"] = meta
+        return None
+    meta["poc"] = proof_record(
+        verified=True, method="GET", url=url,
+        request=f"GET {url}\n(sent with no Cookie and no Authorization header)",
+        status=ev.status, excerpt=body,
+        rationale=(f"Fetched with zero credentials and received privileged content "
+                   f"(identity markers={markers}, sensitive={sensitive}); the response "
+                   "is not a login, redirect, or deny page — authentication is not enforced."))
+    f["metadata"] = meta
+    return True
+
+
+async def _re_smuggling(ctx, f):
+    """Confirm a timing-oracle smuggle is reproducible, not a one-off fluke.
+
+    Delegates to the scanner's raw-socket re-probe (it owns the byte-level
+    payloads). Confirms only when the flagged shape is consistently slow and its
+    inverse consistently fast across repeats; drops when the differential is
+    clearly gone; skips when the network is too noisy to decide."""
+    kind = (f.get("metadata") or {}).get("kind")
+    try:
+        if kind in ("CL.TE", "TE.CL"):
+            from scanners.request_smuggling import reprobe
+        elif kind == "h2_crlf_path":
+            from scanners.h2_smuggling import reprobe
+        else:
+            return None  # continuation flood / h2c: no single-shot timing oracle
+        result, proof = await reprobe(ctx, f)
+    except Exception:  # noqa: BLE001
+        return None
+    if result is True and proof:
+        meta = f.get("metadata") or {}
+        meta["poc"] = proof
+        f["metadata"] = meta
+    return result
+
+
 REVALIDATORS = {
     "cors": _re_cors,
     "xss": _re_reflect, "stored_xss": _re_reflect,
@@ -129,6 +211,8 @@ REVALIDATORS = {
     "open_redirect": _re_open_redirect,
     "sqli": _re_sql_error, "nosqli": _re_nosql,
     "ssrf": _re_ssrf, "crlf": _re_crlf,
+    "broken_auth": _re_broken_auth,
+    "smuggling": _re_smuggling,
 }
 
 # categories we deliberately never auto-revalidate (hard proof or not single-shot)

