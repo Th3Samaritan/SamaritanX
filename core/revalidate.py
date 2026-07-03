@@ -99,10 +99,39 @@ async def _re_reflect(ctx, f):
         return None
     ev = await _refire(ctx, f)
     if ev and payload in (ev.response_body or ""):
-        return _capture(f, ev, method=_re_method(f),
-                        rationale=f"The payload {payload!r} was reflected unencoded in the "
-                                  "response body on a fresh re-fire.")
+        _capture(f, ev, method=_re_method(f),
+                 rationale=f"The payload {payload!r} was reflected unencoded in the "
+                           "response body on a fresh re-fire.")
+        # Upgrade to hard proof if we can watch the sink fire in a real browser.
+        await _browser_upgrade(ctx, f, payload)
+        return True
     return False
+
+
+async def _browser_upgrade(ctx, f, payload: str) -> None:
+    """Best-effort: replace a reflection proof with a browser-execution proof
+    (screenshot + fired sink) when Playwright is available. Never weakens the
+    existing proof — only strengthens it."""
+    try:
+        from core import browser_verify
+        if not browser_verify.available():
+            return
+        # a unique alphanumeric token from the payload is what the alert/console
+        # will carry; use it as the execution marker
+        import re as _re
+        tokens = _re.findall(r"[A-Za-z0-9]{4,}", payload)
+        marker = max(tokens, key=len) if tokens else ""
+        if not marker:
+            return
+        url = f.get("url") or ""
+        proof = await browser_verify.verify_xss(
+            ctx.config, url, marker=marker, workspace=getattr(ctx, "workspace", None))
+        if proof:
+            meta = f.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                meta["poc"] = proof  # browser proof supersedes reflection
+    except Exception:
+        pass
 
 
 async def _re_rce(ctx, f):
@@ -214,9 +243,23 @@ async def _re_broken_auth(ctx, f):
     single-shot, so they are skipped honestly.
     """
     meta = f.get("metadata") or {}
+    url = f.get("url")
+    # If we have multiple identities, try the strongest proof first: does another
+    # identity read this user's private data? A captured cross-identity leak is
+    # hard BOLA/BFLA proof.
+    if url:
+        try:
+            from .identity_matrix import cross_access_check
+            leak = await cross_access_check(ctx, url)
+        except Exception:
+            leak = None
+        if leak and (leak.get("metadata") or {}).get("poc"):
+            f["metadata"] = {**meta, "poc": leak["metadata"]["poc"],
+                             "detection": "identity_matrix",
+                             "leaked_markers": leak["metadata"].get("leaked_markers")}
+            return True
     if meta.get("detection") == "authz_matrix" and meta.get("identity") not in (None, "anon"):
         return None  # BFLA/BOLA — needs per-identity sessions, not single-shot
-    url = f.get("url")
     if not url:
         return None
     ev = await ctx.http.get(url, no_session=True,

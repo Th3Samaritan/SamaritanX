@@ -28,12 +28,31 @@ class ReportingAgent(BaseAgent):
             f["confidence_label"] = conf_label(float(f["confidence"]))
         all_findings.sort(key=lambda f: (float(f.get("confidence", 0)), f.get("cvss", 0)), reverse=True)
 
+        # Collapse duplicate findings (same root cause across many URLs) into one
+        # representative with an affected-endpoints list, so the report shows N
+        # distinct issues, not N URLs.
+        from core.correlate import deduplicate
+        all_findings = deduplicate(all_findings)
+
         # HARD PROOF-GATE: only findings that carry a captured, re-tested PoC are
         # reported. Everything else is quarantined to candidates.json and never
         # presented as a finding. This is the false-positive kill-switch.
         from core.proof_gate import partition
         findings, candidates = partition(all_findings)
         confirmed = findings  # every reported finding is, by definition, proven
+
+        # LLM assist (judge over captured evidence, never a detector): write an
+        # impact narrative + CVSS rationale for each PROVEN finding. Falls back to
+        # deterministic templates when no API key is configured.
+        try:
+            from core.llm import triage_impact
+            for f in findings:
+                assessment = await triage_impact(f, ctx.config)
+                meta = f.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    meta["impact_assessment"] = assessment
+        except Exception as exc:  # noqa: BLE001
+            ctx.dashboard.event("err", f"impact triage skipped: {exc}")
         exploit_path = ctx.workspace / "reports" / "exploitation.json"
         playbooks = {}
         chains: list[dict] = []
