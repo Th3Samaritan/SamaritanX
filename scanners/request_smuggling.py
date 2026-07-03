@@ -211,10 +211,12 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     host = parsed.hostname or ""
     if not host:
         return findings
-    if ctx.scope and not ctx.scope.allows(url)[0]:
-        return findings
-    # scope hygiene: never smuggle-test third-party CDNs or static assets
-    if not _same_site(host, ctx.target):
+    # scope hygiene: active_allows refuses third-party CDNs and off-domain hosts
+    if ctx.scope:
+        ok, _why = ctx.scope.active_allows(url, ctx.target)
+        if not ok:
+            return findings
+    elif not _same_site(host, ctx.target):
         return findings
     if _is_static(parsed.path or "/"):
         return findings
