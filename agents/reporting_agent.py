@@ -22,13 +22,37 @@ class ReportingAgent(BaseAgent):
     handles = ("report",)
 
     async def handle(self, task: Task, ctx: "Context") -> None:
-        findings = ctx.memory.list_findings(ctx.target_slug)
-        for f in findings:
+        all_findings = ctx.memory.list_findings(ctx.target_slug)
+        for f in all_findings:
             f.setdefault("confidence", 0.5)
             f["confidence_label"] = conf_label(float(f["confidence"]))
-        findings.sort(key=lambda f: (float(f.get("confidence", 0)), f.get("cvss", 0)), reverse=True)
-        confirmed = [f for f in findings if float(f.get("confidence", 0)) >= 0.6]
-        candidates = [f for f in findings if float(f.get("confidence", 0)) < 0.6]
+        all_findings.sort(key=lambda f: (float(f.get("confidence", 0)), f.get("cvss", 0)), reverse=True)
+
+        # Collapse duplicate findings (same root cause across many URLs) into one
+        # representative with an affected-endpoints list, so the report shows N
+        # distinct issues, not N URLs.
+        from core.correlate import deduplicate
+        all_findings = deduplicate(all_findings)
+
+        # HARD PROOF-GATE: only findings that carry a captured, re-tested PoC are
+        # reported. Everything else is quarantined to candidates.json and never
+        # presented as a finding. This is the false-positive kill-switch.
+        from core.proof_gate import partition
+        findings, candidates = partition(all_findings)
+        confirmed = findings  # every reported finding is, by definition, proven
+
+        # LLM assist (judge over captured evidence, never a detector): write an
+        # impact narrative + CVSS rationale for each PROVEN finding. Falls back to
+        # deterministic templates when no API key is configured.
+        try:
+            from core.llm import triage_impact
+            for f in findings:
+                assessment = await triage_impact(f, ctx.config)
+                meta = f.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    meta["impact_assessment"] = assessment
+        except Exception as exc:  # noqa: BLE001
+            ctx.dashboard.event("err", f"impact triage skipped: {exc}")
         exploit_path = ctx.workspace / "reports" / "exploitation.json"
         playbooks = {}
         chains: list[dict] = []
@@ -51,18 +75,23 @@ class ReportingAgent(BaseAgent):
         # executive summary
         n = len(findings)
         if n == 0:
-            exec_summary = "No findings were produced by the automated pipeline. " \
-                           "The asset surface and crawled corpus are still in /recon and /crawl."
+            exec_summary = (
+                f"No **proven** findings against `{ctx.target}`. "
+                f"{len(candidates)} candidate signal(s) were produced but none carried a "
+                "captured, re-tested proof, so all were quarantined to `candidates.json` for "
+                "manual review rather than reported. The asset surface and crawled corpus are "
+                "in /recon and /crawl."
+            )
         else:
             top = sorted(findings, key=lambda f: f.get("cvss", 0), reverse=True)[:3]
             top_titles = "; ".join(f["title"] for f in top)
             exec_summary = (
-                f"SamaritanX produced **{n} findings** against `{ctx.target}` "
+                f"SamaritanX **proved {n} finding(s)** against `{ctx.target}` "
                 f"({severity_counts['critical']} critical, {severity_counts['high']} high, "
                 f"{severity_counts['medium']} medium, {severity_counts['low']} low). "
-                f"**{len(confirmed)} are high-confidence** (verify and submit); "
-                f"**{len(candidates)} are lower-confidence candidates** that need manual "
-                f"confirmation before submission. Highest-CVSS issues: {top_titles}."
+                f"Every reported finding ships a captured request+response PoC and re-tested "
+                f"clean. A further **{len(candidates)} unproven candidate(s)** were quarantined "
+                f"to `candidates.json` (not reported). Highest-CVSS proven issues: {top_titles}."
             )
 
         proxy_cfg = ctx.config.get("proxy", {}) or {}
@@ -112,9 +141,25 @@ class ReportingAgent(BaseAgent):
                 ctx.dashboard.event("err", "report: pdf rendering unavailable "
                                             "(install weasyprint + GTK / pango)")
 
-        # also drop a machine-readable bundle
+        # machine-readable bundle: ONLY proven findings go in findings.json
         (ctx.workspace / "reports" / "findings.json").write_text(
             json.dumps(findings, indent=2, default=str), encoding="utf-8")
+
+        # quarantined candidates — unproven signals, kept out of the report but
+        # retained (with the reason each was held back) for manual review
+        candidates_out = [{
+            "id": c.get("id"), "category": c.get("category"), "title": c.get("title"),
+            "severity": c.get("severity"), "url": c.get("url"),
+            "confidence": c.get("confidence"),
+            "quarantine_reason": (c.get("metadata") or {}).get("quarantine_reason",
+                                                               "no captured proof"),
+        } for c in candidates]
+        (ctx.workspace / "reports" / "candidates.json").write_text(
+            json.dumps(candidates_out, indent=2, default=str), encoding="utf-8")
+        if candidates:
+            ctx.dashboard.event("info",
+                f"proof-gate: {len(findings)} proven, {len(candidates)} quarantined "
+                f"-> candidates.json")
 
         # per-finding HackerOne submissions
         h1_dir = ctx.workspace / "reports" / "hackerone"

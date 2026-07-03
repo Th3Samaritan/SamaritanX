@@ -123,7 +123,9 @@ def assign(finding: dict[str, Any]) -> tuple[float, str]:
     if cat == "cache_poisoning":
         return 0.7, "unkeyed header reflected into cached response"
     if cat in ("smuggling", "h2_smuggling"):
-        return 0.6, "front/back-end timing disagreement (verify manually)"
+        # timing/heuristic signal only; a captured desync response sets confidence
+        # explicitly on the finding and overrides this via the early return above
+        return 0.3, "timing/heuristic signal — unproven without a captured desync response"
     if cat == "websocket":
         if "hijack" in title or "injection" in title:
             return 0.8, "CSWH handshake / message-channel proof"

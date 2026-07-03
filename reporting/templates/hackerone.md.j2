@@ -19,6 +19,30 @@
 
 ## Proof of concept
 
+{% if f.metadata.poc and f.metadata.poc.verified %}
+> ✅ **Verified** — re-tested fresh before reporting ({{ f.metadata.poc.method }}).
+
+{{ f.metadata.poc.rationale }}
+
+**Request**
+
+```http
+{{ f.metadata.poc.request }}
+```
+
+{% if f.metadata.poc.response_status %}**Response:** `HTTP {{ f.metadata.poc.response_status }}`
+{% endif %}
+{% if f.metadata.poc.response_excerpt %}
+```
+{{ f.metadata.poc.response_excerpt }}
+```
+{% endif %}
+{% if f.metadata.poc.samples %}**Timing samples:** `{{ f.metadata.poc.samples }}`
+{% endif %}
+
+---
+
+{% endif %}
 ```http
 {{ f.request or "—" }}
 ```

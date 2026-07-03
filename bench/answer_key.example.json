@@ -1,0 +1,25 @@
+[
+  {"id": "juice-sqli-login", "target": "juice.local", "category": "sqli",
+   "match": "/rest/user/login", "severity": "critical",
+   "note": "OWASP Juice Shop: SQLi in the login email field ( ' OR 1=1-- )"},
+
+  {"id": "juice-dom-xss-search", "target": "juice.local", "category": "dom_xss",
+   "match": "/#/search", "severity": "medium",
+   "note": "Juice Shop: DOM XSS via the search box q parameter"},
+
+  {"id": "juice-bola-basket", "target": "juice.local", "category": "idor_deep",
+   "match": "/rest/basket/", "severity": "high",
+   "note": "Juice Shop: view another user's basket by id (BOLA)"},
+
+  {"id": "portswigger-ssrf-stock", "target": "ssrf-lab.local", "category": "ssrf",
+   "match": "/product/stock", "severity": "high",
+   "note": "PortSwigger: basic SSRF via stockApi parameter to internal admin"},
+
+  {"id": "portswigger-smuggle-clte", "target": "smuggle-lab.local", "category": "smuggling",
+   "match": "/", "severity": "high",
+   "note": "PortSwigger: CL.TE request smuggling — must capture a desync response"},
+
+  {"id": "dvwa-reflected-xss", "target": "dvwa.local", "category": "xss",
+   "match": "vulnerabilities/xss_r", "severity": "medium",
+   "note": "DVWA: reflected XSS via name parameter — must execute in a browser"}
+]

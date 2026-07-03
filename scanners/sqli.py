@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import re
-import statistics
 import time
 from typing import TYPE_CHECKING
 
+from core.baseline import TimingBaseline, ResponseBaseline
 from core.injection import send, describe, candidate_points
 
 if TYPE_CHECKING:
@@ -35,19 +35,17 @@ ERROR_RE = re.compile("|".join(ERROR_SIGNATURES), re.I)
 
 
 async def _baseline(ctx, url: str, n: int = 4):
-    """Return (mean_size, sigma_size, mean_rtt, sigma_rtt) of N legit GETs."""
-    sizes = []
-    rtts = []
+    """Model the endpoint's normal latency + response with the robust (median/MAD)
+    baseline engine, so a single slow/large sample can't skew the thresholds."""
+    tb = TimingBaseline(k=6.0, min_delta_s=2.0)
+    rb = ResponseBaseline()
     for _ in range(n):
         ev = await ctx.http.get(url)
         if ev.error or ev.status == 0:
             continue
-        sizes.append(len(ev.response_body or ""))
-        rtts.append(ev.elapsed_ms / 1000.0)
-    if len(sizes) < 2:
-        return 0.0, 0.0, 0.0, 0.0
-    return (statistics.mean(sizes), statistics.pstdev(sizes),
-            statistics.mean(rtts),  statistics.pstdev(rtts))
+        tb.add((ev.elapsed_ms or 0.0) / 1000.0)
+        rb.add(ev.status, ev.response_body or "")
+    return tb, rb
 
 
 async def scan(ctx: "Context", url: str, params: list, method: str = "GET", form=None):
@@ -56,9 +54,12 @@ async def scan(ctx: "Context", url: str, params: list, method: str = "GET", form
     points = candidate_points(url, params, form, method)
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
 
-    base_size, base_sigma_size, base_rtt, base_sigma_rtt = await _baseline(ctx, url)
-    size_threshold = max(200.0, 5 * base_sigma_size)
-    rtt_threshold = base_rtt + max(2.0, 5 * base_sigma_rtt)
+    tb, rb = await _baseline(ctx, url)
+    base_rtt = tb.median
+    size_threshold = rb.length_threshold(k=5.0, floor=200.0)
+    # robust latency outlier threshold, with a hard 7s floor so a slow baseline
+    # can't make the time-based check trivially satisfiable
+    rtt_threshold = max(7.0, tb.threshold()) if tb.samples else 7.0
 
     async def test_param(param: str) -> None:
         # ----- error-based -----
@@ -92,8 +93,8 @@ async def scan(ctx: "Context", url: str, params: list, method: str = "GET", form
                     findings.append(_finding(
                         url, param, f"{true_p} / {false_p}", "boolean", ev_t,
                         f"true/false response length deltas {delta:.0f} and {delta2:.0f} "
-                        f"both exceed the {size_threshold:.0f}B noise floor "
-                        f"(baseline sigma={base_sigma_size:.0f}B)"))
+                        f"both exceed the {size_threshold:.0f}B robust noise floor "
+                        f"(median/MAD baseline over {rb.n} samples)"))
                     ctx.memory.record_payload_result(true_p, "sqli", True)
                     return
 
@@ -117,7 +118,7 @@ async def scan(ctx: "Context", url: str, params: list, method: str = "GET", form
                     findings.append(_finding(
                         url, param, p, "time", ev,
                         f"Two consecutive responses delayed {elapsed:.2f}s and {elapsed2:.2f}s "
-                        f"(baseline RTT {base_rtt:.2f}s +/- {base_sigma_rtt:.2f}s, "
+                        f"(baseline median RTT {base_rtt:.2f}s, robust outlier "
                         f"threshold {rtt_threshold:.2f}s) - confirms time-based SQLi"))
                     ctx.memory.record_payload_result(p, "sqli", True)
                     return

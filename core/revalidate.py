@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Optional
 
 from .confidence import label as conf_label
 from .injection import send, parse_point
+from .poc import is_auth_wall, is_static_asset, proof_record
 
 if TYPE_CHECKING:
     from .orchestrator import Context
@@ -33,6 +34,24 @@ _NOSQL_ERR = re.compile(r"(MongoError|BSONObj|E11000|MongoServerError|unknown op
 _RCE_MARKER = re.compile(r"SX_[a-z0-9]{4,12}_OK")
 _SSRF_INDICATORS = ("ami-id", "iam/security-credentials", "computemetadata",
                     "metadata/instance", "root:x:0:0:", "redis_version", "stat pid")
+
+
+def _capture(f: dict, ev, *, method: str, rationale: str, request: str | None = None) -> bool:
+    """Attach a captured, verified proof to a finding and return True.
+
+    Called from a revalidator's reproduce-True path so the finding carries the
+    actual request + response that proves it — the artifact the proof-gate
+    requires before anything reaches the report."""
+    meta = f.setdefault("metadata", {})
+    if isinstance(meta, dict):
+        meta["poc"] = proof_record(
+            verified=True, method=method, url=f.get("url", ""),
+            request=request or (f.get("request") or f"{method} {f.get('url','')}"),
+            status=getattr(ev, "status", None),
+            excerpt=getattr(ev, "response_body", "") or "",
+            rationale=rationale,
+        )
+    return True
 
 
 async def _refire(ctx, finding, *, value=None):
@@ -58,8 +77,20 @@ async def _re_cors(ctx, f):
     aco = ev.response_headers.get("access-control-allow-origin", "")
     if "credential" in (f.get("title") or "").lower():
         acc = (ev.response_headers.get("access-control-allow-credentials") or "").lower() == "true"
-        return ("evil.samaritanx.test" in aco) and acc
-    return "evil.samaritanx.test" in aco
+        if ("evil.samaritanx.test" in aco) and acc:
+            return _capture(f, ev, method="GET",
+                            request=f"GET {f.get('url','')}\nOrigin: https://evil.samaritanx.test",
+                            rationale="Cross-origin request from an arbitrary Origin was reflected "
+                                      "into Access-Control-Allow-Origin with "
+                                      "Access-Control-Allow-Credentials: true — a credentialed "
+                                      "cross-origin read of this response is possible.")
+        return False
+    if "evil.samaritanx.test" in aco:
+        return _capture(f, ev, method="GET",
+                        request=f"GET {f.get('url','')}\nOrigin: https://evil.samaritanx.test",
+                        rationale="An arbitrary Origin was reflected into "
+                                  "Access-Control-Allow-Origin.")
+    return False
 
 
 async def _re_reflect(ctx, f):
@@ -67,20 +98,61 @@ async def _re_reflect(ctx, f):
     if not payload:
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and payload in (ev.response_body or ""))
+    if ev and payload in (ev.response_body or ""):
+        _capture(f, ev, method=_re_method(f),
+                 rationale=f"The payload {payload!r} was reflected unencoded in the "
+                           "response body on a fresh re-fire.")
+        # Upgrade to hard proof if we can watch the sink fire in a real browser.
+        await _browser_upgrade(ctx, f, payload)
+        return True
+    return False
+
+
+async def _browser_upgrade(ctx, f, payload: str) -> None:
+    """Best-effort: replace a reflection proof with a browser-execution proof
+    (screenshot + fired sink) when Playwright is available. Never weakens the
+    existing proof — only strengthens it."""
+    try:
+        from core import browser_verify
+        if not browser_verify.available():
+            return
+        # a unique alphanumeric token from the payload is what the alert/console
+        # will carry; use it as the execution marker
+        import re as _re
+        tokens = _re.findall(r"[A-Za-z0-9]{4,}", payload)
+        marker = max(tokens, key=len) if tokens else ""
+        if not marker:
+            return
+        url = f.get("url") or ""
+        proof = await browser_verify.verify_xss(
+            ctx.config, url, marker=marker, workspace=getattr(ctx, "workspace", None))
+        if proof:
+            meta = f.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                meta["poc"] = proof  # browser proof supersedes reflection
+    except Exception:
+        pass
 
 
 async def _re_rce(ctx, f):
     if (f.get("metadata") or {}).get("detection") == "oob":
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and _RCE_MARKER.search(ev.response_body or ""))
+    if ev and _RCE_MARKER.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The command-execution marker was echoed in the response — "
+                                  "the injected command ran.")
+    return False
 
 
 async def _re_ssti(ctx, f):
     ev = await _refire(ctx, f)
     body = (ev.response_body or "") if ev else ""
-    return ("49" in body) and ("{{7*7}}" not in body)
+    if ("49" in body) and ("{{7*7}}" not in body):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The template expression {{7*7}} evaluated to 49 in the "
+                                  "response — server-side template injection is confirmed.")
+    return False
 
 
 async def _re_open_redirect(ctx, f):
@@ -88,22 +160,43 @@ async def _re_open_redirect(ctx, f):
     if not ev:
         return False
     loc = ev.response_headers.get("location", "")
-    return ev.status in (301, 302, 303, 307, 308) and ("//" in loc) and "samaritanx" in (f.get("payload") or "").lower() or \
-        (ev.status in (301, 302, 303, 307, 308) and bool(loc))
+    if ev.status not in (301, 302, 303, 307, 308) or not loc:
+        return False
+    # Real proof: the payload we injected actually appears in the redirect target
+    # (host or full URL). A bare 3xx with some Location is not open redirect.
+    payload = (f.get("payload") or "").strip()
+    from urllib.parse import urlparse as _up
+    pay_host = _up(payload if "//" in payload else "//" + payload).netloc.lower()
+    loc_l = loc.lower()
+    controlled = bool(payload) and (payload.lower() in loc_l or (pay_host and pay_host in loc_l))
+    if controlled:
+        return _capture(f, ev, method=_re_method(f),
+                        request=f"{_re_method(f)} {f.get('url','')}",
+                        rationale=f"Server issued a {ev.status} redirect to Location: {loc[:120]} "
+                                  "— the destination host came from our payload.")
+    return False
 
 
 async def _re_sql_error(ctx, f):
     if (f.get("metadata") or {}).get("detection") not in ("error", None):
         return None  # boolean/time oracles aren't single-shot re-checkable
     ev = await _refire(ctx, f)
-    return bool(ev and _SQL_ERR.search(ev.response_body or ""))
+    if ev and _SQL_ERR.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="A SQL error string surfaced in the response when the payload "
+                                  "was re-sent — the input reaches an unparameterised query.")
+    return False
 
 
 async def _re_nosql(ctx, f):
     if (f.get("metadata") or {}).get("detection") != "error":
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and _NOSQL_ERR.search(ev.response_body or ""))
+    if ev and _NOSQL_ERR.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="A NoSQL driver error surfaced in the response when the "
+                                  "operator payload was re-sent.")
+    return False
 
 
 async def _re_ssrf(ctx, f):
@@ -111,7 +204,12 @@ async def _re_ssrf(ctx, f):
         return None  # callback proof — can't replay collaborator here
     ev = await _refire(ctx, f)
     body = (ev.response_body or "").lower() if ev else ""
-    return any(m in body for m in _SSRF_INDICATORS)
+    if any(m in body for m in _SSRF_INDICATORS):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The response contained an internal-resource indicator "
+                                  "(cloud metadata / internal service banner) fetched via the "
+                                  "SSRF sink.")
+    return False
 
 
 async def _re_crlf(ctx, f):
@@ -119,7 +217,111 @@ async def _re_crlf(ctx, f):
     if not ev:
         return False
     hdr_blob = " ".join(f"{k}:{v}" for k, v in (ev.response_headers or {}).items()).lower()
-    return "samaritanx" in hdr_blob or "sx-" in hdr_blob
+    if "samaritanx" in hdr_blob or "sx-" in hdr_blob:
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="An injected header appeared in the response headers — CRLF "
+                                  "injection lets the payload split the header section.")
+    return False
+
+
+def _re_method(f: dict) -> str:
+    m = (f.get("request") or "GET").split(None, 1)[0].upper()
+    return m if m in ("GET", "POST", "PUT", "PATCH", "DELETE") else "GET"
+
+
+async def _re_broken_auth(ctx, f):
+    """Prove (or drop) a 'reachable without authentication' finding.
+
+    The dominant false positive here is an app that 200s its *login page* — the
+    naive detector reads "200 + body" as privileged access. We re-fetch with no
+    credentials at all and decide:
+      * auth wall (login page / redirect / 401-403) → False  (drop the FP)
+      * static asset                                → False  (not a page at all)
+      * substantive page with identity/sensitive markers → True + captured PoC
+      * reachable but unprovable as privileged      → None   (skip, manual check)
+    Cross-identity / BFLA findings need a stateful identity replay we can't do
+    single-shot, so they are skipped honestly.
+    """
+    meta = f.get("metadata") or {}
+    url = f.get("url")
+    # If we have multiple identities, try the strongest proof first: does another
+    # identity read this user's private data? A captured cross-identity leak is
+    # hard BOLA/BFLA proof.
+    if url:
+        try:
+            from .identity_matrix import cross_access_check
+            leak = await cross_access_check(ctx, url)
+        except Exception:
+            leak = None
+        if leak and (leak.get("metadata") or {}).get("poc"):
+            f["metadata"] = {**meta, "poc": leak["metadata"]["poc"],
+                             "detection": "identity_matrix",
+                             "leaked_markers": leak["metadata"].get("leaked_markers")}
+            return True
+    if meta.get("detection") == "authz_matrix" and meta.get("identity") not in (None, "anon"):
+        return None  # BFLA/BOLA — needs per-identity sessions, not single-shot
+    if not url:
+        return None
+    ev = await ctx.http.get(url, no_session=True,
+                            headers={"Authorization": "", "Cookie": ""})
+    if not ev or not ev.status:
+        return None
+    wall, why = is_auth_wall(ev.status, ev.response_headers, ev.response_body, url)
+    if wall:
+        meta["revalidation_proof"] = f"unauth re-fetch hit an auth wall — {why} (HTTP {ev.status})"
+        f["metadata"] = meta
+        return False
+    if is_static_asset(url, ev.response_headers):
+        meta["revalidation_proof"] = "URL serves a static asset, not privileged content"
+        f["metadata"] = meta
+        return False
+    body = ev.response_body or ""
+    if ev.status != 200 or len(body) < 200:
+        return False
+    from scanners.idor_deep import identity_markers
+    from .escalation import sensitive_hits
+    markers = sorted(identity_markers(body))[:6]
+    sensitive = [k for k, _ in sensitive_hits(body, ev.response_headers)]
+    if not markers and not sensitive:
+        meta["revalidation_proof"] = (
+            "reachable unauthenticated and not a login page, but no identity / "
+            "sensitive markers were found — confirm privileged content manually")
+        f["metadata"] = meta
+        return None
+    meta["poc"] = proof_record(
+        verified=True, method="GET", url=url,
+        request=f"GET {url}\n(sent with no Cookie and no Authorization header)",
+        status=ev.status, excerpt=body,
+        rationale=(f"Fetched with zero credentials and received privileged content "
+                   f"(identity markers={markers}, sensitive={sensitive}); the response "
+                   "is not a login, redirect, or deny page — authentication is not enforced."))
+    f["metadata"] = meta
+    return True
+
+
+async def _re_smuggling(ctx, f):
+    """Confirm a timing-oracle smuggle is reproducible, not a one-off fluke.
+
+    Delegates to the scanner's raw-socket re-probe (it owns the byte-level
+    payloads). Confirms only when the flagged shape is consistently slow and its
+    inverse consistently fast across repeats; drops when the differential is
+    clearly gone; skips when the network is too noisy to decide."""
+    kind = (f.get("metadata") or {}).get("kind")
+    try:
+        if kind in ("CL.TE", "TE.CL"):
+            from scanners.request_smuggling import reprobe
+        elif kind == "h2_crlf_path":
+            from scanners.h2_smuggling import reprobe
+        else:
+            return None  # continuation flood / h2c: no single-shot timing oracle
+        result, proof = await reprobe(ctx, f)
+    except Exception:  # noqa: BLE001
+        return None
+    if result is True and proof:
+        meta = f.get("metadata") or {}
+        meta["poc"] = proof
+        f["metadata"] = meta
+    return result
 
 
 REVALIDATORS = {
@@ -129,6 +331,8 @@ REVALIDATORS = {
     "open_redirect": _re_open_redirect,
     "sqli": _re_sql_error, "nosqli": _re_nosql,
     "ssrf": _re_ssrf, "crlf": _re_crlf,
+    "broken_auth": _re_broken_auth,
+    "smuggling": _re_smuggling,
 }
 
 # categories we deliberately never auto-revalidate (hard proof or not single-shot)

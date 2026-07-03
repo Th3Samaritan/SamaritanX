@@ -24,6 +24,42 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Third-party hosts that regularly appear in a target's traffic but are never
+# the target — active/intrusive probes against them are out of scope and a good
+# way to get a hunter banned. Matched as a suffix of the registrable domain.
+# Denylist for *active* testing only; passive recon is unaffected.
+_THIRD_PARTY = (
+    "google-analytics.com", "googletagmanager.com", "google.com", "gstatic.com",
+    "doubleclick.net", "facebook.com", "facebook.net", "segment.io", "segment.com",
+    "singular.net", "branch.io", "amplitude.com", "mixpanel.com", "sentry.io",
+    "cloudflare.com", "cloudflareinsights.com", "jsdelivr.net", "unpkg.com",
+    "cdnjs.com", "bootstrapcdn.com", "fontawesome.com", "gravatar.com",
+    "hotjar.com", "intercom.io", "stripe.com", "paypal.com", "youtube.com",
+    "ytimg.com", "twitter.com", "twimg.com", "linkedin.com", "recaptcha.net",
+    "cloudfront.net", "akamaihd.net", "fastly.net", "newrelic.com",
+)
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort registrable domain without a tldextract dependency.
+
+    Handles common two-label public suffixes (co.uk, com.au, ...) so
+    ``www.example.co.uk`` -> ``example.co.uk``. Good enough for scope grouping.
+    """
+    host = (host or "").lower().strip(".")
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    two_label = {"co", "com", "org", "net", "gov", "edu", "ac"}
+    if parts[-2] in two_label:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def is_third_party(host: str) -> bool:
+    reg = registrable_domain(host)
+    return any(reg == tp or reg.endswith("." + tp) for tp in _THIRD_PARTY)
+
 
 @dataclass
 class ScopePolicy:
@@ -116,3 +152,33 @@ class ScopePolicy:
         if self.default_allow:
             return True, "default-allow"
         return False, "not in scope"
+
+    def active_allows(self, url: str, target: str | None = None) -> tuple[bool, str]:
+        """Stricter gate for *active / intrusive* probes (smuggling, uploads,
+        injection at scale, anything that could DoS or alter state).
+
+        On top of the normal ``allows()`` check it refuses:
+          * recognised third-party hosts (analytics/CDN/payment SDKs), and
+          * hosts outside the target's own registrable domain when a target is
+            known and no explicit scope allow-list was configured.
+
+        Passive recon should keep calling ``allows()``; only dangerous active
+        modules should call this. It closes the hole that let the old scanner
+        fire smuggling payloads at segment.io / singular.net."""
+        ok, reason = self.allows(url)
+        if not ok:
+            return False, reason
+        host = (urlparse(url if "://" in url else f"http://{url}").hostname or "").lower()
+        if not host:
+            return False, "no host"
+        if is_third_party(host):
+            return False, f"third-party host ({registrable_domain(host)}) — out of scope for active tests"
+        # When we're relying on default-allow (no explicit allow-list) and we
+        # know the target, confine active probes to the target's own domain.
+        explicit = bool(self.allow_globs or self.allow_regex or self.allow_cidr)
+        if target and not explicit:
+            th = (urlparse(target if "://" in target else f"http://{target}").hostname or target)
+            if registrable_domain(host) != registrable_domain(th):
+                return False, (f"host {registrable_domain(host)} is off the target domain "
+                               f"{registrable_domain(th)} — refusing active probe")
+        return True, "in scope (active)"

@@ -58,6 +58,7 @@ class LogicAgent(BaseAgent):
         )
 
     async def _sensitive_paths(self, base: str, ctx: "Context") -> None:
+        from core.poc import is_auth_wall
         for path in SENSITIVE_PATHS:
             url = urljoin(base, path)
             ev = await ctx.http.get(url)
@@ -65,6 +66,12 @@ class LogicAgent(BaseAgent):
                 continue
             body = (ev.response_body or "")[:400]
             if ev.status == 200 and len(ev.response_body or "") > 50:
+                # an app that 200s its login view for /admin, /console, … is not
+                # an exposure — only report when it isn't an auth wall.
+                wall, why = is_auth_wall(ev.status, ev.response_headers, ev.response_body, url)
+                if wall:
+                    ctx.dashboard.event("info", f"logic: {url} is an auth wall ({why}), not an exposure")
+                    continue
                 self.report_finding(ctx, {
                     "category": "exposure",
                     "title": f"Sensitive path publicly accessible: {path}",
@@ -78,21 +85,42 @@ class LogicAgent(BaseAgent):
                 ctx.dashboard.event("info", f"logic: protected path discovered {url} ({ev.status})")
 
     async def _admin_anon(self, endpoints: list[str], ctx: "Context") -> None:
+        from core.poc import is_auth_wall, is_static_asset
+        from core.escalation import sensitive_hits
+        from scanners.idor_deep import identity_markers
         for url in endpoints:
             if not any(h in url.lower() for h in ADMIN_HINTS):
                 continue
             anon_cookies = {k: "" for k in (ctx.session.cookies if ctx.session else {})}
             ev = await ctx.http.get(url, headers={"Authorization": ""}, cookies=anon_cookies)
-            if ev.status == 200 and len(ev.response_body or "") > 200:
-                self.report_finding(ctx, {
-                    "category": "broken_auth",
-                    "title": f"Privileged page reachable without authentication: {url}",
-                    "severity": "critical", "cvss": 9.0,
-                    "url": url,
-                    "evidence": "Admin-shaped path returned 200 with substantive body without any auth header.",
-                    "request": f"GET {url}",
-                    "response": (ev.response_body or "")[:1500],
-                })
+            if ev.status != 200 or len(ev.response_body or "") <= 200:
+                continue
+            # The classic false positive: an app that 200s its *login page*
+            # (Laravel/SPA) or serves a static asset on an admin-shaped path.
+            # Require genuine privileged content, not a 200-shaped auth wall.
+            wall, why = is_auth_wall(ev.status, ev.response_headers, ev.response_body, url)
+            if wall or is_static_asset(url, ev.response_headers):
+                ctx.dashboard.event("info",
+                    f"logic: {url} not privileged content ({why or 'static asset'}) — skipped")
+                continue
+            body = ev.response_body or ""
+            markers = sorted(identity_markers(body))[:6]
+            sensitive = [k for k, _ in sensitive_hits(body, ev.response_headers)]
+            if not markers and not sensitive:
+                ctx.dashboard.event("info",
+                    f"logic: {url} reachable anon but no identity/sensitive markers — not reported")
+                continue
+            self.report_finding(ctx, {
+                "category": "broken_auth",
+                "title": f"Privileged page reachable without authentication: {url}",
+                "severity": "critical", "cvss": 9.0,
+                "url": url,
+                "evidence": f"Admin-shaped path returned 200 with privileged content and no "
+                            f"auth header (identity markers={markers}, sensitive={sensitive}).",
+                "request": f"GET {url}",
+                "response": body[:1500],
+                "metadata": {"detection": "admin_anon", "markers": markers, "sensitive": sensitive},
+            })
 
     async def _pricing_tamper(self, forms: list[dict], ctx: "Context") -> None:
         if not ctx.config.get("safety", {}).get("aggressive"):
