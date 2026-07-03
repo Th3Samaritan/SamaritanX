@@ -32,8 +32,25 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from core.utils import root_domain
+
 if TYPE_CHECKING:
     from core.orchestrator import Context
+
+_STATIC_EXT = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+               ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webp", ".pdf")
+
+
+def _same_site(host: str, target: str) -> bool:
+    th = urlparse(target if "://" in target else "http://" + target).hostname or target
+    try:
+        return root_domain(host) == root_domain(th)
+    except Exception:
+        return host == th
+
+
+def _is_static(path: str) -> bool:
+    return (path or "/").lower().rsplit("?", 1)[0].endswith(_STATIC_EXT)
 
 
 async def _h2_open(host: str, port: int, use_tls: bool, bucket=None):
@@ -102,6 +119,11 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if not host:
         return findings
     if ctx.scope and not ctx.scope.allows(url)[0]:
+        return findings
+    # scope hygiene: never smuggle-test third-party CDNs or static assets
+    if not _same_site(host, ctx.target):
+        return findings
+    if _is_static(parsed.path or "/"):
         return findings
     use_tls = parsed.scheme == "https"
     port = parsed.port or (443 if use_tls else 80)
@@ -188,7 +210,7 @@ async def _crlf_pseudo_header(host, port, path, use_tls, bucket, url) -> list[di
     findings.append({
         "category": "smuggling",
         "title": "HTTP/2 request smuggling — CRLF in pseudo-header (:path)",
-        "severity": "critical", "cvss": 9.0,
+        "severity": "critical", "cvss": 9.0, "confidence": 0.3,
         "url": url,
         "evidence": f"A :path containing \\r\\n caused the upstream to hang for "
                     f"{elapsed2:.2f}s while a clean H2 GET to the same path returned in "
@@ -304,7 +326,7 @@ async def _continuation_flood(host, port, path, use_tls, bucket, url) -> list[di
         findings.append({
             "category": "smuggling",
             "title": "HTTP/2 CONTINUATION-frame flood accepted (potential DoS / smuggling primitive)",
-            "severity": "high", "cvss": 7.4,
+            "severity": "high", "cvss": 7.4, "confidence": 0.3,
             "url": url,
             "evidence": "Server accepted 50 CONTINUATION frames carrying ~100 KB of header "
                         "padding without rejecting the stream — header buffer is unbounded "
@@ -348,7 +370,7 @@ async def _h2c_upgrade_smuggle(host, port, path, url, ctx) -> list[dict]:
         findings.append({
             "category": "smuggling",
             "title": "h2c upgrade smuggling — front-end forwards HTTP/2 cleartext upgrade",
-            "severity": "high", "cvss": 8.0,
+            "severity": "high", "cvss": 8.0, "confidence": 0.3,
             "url": url,
             "evidence": "Server accepted Upgrade: h2c with a CL-bearing body, AND the "
                         "response contains evidence the smuggled GET /admin was processed "

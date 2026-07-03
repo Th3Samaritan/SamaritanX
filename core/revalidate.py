@@ -36,6 +36,24 @@ _SSRF_INDICATORS = ("ami-id", "iam/security-credentials", "computemetadata",
                     "metadata/instance", "root:x:0:0:", "redis_version", "stat pid")
 
 
+def _capture(f: dict, ev, *, method: str, rationale: str, request: str | None = None) -> bool:
+    """Attach a captured, verified proof to a finding and return True.
+
+    Called from a revalidator's reproduce-True path so the finding carries the
+    actual request + response that proves it — the artifact the proof-gate
+    requires before anything reaches the report."""
+    meta = f.setdefault("metadata", {})
+    if isinstance(meta, dict):
+        meta["poc"] = proof_record(
+            verified=True, method=method, url=f.get("url", ""),
+            request=request or (f.get("request") or f"{method} {f.get('url','')}"),
+            status=getattr(ev, "status", None),
+            excerpt=getattr(ev, "response_body", "") or "",
+            rationale=rationale,
+        )
+    return True
+
+
 async def _refire(ctx, finding, *, value=None):
     """Re-send the recorded request and return HttpEvidence (or None)."""
     url = finding.get("url")
@@ -59,8 +77,20 @@ async def _re_cors(ctx, f):
     aco = ev.response_headers.get("access-control-allow-origin", "")
     if "credential" in (f.get("title") or "").lower():
         acc = (ev.response_headers.get("access-control-allow-credentials") or "").lower() == "true"
-        return ("evil.samaritanx.test" in aco) and acc
-    return "evil.samaritanx.test" in aco
+        if ("evil.samaritanx.test" in aco) and acc:
+            return _capture(f, ev, method="GET",
+                            request=f"GET {f.get('url','')}\nOrigin: https://evil.samaritanx.test",
+                            rationale="Cross-origin request from an arbitrary Origin was reflected "
+                                      "into Access-Control-Allow-Origin with "
+                                      "Access-Control-Allow-Credentials: true — a credentialed "
+                                      "cross-origin read of this response is possible.")
+        return False
+    if "evil.samaritanx.test" in aco:
+        return _capture(f, ev, method="GET",
+                        request=f"GET {f.get('url','')}\nOrigin: https://evil.samaritanx.test",
+                        rationale="An arbitrary Origin was reflected into "
+                                  "Access-Control-Allow-Origin.")
+    return False
 
 
 async def _re_reflect(ctx, f):
@@ -68,20 +98,32 @@ async def _re_reflect(ctx, f):
     if not payload:
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and payload in (ev.response_body or ""))
+    if ev and payload in (ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale=f"The payload {payload!r} was reflected unencoded in the "
+                                  "response body on a fresh re-fire.")
+    return False
 
 
 async def _re_rce(ctx, f):
     if (f.get("metadata") or {}).get("detection") == "oob":
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and _RCE_MARKER.search(ev.response_body or ""))
+    if ev and _RCE_MARKER.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The command-execution marker was echoed in the response — "
+                                  "the injected command ran.")
+    return False
 
 
 async def _re_ssti(ctx, f):
     ev = await _refire(ctx, f)
     body = (ev.response_body or "") if ev else ""
-    return ("49" in body) and ("{{7*7}}" not in body)
+    if ("49" in body) and ("{{7*7}}" not in body):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The template expression {{7*7}} evaluated to 49 in the "
+                                  "response — server-side template injection is confirmed.")
+    return False
 
 
 async def _re_open_redirect(ctx, f):
@@ -89,22 +131,43 @@ async def _re_open_redirect(ctx, f):
     if not ev:
         return False
     loc = ev.response_headers.get("location", "")
-    return ev.status in (301, 302, 303, 307, 308) and ("//" in loc) and "samaritanx" in (f.get("payload") or "").lower() or \
-        (ev.status in (301, 302, 303, 307, 308) and bool(loc))
+    if ev.status not in (301, 302, 303, 307, 308) or not loc:
+        return False
+    # Real proof: the payload we injected actually appears in the redirect target
+    # (host or full URL). A bare 3xx with some Location is not open redirect.
+    payload = (f.get("payload") or "").strip()
+    from urllib.parse import urlparse as _up
+    pay_host = _up(payload if "//" in payload else "//" + payload).netloc.lower()
+    loc_l = loc.lower()
+    controlled = bool(payload) and (payload.lower() in loc_l or (pay_host and pay_host in loc_l))
+    if controlled:
+        return _capture(f, ev, method=_re_method(f),
+                        request=f"{_re_method(f)} {f.get('url','')}",
+                        rationale=f"Server issued a {ev.status} redirect to Location: {loc[:120]} "
+                                  "— the destination host came from our payload.")
+    return False
 
 
 async def _re_sql_error(ctx, f):
     if (f.get("metadata") or {}).get("detection") not in ("error", None):
         return None  # boolean/time oracles aren't single-shot re-checkable
     ev = await _refire(ctx, f)
-    return bool(ev and _SQL_ERR.search(ev.response_body or ""))
+    if ev and _SQL_ERR.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="A SQL error string surfaced in the response when the payload "
+                                  "was re-sent — the input reaches an unparameterised query.")
+    return False
 
 
 async def _re_nosql(ctx, f):
     if (f.get("metadata") or {}).get("detection") != "error":
         return None
     ev = await _refire(ctx, f)
-    return bool(ev and _NOSQL_ERR.search(ev.response_body or ""))
+    if ev and _NOSQL_ERR.search(ev.response_body or ""):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="A NoSQL driver error surfaced in the response when the "
+                                  "operator payload was re-sent.")
+    return False
 
 
 async def _re_ssrf(ctx, f):
@@ -112,7 +175,12 @@ async def _re_ssrf(ctx, f):
         return None  # callback proof — can't replay collaborator here
     ev = await _refire(ctx, f)
     body = (ev.response_body or "").lower() if ev else ""
-    return any(m in body for m in _SSRF_INDICATORS)
+    if any(m in body for m in _SSRF_INDICATORS):
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="The response contained an internal-resource indicator "
+                                  "(cloud metadata / internal service banner) fetched via the "
+                                  "SSRF sink.")
+    return False
 
 
 async def _re_crlf(ctx, f):
@@ -120,7 +188,16 @@ async def _re_crlf(ctx, f):
     if not ev:
         return False
     hdr_blob = " ".join(f"{k}:{v}" for k, v in (ev.response_headers or {}).items()).lower()
-    return "samaritanx" in hdr_blob or "sx-" in hdr_blob
+    if "samaritanx" in hdr_blob or "sx-" in hdr_blob:
+        return _capture(f, ev, method=_re_method(f),
+                        rationale="An injected header appeared in the response headers — CRLF "
+                                  "injection lets the payload split the header section.")
+    return False
+
+
+def _re_method(f: dict) -> str:
+    m = (f.get("request") or "GET").split(None, 1)[0].upper()
+    return m if m in ("GET", "POST", "PUT", "PATCH", "DELETE") else "GET"
 
 
 async def _re_broken_auth(ctx, f):
