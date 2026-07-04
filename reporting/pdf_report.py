@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import markdown as md
-
+# NOTE: `markdown` and `weasyprint` are optional (PDF export only). Import them
+# lazily inside render_pdf so a missing optional dependency degrades to "no PDF"
+# instead of taking down the whole reporting pipeline at import time.
 
 PDF_CSS = """
 @page { size: A4; margin: 18mm 14mm; }
@@ -31,6 +32,7 @@ th { background: #eef3f8; }
 
 def render_pdf(markdown_text: str, output_path: str | Path) -> bool:
     try:
+        import markdown as md
         from weasyprint import HTML, CSS
     except Exception:
         return False

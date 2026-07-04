@@ -66,6 +66,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             token = ctx.oob.token()
             host = ctx.oob.host_for(token)
             oob_tokens[param] = token
+            ctx.oob.register(token, {
+                "category": "rce",
+                "title": f"Blind OS command injection in `{param}` (OOB)",
+                "severity": "critical", "cvss": 9.8,
+                "url": url, "parameter": param, "payload": f"oob://{host}",
+                "evidence": f"An injected command in `{param}` caused the server to reach our "
+                            "out-of-band host — confirms blind command execution.",
+                "_detection": "oob", "_method": method.upper(),
+                "_request": f"{method.upper()} {url}  ({param} = OS command referencing {host})",
+                "_oob_ref": host,
+            })
             for tpl in OOB_TEMPLATES:
                 async with sem:
                     await _request(ctx, url, method, param, tpl.format(host=host), form)

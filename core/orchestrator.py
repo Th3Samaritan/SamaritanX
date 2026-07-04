@@ -169,16 +169,17 @@ class Orchestrator:
                     continue
                 agent = self._agents[agent_name]
                 self.dashboard.update_agent(agent.name, "running", task.kind)
+                _deadline = self._timeout_for(task.kind)
                 try:
                     await asyncio.wait_for(
                         agent.handle(task, ctx),
-                        timeout=self._timeout_for(task.kind),
+                        timeout=_deadline,
                     )
                 except asyncio.TimeoutError:
                     log.warning("worker %s: task %s timed out after %.0fs",
-                                _worker_name, task.kind, self.task_timeout)
+                                _worker_name, task.kind, _deadline)
                     self.dashboard.event("err",
-                        f"{agent.name} timed out on {task.kind} ({self.task_timeout:.0f}s)")
+                        f"{agent.name} timed out on {task.kind} ({_deadline:.0f}s)")
                 except Exception as exc:
                     log.exception("agent %s failed on %s: %s", agent.name, task.kind, exc)
                     self.dashboard.event("err", f"{agent.name} crash on {task.kind}: {exc}")
@@ -241,8 +242,15 @@ class Orchestrator:
                 self.dashboard.event("err", f"extra session '{label}' failed: {exc}")
                 await client.close()
 
-        # 4) OOB collaborator
+        # 4) OOB collaborator — start the background poller so callbacks that
+        # arrive after a scanner has moved on are still accumulated and can
+        # upgrade findings at finalize.
         self.oob = await OOBClient.create(self.config)
+        try:
+            await self.oob.start_polling(
+                interval=float(self.config.get("oob", {}).get("poll_interval", 5.0)))
+        except Exception:
+            pass
         self.dashboard.event("info", f"oob: backend={self.oob.kind} "
                                      f"{'registered' if self.oob.registered else 'unavailable'}")
 

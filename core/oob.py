@@ -161,19 +161,82 @@ class _LocalCallbackClient:
 
 # --------- public façade -------------------------------------------------------
 
+def _event_id(event: dict) -> str:
+    """A stable id string for an interaction, used for token matching + dedupe."""
+    return " ".join(str(event.get(k) or "") for k in
+                    ("full-id", "unique-id", "query-name", "remote-address",
+                     "timestamp", "raw-request")).lower()
+
+
+def build_oob_finding(template: dict, events: list[dict]) -> dict:
+    """Turn a registered token's template + its interactions into a verified
+    finding. The callback IS the proof — a blind payload made the target reach
+    our controlled host, which cannot happen by accident."""
+    from .poc import proof_record
+    kinds = sorted({(e.get("protocol") or e.get("proto") or "dns").upper() for e in events})
+    remotes = sorted({e.get("remote-address", "") for e in events if e.get("remote-address")})
+    excerpt = ""
+    for e in events:
+        if e.get("raw-request"):
+            excerpt = str(e["raw-request"])[:1000]
+            break
+    poc = proof_record(
+        verified=True, method=template.get("_method", "GET"),
+        url=template.get("url", ""),
+        request=template.get("_request") or template.get("request")
+        or f"payload referencing {template.get('_oob_ref','the OOB host')}",
+        excerpt=excerpt or f"{len(events)} interaction(s): protocols={kinds} from {remotes}",
+        rationale=(f"The blind payload caused the target to contact our out-of-band host via "
+                   f"{', '.join(kinds) or 'DNS/HTTP'} ({len(events)} interaction(s)). An "
+                   "out-of-band callback to an attacker-controlled host is unforgeable proof "
+                   "the injection executed."),
+        samples=[{"protocol": e.get("protocol"), "remote_address": e.get("remote-address"),
+                  "timestamp": e.get("timestamp")} for e in events[:5]],
+    )
+    f = {k: v for k, v in template.items() if not k.startswith("_")}
+    f.setdefault("severity", "high")
+    f.setdefault("cvss", 8.5)
+    f["confidence"] = 0.97
+    meta = f.setdefault("metadata", {})
+    meta["detection"] = template.get("_detection", "oob")
+    meta["poc"] = poc
+    meta["oob_interactions"] = len(events)
+    return f
+
+
 class OOBClient:
-    """Indirection over interactsh / local fallback.
+    """Indirection over interactsh / local fallback with a background poller.
+
+    The projectdiscovery poll protocol returns *new* events since the last poll
+    and does not repeat them, so a scanner that polls once right after firing
+    almost always misses the callback (they arrive seconds-to-minutes later) and
+    concurrent scanners consume each other's events. This façade fixes both:
+
+      * a single background loop drains the backend and **accumulates every
+        event** into ``self._events`` (deduped),
+      * scanners ``register(token, template)`` and later ``check(token, wait=…)``
+        which searches the accumulator without consuming, optionally waiting,
+      * a finalize ``pending_findings()`` sweep emits findings for any registered
+        token whose callback arrived late — after the scanner had moved on.
 
     Usage:
-        oob = await OOBClient.create(cfg)
-        token = oob.token()
-        url   = oob.url_for(token)
+        oob = await OOBClient.create(cfg); await oob.start_polling()
+        token = oob.token(); url = oob.url_for(token)
+        oob.register(token, {"category": "ssrf", "url": url, ...})
         # ... fire payload ...
-        events = await oob.poll(token)        # filtered to that token
+        hits = await oob.check(token)              # instant, non-consuming
+        # ... at finalize ...
+        for f in oob.pending_findings(): report(f) # catches late callbacks
     """
 
     def __init__(self, backend) -> None:
         self.backend = backend
+        self._events: list[dict] = []
+        self._seen: set[str] = set()
+        self._registered: dict[str, dict] = {}
+        self._emitted: set[str] = set()
+        self._poller = None
+        self._lock = None  # created lazily on the running loop
 
     @classmethod
     async def create(cls, cfg: dict) -> "OOBClient":
@@ -208,14 +271,104 @@ class OOBClient:
     def host_for(self, token: str) -> str:
         return self.backend.host_for(token)
 
+    # ---- registration -----------------------------------------------------
+    def register(self, token: str, template: dict) -> None:
+        """Remember what a token was for, so a late callback can still become a
+        finding at finalize even after the scanner has finished."""
+        self._registered[token] = dict(template)
+
+    # ---- draining / accumulation -----------------------------------------
+    def _lock_obj(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def _drain(self) -> None:
+        try:
+            new = await self.backend.poll()
+        except Exception:
+            return
+        if not new:
+            return
+        async with self._lock_obj():
+            for e in new:
+                eid = _event_id(e)
+                if eid in self._seen:
+                    continue
+                self._seen.add(eid)
+                self._events.append(e)
+
+    async def start_polling(self, interval: float = 5.0) -> None:
+        if self._poller is not None:
+            return
+        self._poller = asyncio.create_task(self._poll_loop(interval))
+
+    async def _poll_loop(self, interval: float) -> None:
+        try:
+            while True:
+                await self._drain()
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
+    # ---- querying ---------------------------------------------------------
+    def _match(self, token: str) -> list[dict]:
+        t = (token or "").lower()
+        if not t:
+            return []
+        return [e for e in self._events if t in _event_id(e)]
+
+    async def check(self, token: str, *, wait: float = 0.0,
+                    poll_interval: float = 2.0) -> list[dict]:
+        """Return interactions for a token, non-destructively. If ``wait`` > 0,
+        poll until a hit appears or the budget expires."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, wait)
+        while True:
+            await self._drain()
+            hits = self._match(token)
+            if hits or loop.time() >= deadline:
+                return hits
+            await asyncio.sleep(poll_interval)
+
+    # backward-compatible name; now non-consuming (accumulating)
     async def poll(self, token: str | None = None) -> list[dict]:
-        events = await self.backend.poll()
-        if token:
-            return [e for e in events if token.lower() in
-                    (e.get("full-id") or e.get("unique-id") or e.get("query-name") or "").lower()]
-        return events
+        await self._drain()
+        return self._match(token) if token else list(self._events)
+
+    def pending_findings(self) -> list[dict]:
+        """Findings for registered tokens that have interactions and haven't been
+        emitted yet. Call at finalize to capture late callbacks."""
+        out: list[dict] = []
+        for token, template in self._registered.items():
+            if token in self._emitted:
+                continue
+            hits = self._match(token)
+            if hits:
+                self._emitted.add(token)
+                out.append(build_oob_finding(template, hits))
+        return out
+
+    async def final_sweep(self, wait: float = 20.0) -> list[dict]:
+        """Wait once for stragglers, then return any late-callback findings."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(0.0, wait)
+        while loop.time() < deadline:
+            await self._drain()
+            if any(self._match(t) and t not in self._emitted for t in self._registered):
+                break
+            await asyncio.sleep(2.0)
+        await self._drain()
+        return self.pending_findings()
 
     async def close(self) -> None:
+        if self._poller is not None:
+            self._poller.cancel()
+            try:
+                await self._poller
+            except Exception:
+                pass
+            self._poller = None
         await self.backend.close()
 
 

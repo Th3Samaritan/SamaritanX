@@ -84,6 +84,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             token = ctx.oob.token()
             oob_url = ctx.oob.url_for(token)
             oob_param_tokens[param] = (token, oob_url)
+            ctx.oob.register(token, {
+                "category": "ssrf",
+                "title": "Blind SSRF — out-of-band callback",
+                "severity": "high", "cvss": 8.6,
+                "url": url, "parameter": param, "payload": oob_url,
+                "evidence": f"The {param} parameter caused the server to make an out-of-band "
+                            "request to our controlled host (blind SSRF).",
+                "_detection": "oob", "_method": method.upper(),
+                "_request": f"{method.upper()} {url}\n{param}={oob_url}",
+                "_oob_ref": oob_url,
+            })
             async with sem:
                 await _request(ctx, url, method, param, oob_url, form)
 
@@ -97,6 +108,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             token = ctx.oob.token()
             target = ctx.oob.host_for(token)  # raw host — most proxies want a host:port
             oob_header_tokens[header] = (token, target)
+            ctx.oob.register(token, {
+                "category": "ssrf",
+                "title": f"Blind SSRF via {header} header — out-of-band callback",
+                "severity": "high", "cvss": 8.6,
+                "url": url, "parameter": f"header:{header}", "payload": target,
+                "evidence": f"The {header} request header caused an out-of-band callback — an "
+                            "intermediary or the origin fetched the attacker-supplied host.",
+                "_detection": "oob-header", "_method": "GET",
+                "_request": f"GET {url}\n{header}: {target}",
+                "_oob_ref": target,
+            })
             async with sem:
                 await ctx.http.get(url, headers={header: target})
 

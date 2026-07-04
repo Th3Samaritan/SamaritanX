@@ -54,6 +54,8 @@ class LogicAgent(BaseAgent):
             self._sensitive_paths(base, ctx),
             self._admin_anon(endpoints, ctx),
             self._pricing_tamper(forms, ctx),
+            self._coupon_reuse(forms, ctx),
+            self._step_skip(endpoints, ctx),
             self._race_conditions(endpoints, ctx),
         )
 
@@ -125,47 +127,57 @@ class LogicAgent(BaseAgent):
     async def _pricing_tamper(self, forms: list[dict], ctx: "Context") -> None:
         if not ctx.config.get("safety", {}).get("aggressive"):
             return  # mutating check — requires --aggressive
+        from core.logic_sequences import run_price_tamper
+        for form in forms:
+            form = {**form, "action": form.get("action") or form.get("url")}
+            f = await run_price_tamper(ctx, form)
+            if f:  # only returns a finding when the charged total actually dropped
+                self.report_finding(ctx, f)
+
+    async def _coupon_reuse(self, forms: list[dict], ctx: "Context") -> None:
+        if not ctx.config.get("safety", {}).get("aggressive"):
+            return
+        from core.logic_sequences import run_coupon_reuse
         for form in forms:
             inputs = form.get("inputs", [])
-            tamperable = [i["name"] for i in inputs if any(h in (i.get("name") or "").lower() for h in PRICING_HINTS)]
-            if not tamperable:
+            code_field = next((i["name"] for i in inputs
+                               if any(h in (i.get("name") or "").lower()
+                                      for h in ("coupon", "promo", "voucher", "discount", "code"))),
+                              None)
+            if not code_field:
                 continue
             data = {i["name"]: i.get("value") or "1" for i in inputs}
-            for k in tamperable:
-                data[k] = "0.01"
-            method = form.get("method", "POST").upper()
-            url = form["action"]
-            ev = await (ctx.http.post(url, data=data) if method != "GET" else ctx.http.get(url, params=data))
-            if ev.status in (200, 201, 202):
-                body = (ev.response_body or "").lower()
-                if any(k in body for k in ("success", "ok", "created", "thank", "order")):
-                    self.report_finding(ctx, {
-                        "category": "logic",
-                        "title": f"Possible pricing/amount tampering on {url}",
-                        "severity": "high", "cvss": 7.4,
-                        "url": url, "parameter": ",".join(tamperable),
-                        "payload": "0.01",
-                        "evidence": "Server accepted attacker-controlled price/amount field with success-shaped response.",
-                        "request": f"{method} {url}\n{data}",
-                        "response": (ev.response_body or "")[:1500],
-                    })
+            apply = {"url": form.get("action") or form.get("url"),
+                     "method": form.get("method", "POST"), "data": data,
+                     "code_field": code_field, "code": data.get(code_field) or "SAVE10"}
+            f = await run_coupon_reuse(ctx, apply)
+            if f:
+                self.report_finding(ctx, f)
+
+    async def _step_skip(self, endpoints: list[str], ctx: "Context") -> None:
+        if not ctx.config.get("safety", {}).get("aggressive"):
+            return
+        from core.logic_sequences import run_step_skip
+        late_stage = ("confirm", "complete", "finalize", "finalise", "ship",
+                      "fulfill", "approve", "activate")
+        for url in endpoints:
+            name = next((h for h in late_stage if h in url.lower()), None)
+            if not name:
+                continue
+            f = await run_step_skip(ctx, {"url": url, "method": "POST", "name": name})
+            if f:
+                self.report_finding(ctx, f)
 
     async def _race_conditions(self, endpoints: list[str], ctx: "Context") -> None:
         if not ctx.config.get("safety", {}).get("aggressive"):
-            return  # fires 25 real POSTs — requires --aggressive
+            return  # fires concurrent real POSTs — requires --aggressive
+        from core.logic_sequences import run_race
         for url in endpoints:
             if not any(h in url.lower() for h in RACE_HINTS):
                 continue
-            results = await asyncio.gather(*[ctx.http.post(url) for _ in range(25)],
-                                           return_exceptions=True)
-            ok = [r for r in results if hasattr(r, "status") and r.status in (200, 201, 202)]
-            if len(ok) > 1:
-                self.report_finding(ctx, {
-                    "category": "race_condition",
-                    "title": f"Possible race condition on {url}",
-                    "severity": "high", "cvss": 7.5,
-                    "url": url,
-                    "evidence": f"25 concurrent POSTs produced {len(ok)} success responses — endpoint lacks idempotency.",
-                    "metadata": {"successes": len(ok)},
-                })
+            # observe the endpoint's own state via GET before/after; the oracle
+            # only fires when a metered value actually over-moves, not on 2xx counts
+            f = await run_race(ctx, {"url": url, "method": "POST", "state_url": url})
+            if f:
+                self.report_finding(ctx, f)
                 return

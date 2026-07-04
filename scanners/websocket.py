@@ -132,6 +132,17 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
             tok = ctx.oob.token()
             host = ctx.oob.host_for(tok)
             oob_tokens[label] = tok
+            ctx.oob.register(tok, {
+                "category": "websocket",
+                "title": f"WebSocket message injection — blind {label} (OOB)",
+                "severity": "high", "cvss": 8.1,
+                "url": ws_url, "parameter": label, "payload": p.replace("{OOB}", host),
+                "evidence": f"A WebSocket message ({label}) caused an out-of-band callback — the "
+                            "message content is processed by a vulnerable backend sink.",
+                "_detection": "oob", "_method": "WS",
+                "_request": f"WS {ws_url}  message: {p.replace('{OOB}', host)}",
+                "_oob_ref": host,
+            })
             payloads.append((label, p.replace("{OOB}", host), tok))
         else:
             payloads.append((label, p, None))

