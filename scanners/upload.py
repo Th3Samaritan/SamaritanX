@@ -75,12 +75,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if ev.error:
             continue
         text = ev.response_body or ""
-        # provide a resp-shaped object for downstream code paths
-        class _R:
-            status_code = ev.status
-            text = text
-        resp = _R()
-        if resp.status_code not in (200, 201, 202):
+        if ev.status not in (200, 201, 202):
             continue
         # extract candidate public URL from response
         candidate = None

@@ -68,6 +68,60 @@ class TestJSIntel(unittest.TestCase):
         self.assertEqual(reconstruct_sources("not json"), [])
 
 
+class TestSchemaIntel(unittest.TestCase):
+    def _schema(self):
+        return {"data": {"__schema": {
+            "queryType": {"name": "Query"},
+            "mutationType": {"name": "Mutation"},
+            "types": [
+                {"name": "Query", "fields": [
+                    {"name": "me", "args": [], "type": {"name": "User", "kind": "OBJECT"}},
+                    {"name": "user", "args": [{"name": "id", "type": {"name": "ID"}}],
+                     "type": {"name": "User"}},
+                ]},
+                {"name": "Mutation", "fields": [
+                    {"name": "login", "args": [{"name": "password", "type": {"name": "String"}}],
+                     "type": {"name": "String"}},
+                ]},
+                {"name": "User", "fields": [
+                    {"name": "id", "args": [], "type": {"name": "ID"}},
+                    {"name": "sessionToken", "args": [], "type": {"name": "String"}},
+                ]},
+                {"name": "__Type", "fields": [{"name": "password", "args": [], "type": {"name": "String"}}]},
+            ],
+        }}}
+
+    def test_parse_queries_mutations(self):
+        from core.schema_intel import parse_schema
+        parsed = parse_schema(self._schema())
+        self.assertEqual({q["name"] for q in parsed["queries"]}, {"me", "user"})
+        self.assertEqual([m["name"] for m in parsed["mutations"]], ["login"])
+        self.assertEqual(next(q for q in parsed["queries"] if q["name"] == "user")["args"], ["id"])
+
+    def test_sensitive_fields_flagged(self):
+        from core.schema_intel import parse_schema
+        sens = {(s["type"], s["field"]) for s in parse_schema(self._schema())["sensitive_fields"]}
+        # flagged on the field NAME (sessionToken contains "token")
+        self.assertIn(("User", "sessionToken"), sens)
+        # introspection meta-types (__Type) are skipped
+        self.assertFalse(any(t.startswith("__") for t, _ in sens))
+
+    def test_bare_schema_envelope(self):
+        from core.schema_intel import parse_schema
+        bare = self._schema()["data"]
+        self.assertEqual(len(parse_schema(bare)["queries"]), 2)
+
+    def test_malformed_returns_empty(self):
+        from core.schema_intel import parse_schema
+        p = parse_schema({"errors": [{"message": "introspection disabled"}]})
+        self.assertEqual(p, {"queries": [], "mutations": [], "sensitive_fields": [], "types": 0})
+
+    def test_build_probe_query(self):
+        from core.schema_intel import build_probe_query
+        self.assertEqual(build_probe_query({"name": "token", "returns": "String"}), "{ token }")
+        self.assertEqual(build_probe_query({"name": "me", "returns": "User"}), "{ me { __typename } }")
+
+
 class TestMonitorDiff(unittest.TestCase):
     def test_added_and_removed(self):
         old = {"hosts": ["a.x.com"], "endpoints": ["https://x/1"], "params": []}

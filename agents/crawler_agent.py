@@ -370,6 +370,25 @@ class CrawlerAgent(BaseAgent):
                     "request": json.dumps(introspection),
                     "response": ev.response_body[:1000],
                 })
+                # Mine the schema: turn every query/mutation into a scan target
+                # and prove any unauthenticated sensitive-field exposure.
+                try:
+                    from core.schema_intel import discover as gql_discover
+                    intel = await gql_discover(ctx, url)
+                    for f in intel["findings"]:
+                        self.report_finding(ctx, f)
+                    for t in intel["tasks"]:
+                        if t.get("params"):
+                            await ctx.queue.put(
+                                "scan", {"url": t["url"], "method": t.get("method", "POST"),
+                                         "params": t["params"]},
+                                target=ctx.target_slug, priority=2, producer=self.name)
+                    if intel["tasks"] or intel["findings"]:
+                        ctx.dashboard.event("ok",
+                            f"graphql-schema: {len(intel['tasks'])} operations, "
+                            f"{len(intel['findings'])} exposure finding(s)")
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("graphql schema mining failed: %s", exc)
                 # also enqueue for vuln agent (logic checks)
                 await ctx.queue.put("scan.graphql", {"url": url}, target=ctx.target_slug,
                                     priority=2, producer=self.name)
