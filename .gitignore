@@ -4,6 +4,18 @@ workspace/
 *.sqlite-journal
 *.log
 
+# stray scan outputs written to the repo root (they belong in workspace/)
+/findings*.json
+/revalidation*.json
+/exploitation.json
+/*.jsonl
+
+# archived legacy scan blobs are kept locally as a forensic record but NOT
+# committed (known false-positive data + bulky logs); the README that documents
+# them IS tracked.
+archive/legacy-scan-2026-06/*
+!archive/legacy-scan-2026-06/README.md
+
 # --- python ---------------------------------------------------------------
 __pycache__/
 *.py[cod]
