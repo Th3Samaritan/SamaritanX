@@ -172,6 +172,8 @@ def scan(
     second_auth: Path = typer.Option(None, "--second-session", help="second auth recipe for IDOR/BOLA cross-tenant tests"),
     session: list[str] = typer.Option(None, "--session", help="extra labeled identity for the authz matrix: 'label=recipe.yaml' (optional ':rank', higher=more privileged, e.g. 'admin=admin.yaml:2'). Repeatable — add an admin row for airtight BFLA."),
     scope: Path = typer.Option(None, "--scope", help="scope file (allow/deny rules) — see config/scope.example.txt"),
+    targets: Path = typer.Option(None, "--targets", help="file with one target per line — runs the full pipeline against each (with --parallel concurrency)"),
+    scan_scope_roots: bool = typer.Option(False, "--scan-scope-roots", help="derive targets from the --scope file and scan every in-scope root (requires --scope)"),
     program: str = typer.Option(None, "--program", help="platform program handle — fetches live scope and scans every in-scope root (e.g. --program acme)"),
     program_platform: str = typer.Option("hackerone", "--program-platform", help="platform for --program (hackerone | bugcrowd | intigriti)"),
     parallel: int = typer.Option(1, "--parallel", help="how many in-scope roots to scan concurrently with --program (1 = sequential)"),
@@ -270,6 +272,9 @@ def scan(
 
     # --program: fetch the platform scope, derive every in-scope root, and
     # run the full pipeline against each (optionally in parallel)
+    multi_roots: list[str] = []
+    multi_scope: str | None = None
+    scope_rules: list[str] = []
     if program:
         import os as _os
         from core.scope_import import fetch_program_scope, to_rules, extract_roots
@@ -281,17 +286,36 @@ def scan(
         except Exception as exc:
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
-        rules = to_rules(text)
-        roots = extract_roots(rules)
-        if not roots:
-            console.print("[red]no scannable roots derived from program scope[/red]")
+        scope_rules = to_rules(text)
+        multi_roots = extract_roots(scope_rules)
+        console.print(f"[green]{label}[/green] -> {len(multi_roots)} in-scope root(s)")
+    elif targets:
+        lines = [l.strip() for l in targets.read_text(encoding="utf-8").splitlines()
+                 if l.strip() and not l.strip().startswith("#")]
+        multi_roots = lines
+        console.print(f"[green]{len(multi_roots)} target(s)[/green] from {targets}")
+    elif scan_scope_roots:
+        if not scope:
+            console.print("[red]--scan-scope-roots requires --scope[/red]")
             raise typer.Exit(1)
-        scope_out = Path(cfg.get("workspace", {}).get("root", "./workspace")) / \
-            f"scope.{program}.txt"
-        scope_out.parent.mkdir(parents=True, exist_ok=True)
-        scope_out.write_text("\n".join(rules) + "\n", encoding="utf-8")
-        console.print(f"[green]{label}[/green] -> {len(roots)} in-scope root(s): {', '.join(roots[:12])}")
-        console.print(f"scope rules: {scope_out}")
+        from core.scope_import import to_rules, looks_like_platform_export, extract_roots
+        raw = scope.read_text(encoding="utf-8", errors="replace")
+        scope_rules = to_rules(raw) if looks_like_platform_export(raw) else \
+            [l.split("#", 1)[0].strip() for l in raw.splitlines() if l.strip()]
+        multi_roots = extract_roots(scope_rules)
+        console.print(f"[green]{len(multi_roots)} root(s)[/green] from {scope}")
+
+    if multi_roots:
+        if scope_rules:
+            scope_out = Path(cfg.get("workspace", {}).get("root", "./workspace")) / \
+                f"scope.{program or 'imported'}.txt"
+            scope_out.parent.mkdir(parents=True, exist_ok=True)
+            scope_out.write_text("\n".join(scope_rules) + "\n", encoding="utf-8")
+            multi_scope = str(scope_out)
+        elif scope:
+            multi_scope = str(scope)
+        console.print(f"roots: {', '.join(multi_roots[:12])}"
+                      + ("…" if len(multi_roots) > 12 else ""))
 
         async def _program_run():
             sem = asyncio.Semaphore(max(1, int(parallel)))
@@ -299,16 +323,16 @@ def scan(
                 async with sem:
                     await asyncio.to_thread(
                         _run_one, cfg, root, auth=auth, second_auth=second_auth,
-                        extra_sessions=extra_sessions, scope_file=str(scope_out),
+                        extra_sessions=extra_sessions, scope_file=multi_scope,
                         resume=resume, deadline=deadline, task_timeout=task_timeout,
                         no_screenshots=no_screenshots, quiet=True)
-            await asyncio.gather(*(one(r) for r in roots))
+            await asyncio.gather(*(one(r) for r in multi_roots))
         try:
             asyncio.run(_program_run())
         except KeyboardInterrupt:
             console.print("\n[yellow]interrupted — partial results in workspace/[/yellow]")
             raise typer.Exit(130)
-        console.print(f"\n[green]program scan complete[/green] — {len(roots)} root(s), "
+        console.print(f"\n[green]multi-target scan complete[/green] — {len(multi_roots)} root(s), "
                       f"workspace: {cfg.get('workspace', {}).get('root', './workspace')}")
         return
 
@@ -573,6 +597,52 @@ def triage(
                if (f.get("metadata") or {}).get("triage")]
     out.write_text(_json.dumps(decided, indent=2), encoding="utf-8")
     console.print(f"[green]{len(decided)} triage decision(s)[/green] -> {out}")
+
+
+@app.command("auth-check")
+def auth_check(
+    target: str,
+    auth: Path = typer.Option(None, "--auth", help="auth recipe to validate (default: the persisted session)"),
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Validate that an auth session loads and survives a live probe.
+
+    Loads the recipe (or the persisted workspace session), prints what the
+    session contains, then hits the target and reports whether the response
+    looks authenticated or hits an auth wall."""
+    banner()
+    cfg = load_config(config)
+    configure_logging(verbose=False)
+    orch = Orchestrator(cfg, target, auth_recipe=str(auth) if auth else None,
+                        resume=True)
+
+    async def _do():
+        await orch._async_setup()
+        s = orch.session
+        if not s or not s.is_authed():
+            console.print("[red]no session loaded[/red] (recipe failed or nothing persisted)")
+            return
+        console.print(f"[green]label[/green]   : {s.label}")
+        console.print(f"[green]cookies[/green] : {len(s.cookies)}")
+        console.print(f"[green]headers[/green] : {len(s.headers)}")
+        if getattr(s, "same_site", None):
+            console.print(f"[green]same_site[/green]: {s.same_site}")
+        probe_url = target if "://" in target else f"http://{target}"
+        ev = await orch.http.request("GET", probe_url, bypass_scope=True,
+                                     allow_redirects=False)
+        wall = ev.status in (401, 403)
+        verdict = ("[red]AUTH WALL — session likely invalid[/red]" if wall
+                   else f"[green]usable[/green] (HTTP {ev.status}, "
+                        f"{len(ev.response_body or '')} bytes)")
+        console.print(f"[green]probe[/green]    : {verdict}")
+        await orch.http.close()
+        if orch.oob:
+            try:
+                await orch.oob.close()
+            except Exception:
+                pass
+
+    asyncio.run(_do())
 
 
 memory_app = typer.Typer(help="Inspect SamaritanX memory")

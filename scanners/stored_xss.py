@@ -112,10 +112,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     # 4) Playwright execution check
     confirmed_url = None
     confirmed_sinks: list[str] = []
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        # No browser — still flag at MEDIUM as a stored-reflection candidate
+
+    def _reflection_candidates(note: str) -> None:
         for u in reflectors:
             findings.append({
                 "category": "xss",
@@ -123,20 +121,31 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 "severity": "medium", "cvss": 6.4,
                 "url": u, "parameter": target_inp["name"], "payload": payload,
                 "evidence": "Token submitted through the form re-appeared in another "
-                            "page response. Manual confirmation of execution context "
-                            "required (Playwright not installed).",
+                            f"page response. {note}",
                 "request": f"POST {submit_url}\n\n{data}",
                 "response": "",
                 "metadata": {"submitted_url": submit_url, "reflected_url": u,
                              "token": token},
             })
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        _reflection_candidates("Manual confirmation of execution context "
+                               "required (Playwright not installed).")
         return findings
 
-    async with browser_slot(ctx.config), async_playwright() as pw:
-        try:
+    try:
+        async with browser_slot(ctx.config), async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        except Exception:
-            return findings
+    except Exception:
+        # browser unavailable (no chromium build / sandbox) — never swallow the
+        # reflection evidence: still report the stored-reflection candidates
+        _reflection_candidates("Browser unavailable for execution verification "
+                               "(chromium missing).")
+        return findings
+
+    try:
         context = await browser.new_context(
             ignore_https_errors=True,
             extra_http_headers=(ctx.session.headers if ctx.session else {}) or {},
@@ -175,6 +184,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 confirmed_sinks = sorted({h["k"] for h in relevant})
                 break
         await browser.close()
+    except Exception:
+        # any browser failure still leaves the reflection evidence reportable
+        pass
 
     if confirmed_url:
         findings.append({

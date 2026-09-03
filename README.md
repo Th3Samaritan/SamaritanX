@@ -1,5 +1,7 @@
 # SamaritanX
 
+[![CI](https://github.com/Th3Samaritan/SamaritanX/actions/workflows/ci.yml/badge.svg)](https://github.com/Th3Samaritan/SamaritanX/actions/workflows/ci.yml)
+
 > Agentic bug-bounty framework for **th3Samaritan**.
 > Recon → Crawl → Vulnerability scan (12 categories) → Logic abuse → Exploit synthesis → Report (MD + PDF).
 

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from core.logger import get_logger
 from core.task_queue import Task
-from core.utils import host_of, normalize_url, random_token, root_domain
+from core.utils import host_of, normalize_url, random_token, root_domain, slugify
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -87,6 +87,14 @@ class ReconAgent(BaseAgent):
         if seed:
             await emit_live(seed)
 
+        # 0b) DNS zone transfer (AXFR) — cheap, occasionally yields the entire
+        #     zone when the nameserver is misconfigured
+        if ctx.config.get("recon", {}).get("zone_transfer", True):
+            zone_names = await self._zone_transfer(root, ctx)
+            if zone_names:
+                ctx.dashboard.event("ok",
+                    f"recon: AXFR enabled on {root} — {len(zone_names)} zone record(s)")
+
         # wildcard DNS detection: a target with *.root -> one IP would turn
         # the brute-force into thousands of phantom hosts. Resolve random
         # names FIRST and drop brute-force results resolving to wildcard IPs.
@@ -152,6 +160,14 @@ class ReconAgent(BaseAgent):
         #    (names that exist only as vhosts never resolve publicly)
         if ctx.config.get("recon", {}).get("vhost_brute", True):
             await self._vhost_brute(target_host, root, ctx, emit_live)
+
+        # 5) TCP port scan + service banners on a bounded set of live hosts
+        #    (read-only probes: banners, HTTP GET, Redis PING, Mongo isMaster)
+        if ctx.config.get("recon", {}).get("port_scan", False):
+            hosts_to_scan = list(dict.fromkeys(
+                [h for h in [target_host] + [e["host"] for e in live[:4]] if h]))[:5]
+            for h in hosts_to_scan:
+                await self._port_scan(h, ctx)
 
         (ctx.workspace / "recon" / "live.json").write_text(
             json.dumps(live, indent=2), encoding="utf-8")
@@ -538,6 +554,196 @@ class ReconAgent(BaseAgent):
         await asyncio.gather(*(probe(w) for w in words))
         if found:
             ctx.dashboard.event("ok", f"recon: vhost brute-force found {found} distinct virtual host(s)")
+
+    # ------------------------------------------------------------------ #
+    # zone transfer + port scan
+    # ------------------------------------------------------------------ #
+    _PORTS = (
+        (21, "ftp"), (22, "ssh"), (23, "telnet"), (25, "smtp"),
+        (110, "pop3"), (143, "imap"), (389, "ldap"),
+        (3306, "mysql"), (5432, "postgresql"), (6379, "redis"),
+        (27017, "mongodb"), (9200, "elasticsearch"), (11211, "memcached"),
+        (8080, "http-alt"), (8443, "https-alt"), (2375, "docker"),
+        (8500, "consul"), (8200, "vault"), (9090, "prometheus"),
+        (15672, "rabbitmq-mgmt"), (10000, "webmin"), (5000, "app-dev"),
+        (3000, "node-dev"), (8000, "http-dev"),
+    )
+    _MONGO_ISMASTER = (
+        b"\x4f\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\xd4\x07\x00\x00"
+        b"\x00\x00\x00\x00admin.$cmd\x00\x00\x00\x00\x00\x01\x00\x00\x00"
+        b"\x13\x00\x00\x00\x10ismaster\x00\x01\x00\x00\x00\x00"
+    )
+
+    async def _zone_transfer(self, root: str, ctx: "Context") -> set[str]:
+        """Attempt an AXFR against the root's own nameservers (read-only)."""
+        try:
+            import dns.resolver
+        except Exception:
+            return set()
+        loop = asyncio.get_running_loop()
+
+        def _attempt():
+            try:
+                ns = [str(r).rstrip(".") for r in dns.resolver.resolve(root, "NS")]
+            except Exception:
+                return set()
+            import dns.query
+            names: set[str] = set()
+            for server in ns[:4]:
+                try:
+                    for msg in dns.query.xfr(server, root, timeout=6, lifetime=12):
+                        for rrset in msg.answer:
+                            names.add(str(rrset.name).rstrip("."))
+                            for rdata in rrset:
+                                if getattr(rdata, "rdtype", None) == 5:
+                                    names.add(str(rdata.target).rstrip("."))
+                    if names:
+                        break
+                except Exception:
+                    continue
+            return names
+
+        names = await asyncio.wait_for(loop.run_in_executor(None, _attempt),
+                                       timeout=30.0)
+        if names:
+            from core.poc import proof_record
+            excerpt = "\n".join(sorted(names))[:1500]
+            poc = proof_record(
+                verified=True, method="AXFR", url=f"dns:{root}",
+                request=f"dig AXFR {root}",
+                excerpt=excerpt,
+                rationale=(f"The zone {root} allows unrestricted AXFR — the complete DNS "
+                           f"zone ({len(names)} names) was transferred, exposing internal "
+                           "hostnames, IPs and network topology."))
+            self.report_finding(ctx, {
+                "category": "exposure",
+                "title": f"DNS zone transfer (AXFR) enabled on {root}",
+                "severity": "high", "cvss": 7.5,
+                "url": f"dns:{root}",
+                "evidence": f"AXFR against the authoritative nameserver returned "
+                            f"{len(names)} zone records — full internal DNS enumeration.",
+                "request": f"dig AXFR {root}",
+                "response": excerpt,
+                "metadata": {"poc": poc, "zone": root, "records": len(names)},
+            })
+        return names
+
+    async def _port_scan(self, host: str, ctx: "Context") -> None:
+        """Read-only TCP port sweep + banner grab. Reports unauthenticated
+        management services (Redis/Mongo/ES/Docker) as verified exposures."""
+        ctx.dashboard.event("info", f"recon: port scan {host} ({len(self._PORTS)} ports)")
+        results: list[dict] = []
+
+        async def probe(port: int, label: str) -> None:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=2.0)
+            except Exception:
+                return
+            banner = ""
+            try:
+                if label in ("http-alt", "https-alt", "http-dev", "node-dev",
+                             "app-dev", "rabbitmq-mgmt", "prometheus", "consul",
+                             "vault", "webmin", "docker", "elasticsearch"):
+                    req = f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode()
+                    writer.write(req)
+                    await writer.drain()
+                    try:
+                        data = await asyncio.wait_for(reader.read(4096), timeout=3.0)
+                        banner = data.decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+                elif label == "redis":
+                    writer.write(b"PING\r\n")
+                    await writer.drain()
+                    try:
+                        banner = (await asyncio.wait_for(reader.read(128),
+                                                         timeout=2.0)).decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+                elif label == "mongodb":
+                    writer.write(self._MONGO_ISMASTER)
+                    await writer.drain()
+                    try:
+                        banner = (await asyncio.wait_for(reader.read(512),
+                                                         timeout=2.0)).decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        banner = (await asyncio.wait_for(reader.read(256),
+                                                         timeout=2.0)).decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            results.append({"port": port, "service": label, "banner": banner[:400]})
+            await self._service_finding(host, port, label, banner, ctx)
+
+        await asyncio.gather(*(probe(p, l) for p, l in self._PORTS))
+        out = ctx.workspace / "recon" / f"{slugify(host)}_ports.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        open_ports = [r["port"] for r in results]
+        if open_ports:
+            ctx.dashboard.event("ok",
+                f"recon: {host} open ports: {', '.join(map(str, open_ports))}")
+
+    async def _service_finding(self, host: str, port: int, label: str,
+                               banner: str, ctx: "Context") -> None:
+        """Classify an open port's banner into a finding (proof = the banner)."""
+        from core.poc import proof_record
+        title, sev, cvss, evidence = None, None, None, None
+        if label == "redis" and banner.strip().upper().startswith("+PONG"):
+            title = f"Redis exposed without authentication ({host}:{port})"
+            sev, cvss = "critical", 9.0
+            evidence = ("Redis answered PING without auth — anonymous clients can read/"
+                        "write keys, and via CONFIG/SLAVEOF escalate to the host.")
+        elif label == "mongodb" and "ismaster" in banner.lower():
+            title = f"MongoDB exposed without authentication ({host}:{port})"
+            sev, cvss = "critical", 9.0
+            evidence = ("The isMaster handshake succeeded anonymously — unauthenticated "
+                        "read/write access to every database.")
+        elif label == "elasticsearch" and ("cluster_name" in banner or "lucene" in banner):
+            title = f"Elasticsearch exposed without authentication ({host}:{port})"
+            sev, cvss = "critical", 9.0
+            evidence = ("The cluster root answered anonymously — indices and data are "
+                        "readable by anyone who can reach the port.")
+        elif label == "docker" and ("Docker" in banner or "ApiVersion" in banner):
+            title = f"Docker API exposed without authentication ({host}:{port})"
+            sev, cvss = "critical", 9.8
+            evidence = ("The Docker daemon API answered without TLS/auth — equivalent to "
+                        "root on the host (mount /, exec, deploy containers).")
+        elif label in ("mysql", "postgresql") and banner and not banner.startswith("HTTP"):
+            title = f"Database banner disclosure ({label} on {host}:{port})"
+            sev, cvss = "medium", 5.3
+            evidence = (f"The {label} greeting exposed its version string — fingerprinting "
+                        "aid; confirm authentication posture manually.")
+        elif banner and label not in ("http", "https"):
+            title = f"Service banner disclosure ({label} on {host}:{port})"
+            sev, cvss = "low", 3.7
+            evidence = f"Open {label} port advertised: {banner[:120]}"
+        if not title:
+            return
+        poc = proof_record(
+            verified=True, method="TCP", url=f"{host}:{port}",
+            request=f"connect {host}:{port}\n{('PING' if port == 6379 else 'banner read')}",
+            excerpt=banner,
+            rationale=evidence)
+        self.report_finding(ctx, {
+            "category": "exposure",
+            "title": title, "severity": sev, "cvss": cvss,
+            "url": f"{host}:{port}",
+            "evidence": evidence,
+            "request": f"connect {host}:{port}",
+            "response": banner[:800],
+            "metadata": {"port": port, "service": label, "poc": poc},
+        })
 
     @staticmethod
     def _vhost_sig(ev) -> tuple:

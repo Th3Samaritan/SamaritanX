@@ -156,5 +156,101 @@ class TestProxyRotation(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestPortScanServices(unittest.TestCase):
+    """Port-scan service classification against a live socket."""
+
+    @staticmethod
+    def _redis_socket_server(replies: list[bytes]):
+        import socket as _s
+        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def _serve():
+            for _ in range(5):
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(256)
+                    for r in replies:
+                        conn.sendall(r)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+        import threading
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+        return srv, port, t
+
+    def test_redis_pong_classified_critical(self):
+        from agents.recon_agent import ReconAgent
+
+        class FakeCtx:
+            def __init__(self):
+                import tempfile
+                from core.memory import Memory
+                from core.dashboard import Dashboard
+                self.tmp = tempfile.mkdtemp()
+                self.memory = Memory(Path(self.tmp) / "m.sqlite")
+                self.dashboard = Dashboard("x", quiet=True)
+                self.target_slug = "t"
+                self.workspace = Path(self.tmp)
+                self.config = {}
+                self.target = "127.0.0.1"
+
+        srv, port, _thread = self._redis_socket_server([b"+PONG\r\n"])
+        try:
+            ctx = FakeCtx()
+            agent = ReconAgent()
+            agent._PORTS = [(port, "redis")]
+
+            async def run():
+                await agent._port_scan("127.0.0.1", ctx)
+                rows = ctx.memory.list_findings("t")
+                return rows
+            rows = asyncio.run(run())
+            self.assertTrue(any("Redis exposed" in r["title"] and
+                                r["severity"] == "critical" for r in rows))
+        finally:
+            srv.close()
+
+    def test_closed_port_yields_nothing(self):
+        from agents.recon_agent import ReconAgent
+        import socket
+        # grab a port that is closed
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        class FakeCtx:
+            def __init__(self):
+                import tempfile
+                from core.memory import Memory
+                from core.dashboard import Dashboard
+                self.tmp = tempfile.mkdtemp()
+                self.memory = Memory(Path(self.tmp) / "m.sqlite")
+                self.dashboard = Dashboard("x", quiet=True)
+                self.target_slug = "t"
+                self.workspace = Path(self.tmp)
+                self.config = {}
+                self.target = "127.0.0.1"
+
+        ctx = FakeCtx()
+        agent = ReconAgent()
+        agent._PORTS = [(port, "test")]
+
+        async def run():
+            await agent._port_scan("127.0.0.1", ctx)
+            return ctx.memory.list_findings("t")
+        rows = asyncio.run(run())
+        self.assertEqual(rows, [])
+
+
 if __name__ == "__main__":
     unittest.main()

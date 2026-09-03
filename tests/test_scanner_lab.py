@@ -115,8 +115,31 @@ class _LabHandler(BaseHTTPRequestHandler):
                 self._send(200, f"ok: {vals[0] if vals else ''}".encode())
         elif path == "/page":
             self._send(200, b"<html><body>plain page</body></html>")
+        elif path == "/":
+            self._send(200, f"<html><body>home {' '.join(_LabHandler.stored)}</body></html>".encode())
+        elif path == "/board":
+            self._send(200, f"<html><body>{' '.join(_LabHandler.stored)}</body></html>".encode())
+        elif path == "/api/v1/admin":
+            self._send(403, b"forbidden")
+        elif path == "/api/v2/admin":
+            body = json.dumps({
+                "users": [{"id": 1, "email": "admin@example.com",
+                           "role": "superadmin", "last_login": "2026-09-03"}],
+                "roles": ["admin", "billing"],
+                "audit_log": ["login admin", "user deleted", "billing updated"],
+                "notes": "privileged endpoint without authorization checks " * 4})
+            self._send(200, body.encode(), "application/json")
+        elif path.startswith("/obj"):
+            oid = params.get("id", "1")
+            emails = {"1": "user1@example.com", "2": "user2@example.com"}
+            body = json.dumps({
+                "object": {"id": oid, "email": emails.get(oid, "x@example.com"),
+                           "notes": "lorem ipsum dolor sit amet " * 8}})
+            self._send(200, body.encode(), "application/json")
         else:
             self._send(404, b"not found")
+
+    stored: list[str] = []
 
     def do_POST(self):
         path, _, _ = self.path.partition("?")
@@ -132,6 +155,13 @@ class _LabHandler(BaseHTTPRequestHandler):
                            "application/json")
             else:
                 self._send(200, json.dumps({"success": False}).encode(), "application/json")
+        elif path == "/store":
+            body = raw.decode(errors="ignore")
+            form = {unquote_plus(k): unquote_plus(v)
+                    for k, v in (kv.split("=", 1) for kv in body.split("&") if "=" in kv)}
+            if form.get("message"):
+                _LabHandler.stored.append(form["message"])
+            self._send(200, b"saved")
         else:
             self._send(404, b"")
 
@@ -183,12 +213,21 @@ class TestScannerAccuracy(unittest.TestCase):
     def _run(self, coro):
         return asyncio.run(coro)
 
-    async def _scan(self, scanner, path, params):
+    async def _scan(self, scanner, path, params, form=None):
         ctx = _FakeContext(self.base)
         try:
-            return await scanner(ctx, self.base + path, params, "GET", None)
+            return await scanner(ctx, self.base + path, params, "GET", form)
         finally:
             await ctx.close()
+
+    def test_stored_xss_detected(self):
+        from scanners.stored_xss import scan
+        _LabHandler.stored.clear()
+        form = {"action": self.base + "/store", "method": "POST",
+                "inputs": [{"name": "message", "type": "text", "value": ""}]}
+        findings = self._run(self._scan(scan, "/store", ["message"], form))
+        self.assertTrue(any(f["category"] == "xss" and "Stored" in f["title"]
+                            for f in findings))
 
     def test_sqli_error_detected(self):
         from scanners.sqli import scan
@@ -266,6 +305,16 @@ class TestScannerAccuracy(unittest.TestCase):
         titles = " ".join(f["title"] for f in findings)
         self.assertIn("Strict Transport Security", titles)
         self.assertIn("Content Security Policy", titles)
+
+    def test_version_bypass_detected(self):
+        from scanners.version_bypass import scan
+        findings = self._run(self._scan(scan, "/api/v1/admin", []))
+        self.assertTrue(any(f["category"] == "broken_auth" for f in findings))
+
+    def test_idor_heuristic_detected(self):
+        from scanners.idor import scan
+        findings = self._run(self._scan(scan, "/obj?id=1", ["id"]))
+        self.assertTrue(any(f["category"] == "idor" for f in findings))
 
 
 if __name__ == "__main__":
