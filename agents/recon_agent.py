@@ -166,6 +166,13 @@ class ReconAgent(BaseAgent):
         #    costing a full HTTP timeout. Then cap the probe set.
         ctx.dashboard.event("info", f"recon: {len(subs)} candidates — resolving DNS")
         resolvable = await self._resolve_hosts(sorted(subs), ctx)
+        if wildcard_ips:
+            before = len(resolvable)
+            resolvable = [h for h in resolvable
+                          if await self._resolves_to(h, ctx) not in wildcard_ips]
+            if before != len(resolvable):
+                ctx.dashboard.event("info",
+                    f"recon: dropped {before - len(resolvable)} wildcard-resolving host(s)")
         max_probe = int(ctx.config.get("recon", {}).get("max_probe_hosts", 750))
         to_probe = [h for h in resolvable if h not in emitted][:max_probe]
         ctx.dashboard.task("subdomain probe", len(to_probe))
@@ -449,6 +456,16 @@ class ReconAgent(BaseAgent):
                     out.add(f"{stripped}{n}.{root}")
         return {s for s in out if s not in subs}
 
+    async def _resolves_to(self, host: str, ctx: "Context") -> str | None:
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, socket.gethostbyname, host),
+                timeout=3.0,
+            )
+        except Exception:
+            return None
+
     async def _resolve_hosts(self, hosts: list[str], ctx: "Context") -> list[str]:
         """Keep only hosts whose DNS resolves. This drops the large tail of
         dead historical hostnames returned by crt.sh / certspotter before the
@@ -475,6 +492,7 @@ class ReconAgent(BaseAgent):
     async def _probe_live(self, hosts: list[str], ctx: "Context", on_live=None) -> list[dict]:
         sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("recon_workers", 8)))
         probe_timeout = float(ctx.config.get("recon", {}).get("probe_timeout", 8.0))
+        retries = int(ctx.config.get("recon", {}).get("probe_retries", 1))
         live: list[dict] = []
 
         async def probe(host: str) -> None:
@@ -482,11 +500,15 @@ class ReconAgent(BaseAgent):
                 try:
                     for scheme in ("https", "http"):
                         url = f"{scheme}://{host}"
-                        try:
-                            ev = await asyncio.wait_for(ctx.http.get(url), timeout=probe_timeout)
-                        except asyncio.TimeoutError:
-                            continue
-                        if ev.error or ev.status == 0:
+                        ev = None
+                        for attempt in range(retries + 1):
+                            try:
+                                ev = await asyncio.wait_for(ctx.http.get(url),
+                                                            timeout=probe_timeout)
+                                break
+                            except asyncio.TimeoutError:
+                                continue  # transient stall — retry once
+                        if ev is None or ev.error or ev.status == 0:
                             continue
                         title = self._extract_title(ev.response_body)
                         tech = self._fingerprint(ev.response_headers, ev.response_body)
@@ -801,13 +823,17 @@ class ReconAgent(BaseAgent):
 
     async def _probe_host(self, host: str, ctx: "Context") -> dict | None:
         probe_timeout = float(ctx.config.get("recon", {}).get("probe_timeout", 8.0))
+        retries = int(ctx.config.get("recon", {}).get("probe_retries", 1))
         for scheme in ("https", "http"):
             url = f"{scheme}://{host}"
-            try:
-                ev = await asyncio.wait_for(ctx.http.get(url), timeout=probe_timeout)
-            except asyncio.TimeoutError:
-                continue
-            if ev.error or ev.status == 0:
+            ev = None
+            for _attempt in range(retries + 1):
+                try:
+                    ev = await asyncio.wait_for(ctx.http.get(url), timeout=probe_timeout)
+                    break
+                except asyncio.TimeoutError:
+                    continue  # transient stall — retry once
+            if ev is None or ev.error or ev.status == 0:
                 continue
             title = self._extract_title(ev.response_body)
             tech = self._fingerprint(ev.response_headers, ev.response_body)

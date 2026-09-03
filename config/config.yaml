@@ -95,6 +95,7 @@ recon:
   resolve_dns: true
   max_probe_hosts: 750          # cap live-probe set after DNS resolution
   probe_timeout: 8              # per-host HTTP probe timeout (seconds)
+  probe_retries: 1              # retry transient probe timeouts before giving up
   port_scan: false              # toggle on for in-scope authorized targets
   zone_transfer: true           # attempt AXFR against the root's nameservers
   tech_fingerprint: true
