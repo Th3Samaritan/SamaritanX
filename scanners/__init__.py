@@ -41,6 +41,9 @@ from .oauth import scan as scan_oauth  # noqa: E402
 from .graphql import scan as scan_graphql  # noqa: E402
 from .crlf import scan as scan_crlf  # noqa: E402
 from .host_header import scan as scan_host_header  # noqa: E402
+from .hpp import scan as scan_hpp  # noqa: E402
+from .path_normalization import scan as scan_path_normalization  # noqa: E402
+from .security_headers import scan as scan_security_headers  # noqa: E402
 from .xxe import scan as scan_xxe  # noqa: E402
 from .deserialization import scan as scan_deserialization  # noqa: E402
 from .version_bypass import scan as scan_version_bypass  # noqa: E402
@@ -76,6 +79,9 @@ REGISTRY: dict[str, ScanFn] = {
     "graphql": scan_graphql,
     "crlf": scan_crlf,
     "host_header": scan_host_header,
+    "hpp": scan_hpp,
+    "path_normalization": scan_path_normalization,
+    "security_headers": scan_security_headers,
     "xxe": scan_xxe,
     "deserialization": scan_deserialization,
     "version_bypass": scan_version_bypass,

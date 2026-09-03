@@ -237,6 +237,10 @@ async def _re_ssrf(ctx, f):
         return None  # callback proof — can't replay collaborator here
     ev = await _refire(ctx, f)
     body = (ev.response_body or "").lower() if ev else ""
+    payload = (f.get("payload") or "").lower()
+    # the echoed-URL case is a reflection, not a fetch — never counts
+    if payload and payload in body:
+        return False
     if any(m in body for m in _SSRF_INDICATORS):
         return _capture(f, ev, method=_re_method(f),
                         rationale="The response contained an internal-resource indicator "

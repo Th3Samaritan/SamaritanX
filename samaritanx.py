@@ -173,7 +173,7 @@ def scan(
     session: list[str] = typer.Option(None, "--session", help="extra labeled identity for the authz matrix: 'label=recipe.yaml' (optional ':rank', higher=more privileged, e.g. 'admin=admin.yaml:2'). Repeatable — add an admin row for airtight BFLA."),
     scope: Path = typer.Option(None, "--scope", help="scope file (allow/deny rules) — see config/scope.example.txt"),
     program: str = typer.Option(None, "--program", help="platform program handle — fetches live scope and scans every in-scope root (e.g. --program acme)"),
-    program_platform: str = typer.Option("hackerone", "--program-platform", help="platform for --program (hackerone)"),
+    program_platform: str = typer.Option("hackerone", "--program-platform", help="platform for --program (hackerone | bugcrowd | intigriti)"),
     parallel: int = typer.Option(1, "--parallel", help="how many in-scope roots to scan concurrently with --program (1 = sequential)"),
     resume: bool = typer.Option(False, "--resume", help="reuse memory state from a prior run (skip already-completed phases)"),
     deadline: float = typer.Option(0.0, "--deadline", help="max scan duration in seconds (0 = no limit). Kills the run gracefully when exceeded"),
@@ -405,7 +405,7 @@ def report(
 def scope_import(
     source: str = typer.Argument(None, help="path or URL of a platform scope export (HackerOne structured_scopes JSON, Bugcrowd CSV/JSON, Intigriti JSON, Chaos JSON) — omit when using --program"),
     program: str = typer.Option(None, "--program", help="fetch scope live from a platform program handle (e.g. --program acme --platform hackerone)"),
-    platform: str = typer.Option("hackerone", "--platform", help="hackerone (default)"),
+    platform: str = typer.Option("hackerone", "--platform", help="hackerone | bugcrowd | intigriti"),
     output: Path = typer.Option(None, "--output", "-o", help="where to write the generated scope file (default: config/scope.imported.txt)"),
 ):
     """Convert a bug-bounty platform scope export into a SamaritanX scope file.

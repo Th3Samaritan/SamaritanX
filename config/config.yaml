@@ -121,6 +121,9 @@ scanners:
     - graphql
     - crlf
     - host_header          # Host / X-Forwarded-Host reflection (reset-link/SSO poisoning primitive)
+    - hpp                  # HTTP parameter pollution (duplicate / array parsing)
+    - path_normalization   # 401/403 bypass via URL-parser discrepancies
+    - security_headers     # missing HSTS/CSP/XFO/nosniff etc. + banner disclosure
     - xxe
     - deserialization
     - version_bypass

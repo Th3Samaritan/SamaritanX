@@ -31,6 +31,7 @@ from core.utils import slugify
 
 class _LabHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    last_xfh: str = ""
 
     def _send(self, code, body, ctype="text/html", extra=None):
         self.send_response(code)
@@ -73,6 +74,47 @@ class _LabHandler(BaseHTTPRequestHandler):
             self._send(200, b"version 49 docs mention Werkzeug and java.lang elsewhere")
         elif path == "/api/items":
             self._send(200, json.dumps({"items": [1, 2]}).encode(), "application/json")
+        elif path == "/cors":
+            origin = self.headers.get("Origin", "")
+            extra = {}
+            if origin:
+                extra = {"Access-Control-Allow-Origin": origin,
+                         "Access-Control-Allow-Credentials": "true"}
+            self._send(200, b'{"secret": true}', "application/json", extra)
+        elif path == "/fetch":
+            target = params.get("url", "")
+            if "169.254.169.254" in target:
+                self._send(200, b"ami-id\niam/security-credentials\ncomputeMetadata",
+                           "text/plain")
+            else:
+                self._send(200, b"nothing")
+        elif path == "/echo-param":
+            # echoes the injected URL verbatim — a reflection trap that must
+            # NEVER be reported as in-band SSRF
+            self._send(200, f"you asked for: {params.get('url', '')}".encode())
+        elif path == "/cache":
+            # remembers the last X-Forwarded-Host and reflects it on later
+            # (clean) requests — simulates an unkeyed-header cache
+            xfh = self.headers.get("X-Forwarded-Host", "")
+            if xfh:
+                _LabHandler.last_xfh = xfh
+            self._send(200, f"cached page {_LabHandler.last_xfh}".encode())
+        elif path == "/admin":
+            self._send(403, b"forbidden")
+        elif path == "/admin/":
+            body = ("<html><body><h1>Admin console</h1>"
+                    "<p>Users: 42, roles: admin, billing: active.</p>"
+                    "<p>Internal API key: sk-admin-1234567890abcdef</p></body></html>")
+            self._send(200, body.encode())
+        elif path == "/hpp":
+            vals = [unquote_plus(v) for kv in query.split("&")
+                    for v in [kv.split("=", 1)[1]] if "=" in kv and kv.split("=", 1)[0] == "p"]
+            if len(vals) > 1:
+                self._send(200, b"error: duplicate parameter")
+            else:
+                self._send(200, f"ok: {vals[0] if vals else ''}".encode())
+        elif path == "/page":
+            self._send(200, b"<html><body>plain page</body></html>")
         else:
             self._send(404, b"not found")
 
@@ -184,6 +226,46 @@ class TestScannerAccuracy(unittest.TestCase):
         from scanners.rce import scan
         findings = self._run(self._scan(scan, "/static49", ["q"]))
         self.assertFalse(any(f["category"] == "ssti" for f in findings))
+
+    def test_cors_reflection_detected(self):
+        from scanners.cors import scan
+        findings = self._run(self._scan(scan, "/cors", []))
+        self.assertTrue(any(f["category"] == "cors" for f in findings))
+
+    def test_ssrf_inband_metadata_detected(self):
+        from scanners.ssrf import scan
+        findings = self._run(self._scan(scan, "/fetch", ["url"]))
+        self.assertTrue(any(f["category"] == "ssrf" for f in findings))
+
+    def test_ssrf_echo_not_flagged(self):
+        from scanners.ssrf import scan
+        findings = self._run(self._scan(scan, "/echo-param", ["url"]))
+        self.assertFalse(any(f["category"] == "ssrf" for f in findings))
+
+    def test_cache_poisoning_header_detected(self):
+        from scanners.cache_poisoning import scan
+        _LabHandler.last_xfh = ""
+        findings = self._run(self._scan(scan, "/cache", []))
+        self.assertTrue(any(f["category"] == "cache_poisoning" for f in findings))
+
+    def test_path_normalization_bypass_detected(self):
+        from scanners.path_normalization import scan
+        findings = self._run(self._scan(scan, "/admin", []))
+        self.assertTrue(any(f["category"] == "broken_auth" for f in findings))
+
+    def test_hpp_duplicate_parsing_detected(self):
+        from scanners.hpp import scan
+        findings = self._run(self._scan(scan, "/hpp", ["p"]))
+        self.assertTrue(any(f["category"] == "hpp" for f in findings))
+
+    def test_security_headers_missing_detected(self):
+        from scanners.security_headers import scan
+        findings = self._run(self._scan(scan, "/page", []))
+        cats = {f["category"] for f in findings}
+        self.assertIn("security_headers", cats)
+        titles = " ".join(f["title"] for f in findings)
+        self.assertIn("Strict Transport Security", titles)
+        self.assertIn("Content Security Policy", titles)
 
 
 if __name__ == "__main__":

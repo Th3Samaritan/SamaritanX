@@ -275,10 +275,50 @@ async def fetch_program_scope(program: str, *, platform: str = "hackerone",
                         return json.dumps(entries), f"hackerone public graphql ({program})"
             except Exception:
                 pass
-        raise RuntimeError(
-            f"could not fetch {platform} program '{program}' — "
-            "set H1_API_TOKEN for full fidelity, or export the scope manually and "
-            "use scope-import <file>")
+    elif platform == "bugcrowd":
+        # public program.json embed: target_groups[].targets[].name + in_scope
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"https://bugcrowd.com/{program}/program.json",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    entries = []
+                    for group in (data.get("target_groups") or []):
+                        for t in (group.get("targets") or []):
+                            entries.append({
+                                "asset_identifier": t.get("name"),
+                                "category": t.get("category") or "",
+                                "in_scope": t.get("in_scope", True),
+                            })
+                    if entries:
+                        return json.dumps(entries), f"bugcrowd public json ({program})"
+                except Exception:
+                    pass
+    elif platform == "intigriti":
+        # public researcher API
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                f"https://api.intigriti.com/external/researcher/v1/programs/{program}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    domains = data.get("domains") or []
+                    entries = [{"asset_identifier": d.get("endpoint"),
+                                "in_scope": True} for d in domains
+                               if d.get("endpoint")]
+                    if entries:
+                        return json.dumps(entries), f"intigriti public api ({program})"
+                except Exception:
+                    pass
+    raise RuntimeError(
+        f"could not fetch {platform} program '{program}' — "
+        "check the handle, set the platform API token if required, or export "
+        "the scope manually and use scope-import <file>")
 
 
 def extract_roots(rules: list[str]) -> list[str]:

