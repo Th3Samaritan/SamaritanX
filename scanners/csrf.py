@@ -27,7 +27,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if session is not None:
         samesite = getattr(session, "same_site", None)
     if samesite is None:
-        ev = await ctx.http.get(url)
+        cache = getattr(ctx, "cache", None)
+        ev = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
         raw = [v for v in ((ev.extra or {}).get("set_cookie_headers") or [])]
         blob = " ".join(raw).lower()
         if "samesite=strict" in blob:

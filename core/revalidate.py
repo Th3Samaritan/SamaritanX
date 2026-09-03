@@ -411,8 +411,37 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
     reproduced = dropped = skipped = 0
     details: list[dict] = []
 
+    # expensive checks (raw-socket timing oracles) get a tight per-run budget —
+    # smuggling findings repeat per URL, and each reprobe costs ~10-20s
+    cap = int(ctx.config.get("scan", {}).get("revalidate_cap", 150))
+    smuggled_hosts: set[str] = set()
+    processed = 0
+
     for f in findings:
         cat = (f.get("category") or "").lower()
+        if processed >= cap:
+            skipped += 1
+            meta = f.get("metadata") or {}
+            meta["revalidation"] = f"skipped: revalidate cap ({cap}) reached"
+            ctx.memory.update_finding(f.get("id") or f.get("_id"), metadata=meta)
+            details.append({"id": f.get("id") or f.get("_id"), "category": cat,
+                            "result": "skipped", "confidence_label":
+                            conf_label(float(f.get("confidence", 0.5) or 0.5))})
+            continue
+        if cat in ("smuggling", "h2_smuggling"):
+            host = (f.get("url") or "").split("/")[2] if "://" in (f.get("url") or "") else f.get("url")
+            if host in smuggled_hosts or len(smuggled_hosts) >= 4:
+                skipped += 1
+                meta = f.get("metadata") or {}
+                meta["revalidation"] = "skipped: smuggling reprobe budget"
+                ctx.memory.update_finding(f.get("id") or f.get("_id"), metadata=meta)
+                details.append({"id": f.get("id") or f.get("_id"), "category": cat,
+                                "result": "skipped", "confidence_label":
+                                conf_label(float(f.get("confidence", 0.5) or 0.5))})
+                continue
+            smuggled_hosts.add(host)
+        processed += 1
+
         fid = f.get("id") or f.get("_id")
         conf = float(f.get("confidence", 0.5) or 0.5)
         checker = REVALIDATORS.get(cat)

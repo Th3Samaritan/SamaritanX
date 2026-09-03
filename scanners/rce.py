@@ -46,8 +46,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     from core.baseline import TimingBaseline
     tb = TimingBaseline(k=6.0, min_delta_s=2.0)
     base_body = ""
+    cache = getattr(ctx, "cache", None)
     for _ in range(4):
-        ev0 = await ctx.http.get(url)
+        ev0 = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
         if ev0.error or ev0.status == 0:
             continue
         base_body = ev0.response_body or ""

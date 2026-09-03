@@ -31,7 +31,10 @@ def _matches(expected: dict, finding: dict) -> bool:
     needle = (expected.get("match") or "").lower()
     if not needle:
         return True
-    hay = f"{finding.get('url','')} {finding.get('parameter','')}".lower()
+    # url, parameter AND title are all fair haystacks (titles matter for
+    # configuration-class findings like security headers)
+    hay = (f"{finding.get('url','')} {finding.get('parameter','')} "
+           f"{finding.get('title','')}").lower()
     return needle in hay
 
 

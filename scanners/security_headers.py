@@ -61,7 +61,9 @@ _VERBOSE_SERVER = ("apache", "nginx", "microsoft-iis", "jetty", "lighttpd",
 
 async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
     findings: list[dict] = []
-    ev = await ctx.http.get(url, allow_redirects=False)
+    cache = getattr(ctx, "cache", None)
+    ev = await cache.fetch(ctx.http, url, allow_redirects=False) if cache \
+        else await ctx.http.get(url, allow_redirects=False)
     if not ev.status or ev.status in (0, 404):
         return findings
     headers = {str(k).lower(): str(v) for k, v in ev.response_headers.items()}

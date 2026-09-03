@@ -33,6 +33,24 @@ if TYPE_CHECKING:
 log = get_logger("crawler")
 
 
+def _in_crawl_scope(link_host: str, seed_host: str, follow_subs: bool) -> bool:
+    """True when a link's host belongs to the crawl frontier.
+
+    Seed host always allowed; subdomains of the seed host only when
+    ``follow_subdomains``; PARENT domains never are — the registrable-root
+    comparison used previously let a target like scanme.nmap.org crawl the
+    whole of nmap.org."""
+    link_host = (link_host or "").lower().rstrip(".")
+    seed_host = (seed_host or "").lower().rstrip(".")
+    if not link_host or not seed_host:
+        return False
+    if link_host == seed_host:
+        return True
+    if follow_subs and link_host.endswith("." + seed_host):
+        return True
+    return False
+
+
 @dataclass
 class CrawlState:
     queued: set[str] = field(default_factory=set)
@@ -104,7 +122,7 @@ class CrawlerAgent(BaseAgent):
                     loc = ev.response_headers.get("location") or ""
                     if loc:
                         target = normalize_url(urljoin(url, loc))
-                        if root_domain(host_of(target)) == root_domain(host) \
+                        if _in_crawl_scope(host_of(target), host, follow_subs) \
                                 and target not in state.queued:
                             state.queued.add(target)
                             next_frontier.append(target)
@@ -121,12 +139,10 @@ class CrawlerAgent(BaseAgent):
                             continue
                         if not follow_subs and host_of(link) != host:
                             continue
-                        # keep links inside the same registered domain (e.g.
-                        # both example.com and api.example.com pass; evil.com
-                        # does not).
-                        link_root = root_domain(host_of(link))
-                        seed_root = root_domain(host)
-                        if link_root != seed_root:
+                        # keep links inside the seed host or its subdomains —
+                        # never the parent domain (scanme.nmap.org must not
+                        # crawl nmap.org)
+                        if not _in_crawl_scope(host_of(link), host, follow_subs):
                             continue
                         state.queued.add(link)
                         next_frontier.append(link)
@@ -249,7 +265,7 @@ class CrawlerAgent(BaseAgent):
         Non-recursive (one hop) and capped so it can't turn into an unbounded
         second crawl.
         """
-        seed_root = root_domain(host_of(seed_url))
+        seed_host = host_of(seed_url)
         cap = int(ctx.config.get("crawler", {}).get("max_route_refetch", 150))
         max_urls = int(ctx.config.get("crawler", {}).get("max_urls_per_host", 1000))
 
@@ -275,7 +291,7 @@ class CrawlerAgent(BaseAgent):
         for url in candidates:
             if fetched >= cap or len(state.visited) >= max_urls:
                 break
-            if url in state.visited or root_domain(host_of(url)) != seed_root:
+            if url in state.visited or not _in_crawl_scope(host_of(url), seed_host, True):
                 continue
             state.visited.add(url)
             ev = await ctx.http.get(url, allow_redirects=False)
@@ -402,7 +418,7 @@ class CrawlerAgent(BaseAgent):
                         f"crawler: authenticated render harvested {len(xhr_endpoints)} XHR call(s)")
                 for href in hrefs + xhr_endpoints:
                     href = normalize_url(href)
-                    if root_domain(host_of(href)) != root_domain(host_of(seed_url)):
+                    if not _in_crawl_scope(host_of(href), host_of(seed_url), True):
                         continue
                     if href not in state.queued:
                         state.queued.add(href)

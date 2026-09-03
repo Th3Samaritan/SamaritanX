@@ -37,6 +37,26 @@ PASSIVE_HTTP_SOURCES = [
     ("rapiddns", "https://rapiddns.io/subdomain/{root}?full=1#result"),
 ]
 
+# Optional key-based enrichments — only collected when the API key is present
+# in the environment. Shodan/VirusTotal/SecurityTrails all expose domain →
+# subdomains endpoints.
+def _keyed_sources() -> list[tuple[str, str, dict]]:
+    import os
+    out: list[tuple[str, str, dict]] = []
+    if os.environ.get("SHODAN_API_KEY"):
+        out.append(("shodan",
+                    "https://api.shodan.io/dns/domain/{root}?key=" + os.environ["SHODAN_API_KEY"],
+                    {}))
+    if os.environ.get("VT_API_KEY"):
+        out.append(("virustotal",
+                    "https://www.virustotal.com/api/v3/domains/{root}/subdomains?limit=200",
+                    {"x-apikey": os.environ["VT_API_KEY"]}))
+    if os.environ.get("SECURITYTRAILS_API_KEY"):
+        out.append(("securitytrails",
+                    "https://api.securitytrails.com/v1/domain/{root}/subdomains",
+                    {"APIKEY": os.environ["SECURITYTRAILS_API_KEY"]}))
+    return out
+
 
 class ReconAgent(BaseAgent):
     name = "recon"
@@ -270,11 +290,14 @@ class ReconAgent(BaseAgent):
 
     async def _passive_http(self, root: str, ctx: "Context") -> set[str]:
         found: set[str] = set()
-        for name, url_tpl in PASSIVE_HTTP_SOURCES:
+        sources = list(PASSIVE_HTTP_SOURCES)
+        if ctx.config.get("recon", {}).get("keyed_sources", True):
+            sources += [(n, u, h) for n, u, h in _keyed_sources()]
+        for name, url_tpl, extra_headers in sources:
             url = url_tpl.format(root=root)
             # bypass_scope=True — these are external OSINT APIs, not the target;
             # they must never be blocked by the scope policy.
-            ev = await ctx.http.get(url, bypass_scope=True)
+            ev = await ctx.http.get(url, headers=extra_headers or None, bypass_scope=True)
             if ev.error or ev.status >= 400:
                 continue
             try:
@@ -308,6 +331,22 @@ class ReconAgent(BaseAgent):
                         h = h.strip().lower().lstrip("*.")
                         if h.endswith(root):
                             found.add(h)
+                elif name == "shodan":
+                    data = json.loads(ev.response_body)
+                    for h in data.get("subdomains") or []:
+                        if h:
+                            found.add(f"{h}.{root}")
+                elif name == "virustotal":
+                    data = json.loads(ev.response_body)
+                    for item in data.get("data") or []:
+                        h = (item.get("id") or "").lower()
+                        if h.endswith(root):
+                            found.add(h)
+                elif name == "securitytrails":
+                    data = json.loads(ev.response_body)
+                    for h in data.get("subdomains") or []:
+                        if h:
+                            found.add(f"{h}.{root}")
             except Exception as exc:
                 log.debug("passive source %s parse error: %s", name, exc)
         return found
@@ -517,7 +556,9 @@ class ReconAgent(BaseAgent):
 
         async def probe(word: str) -> None:
             nonlocal found
-            for candidate in (f"{word}.{root}", word):
+            # subdomain-shaped candidates only — bare words (intranet search
+            # domains) create nonsense hosts like "31337" and pollute the crawl
+            for candidate in (f"{word}.{root}",):
                 if found >= cap:
                     return
                 # the candidate hostname must be in scope before we touch it

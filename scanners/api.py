@@ -42,7 +42,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 # ---------- excessive data exposure ----------
 async def _excessive_exposure(ctx, url):
-    ev = await ctx.http.get(url)
+    cache = getattr(ctx, "cache", None)
+    ev = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
     if ev.status != 200 or "json" not in ev.response_headers.get("content-type", "").lower():
         return []
     try:

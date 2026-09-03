@@ -50,6 +50,8 @@ class Context:
     session: SessionStore | None
     scope: ScopePolicy | None
     oob: OOBClient | None
+    # shared clean-baseline request cache (scanners read it, never write)
+    cache: "BaselineCache | None" = None
     # Extra labeled identities for the authorization matrix (e.g. an admin row).
     # Each: {"label": str, "client": StealthHttpClient, "rank": int}.
     extra_identities: list[dict[str, Any]] = field(default_factory=list)
@@ -107,6 +109,7 @@ class Orchestrator:
         self.scope: ScopePolicy | None = None
         self.oob: OOBClient | None = None
         self.extra_identities: list[dict[str, Any]] = []  # {label, client, rank}
+        self.cache: "BaselineCache | None" = None
 
         self.memory.upsert_target(self.target_slug, self.root, {"input": target})
         if not resume:
@@ -124,6 +127,9 @@ class Orchestrator:
 
     @property
     def context(self) -> Context:
+        if self.cache is None:
+            from .req_cache import BaselineCache
+            self.cache = BaselineCache()
         return Context(
             config=self.config,
             target=self.target,
@@ -138,6 +144,7 @@ class Orchestrator:
             session=self.session,
             scope=self.scope,
             oob=self.oob,
+            cache=self.cache,
             extra_identities=self.extra_identities,
             resume=self.resume,
         )
@@ -307,6 +314,8 @@ class Orchestrator:
                 await self._join_with_deadline("phase2")
             except asyncio.TimeoutError:
                 self.dashboard.event("err", "global scan deadline reached — stopping")
+                # deliver whatever we found even when the deadline cut phase 2
+                await self._final_report()
             finally:
                 # completion notification (before the http client closes)
                 try:
@@ -315,10 +324,31 @@ class Orchestrator:
                 except Exception:
                     pass
                 await self._shutdown_workers(workers)
+        # belt-and-braces: if no report file was produced for any reason,
+        # render one before the run ends
+        report_path = self.workspace / "reports" / "report.md"
+        if not report_path.exists():
+            await self._final_report()
         n = len(self.memory.list_findings(self.target_slug))
         self.dashboard.event("ok",
             f"run complete — {n} findings, {self.http.request_count} requests, "
             f"{self.http.scoped_out} scope-blocked")
+
+    async def _final_report(self) -> None:
+        """Emergency deliverable: render the report from memory right now.
+
+        Runs when the global deadline fired before the exploit/report phase
+        completed — a run that produces no report is indistinguishable from a
+        crashed one, so we always emit at least the proof-gated report."""
+        try:
+            from agents.reporting_agent import ReportingAgent
+            from .task_queue import Task
+            t = Task(priority=1, seq=0, kind="report",
+                     target=self.target_slug, payload={}, producer="orchestrator")
+            await ReportingAgent().handle(t, self.context)
+            self.dashboard.event("ok", "emergency report rendered")
+        except Exception as exc:  # noqa: BLE001
+            self.dashboard.event("err", f"emergency report failed: {exc}")
 
     async def _join_with_deadline(self, phase: str) -> None:
         """Block until the task queue is fully drained or the global deadline

@@ -47,6 +47,7 @@ from agents.reporting_agent import ReportingAgent  # noqa: E402
 app = typer.Typer(add_completion=False, help="Agentic bug-bounty framework — operator: th3Samaritan")
 console = Console()
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "config.yaml"
+__version__ = "1.0.0"
 
 
 def load_config(path: Path | None) -> dict:
@@ -90,14 +91,18 @@ def banner() -> None:
 
 
 def run_scan(target: str, *, config: Path | None = None, scope: Path | None = None,
-             only: str = "", deadline: float = 0.0, no_pdf: bool = True,
-             no_screenshots: bool = True, no_oob: bool = True) -> None:
+             only: str = "", deadline: float = 0.0, rate: float = 0.0,
+             no_pdf: bool = True, no_screenshots: bool = True,
+             no_oob: bool = True) -> None:
     """Programmatic entry point used by bench.runner and embedders.
 
     Runs the full agent pipeline synchronously and writes the workspace."""
     cfg = load_config(config)
     if only:
         cfg.setdefault("scanners", {})["enabled"] = [s.strip() for s in only.split(",") if s.strip()]
+    if rate > 0:
+        cfg.setdefault("stealth", {})["rate_limit_rps"] = rate
+        cfg["stealth"]["per_host_rps"] = rate
     if no_pdf:
         cfg.setdefault("reporting", {})["format"] = ["markdown"]
     if no_oob:
@@ -188,6 +193,7 @@ def scan(
     skip: str = typer.Option("", "--skip", help="comma-separated scanner deny-list"),
     depth: int = typer.Option(0, "--depth", help="override crawler max_depth"),
     rate: float = typer.Option(0.0, "--rate", help="override stealth.rate_limit_rps"),
+    profile: str = typer.Option("", "--profile", help="config preset: fast | deep | stealth (see config.yaml profiles)"),
     no_pdf: bool = typer.Option(False, "--no-pdf", help="skip PDF rendering"),
     no_screenshots: bool = typer.Option(False, "--no-screenshots", help="skip Playwright PoC screenshots"),
     no_oob: bool = typer.Option(False, "--no-oob", help="don't register interactsh — disables blind RCE/SSRF callback detection"),
@@ -210,6 +216,24 @@ def scan(
             console.print(f"  [dim]- {msg}[/dim]")
 
     # CLI overrides
+    if profile:
+        presets = (cfg.get("profiles") or {}).get(profile)
+        if not presets:
+            console.print(f"[red]unknown profile '{profile}'[/red] (fast | deep | stealth)")
+            raise typer.Exit(1)
+        for section, values in (presets or {}).items():
+            if section == "scanners" and isinstance(values, dict):
+                skip = values.get("skip") or []
+                if skip:
+                    cfg.setdefault("scanners", {})["enabled"] = [
+                        s for s in cfg.get("scanners", {}).get("enabled", [])
+                        if s not in skip]
+                if "nuclei" in values:
+                    cfg.setdefault("scanners", {})["nuclei"] = values["nuclei"]
+                continue
+            if isinstance(values, dict):
+                cfg.setdefault(section, {}).update(values)
+        console.print(f"[green]profile[/green]: {profile}")
     if tor:
         cfg.setdefault("proxy", {})["tor"] = True
         cfg["proxy"]["enabled"] = True
@@ -643,6 +667,12 @@ def auth_check(
                 pass
 
     asyncio.run(_do())
+
+
+@app.command("version")
+def version():
+    """Print the SamaritanX version."""
+    console.print(f"SamaritanX {__version__}")
 
 
 memory_app = typer.Typer(help="Inspect SamaritanX memory")

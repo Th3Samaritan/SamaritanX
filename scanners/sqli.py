@@ -39,8 +39,9 @@ async def _baseline(ctx, url: str, n: int = 4):
     baseline engine, so a single slow/large sample can't skew the thresholds."""
     tb = TimingBaseline(k=6.0, min_delta_s=2.0)
     rb = ResponseBaseline()
+    cache = getattr(ctx, "cache", None)
     for _ in range(n):
-        ev = await ctx.http.get(url)
+        ev = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
         if ev.error or ev.status == 0:
             continue
         tb.add((ev.elapsed_ms or 0.0) / 1000.0)

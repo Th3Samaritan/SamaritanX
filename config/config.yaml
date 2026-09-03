@@ -3,6 +3,22 @@
 # Override at runtime via CLI flags or a custom --config file.
 # =====================================================================
 
+profiles:
+  fast:                        # broad + quick — first pass on a program
+    stealth: {rate_limit_rps: 12, per_host_rps: 6}
+    crawler: {max_depth: 2}
+    scanners:
+      skip: [smuggling, h2_smuggling, websocket, stored_xss, dom_xss,
+             oauth, prompt_injection, prototype_pollution]
+      nuclei: false
+  deep:                        # everything, slowly, deeper
+    stealth: {rate_limit_rps: 4, per_host_rps: 2}
+    crawler: {max_depth: 5, max_urls_per_host: 3000}
+  stealth:                     # minimal footprint
+    stealth: {rate_limit_rps: 1.5, per_host_rps: 0.7, jitter_ms: [500, 2000]}
+    crawler: {max_depth: 2}
+    recon: {permutations: false, vhost_brute: false, zone_transfer: false}
+
 operator:
   handle: th3Samaritan
   contact: ai@technoguard.tech
@@ -68,6 +84,7 @@ scan:
   deadline_seconds: 0               # 0 = no global wall-clock limit
   incremental: true                 # skip re-scanning endpoints whose content hash
                                     # hasn't changed since the last completed scan
+  revalidate_cap: 150               # max findings re-fired per run (bounded phase2)
 
 recon:
   passive_only: false
@@ -86,6 +103,9 @@ recon:
   vhost_brute: true             # fuzz Host headers against the resolved IP
   vhost_words: 60               # words tried for vhost discovery
   vhost_cap: 25                 # max distinct vhosts emitted per run
+  keyed_sources: true           # Shodan/VirusTotal/SecurityTrails enrichment
+                                # when SHODAN_API_KEY / VT_API_KEY /
+                                # SECURITYTRAILS_API_KEY are set
 
 crawler:
   max_depth: 3

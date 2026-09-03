@@ -43,7 +43,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
     aggressive = bool(ctx.config.get("safety", {}).get("aggressive"))
 
-    base = await ctx.http.get(url)
+    cache = getattr(ctx, "cache", None)
+    base = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
     base_len = len(base.response_body or "")
     base_status = base.status
 

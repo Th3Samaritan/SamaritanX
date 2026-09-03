@@ -52,7 +52,9 @@ class VulnerabilityAgent(BaseAgent):
         # on scheduled re-runs, zero loss of coverage)
         incremental = bool(ctx.config.get("scan", {}).get("incremental", True))
         if incremental:
-            probe = await ctx.http.get(url, allow_redirects=False)
+            cache = getattr(ctx, "cache", None)
+            probe = await cache.fetch(ctx.http, url, allow_redirects=False) if cache \
+                else await ctx.http.get(url, allow_redirects=False)
             if probe.status and not probe.error:
                 import hashlib
                 fp = hashlib.sha1(
@@ -113,7 +115,9 @@ class VulnerabilityAgent(BaseAgent):
         if incremental:
             try:
                 import hashlib
-                ev0 = await ctx.http.get(url, allow_redirects=False)
+                cache = getattr(ctx, "cache", None)
+                ev0 = await cache.fetch(ctx.http, url, allow_redirects=False) if cache \
+                    else await ctx.http.get(url, allow_redirects=False)
                 if ev0.status and not ev0.error:
                     fp = hashlib.sha1(
                         f"{ev0.status}|{len(ev0.response_body or '')}|"

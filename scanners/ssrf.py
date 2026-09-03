@@ -75,9 +75,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
     # baseline body — an indicator that is already present on the clean page
     # (docs page mentioning "ami-id" etc.) is not evidence of SSRF
-    base_ev = await ctx.http.get(url)
+    cache = getattr(ctx, "cache", None)
+    base_ev = await cache.fetch(ctx.http, url) if cache else await ctx.http.get(url)
     base_body = (base_ev.response_body or "").lower() if base_ev.status else ""
-
     async def test_param(param: str) -> None:
         # 1) in-band cloud-metadata / file:// indicators
         for p in payloads:

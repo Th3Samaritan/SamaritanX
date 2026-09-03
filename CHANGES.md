@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.0.0 — the accuracy + automation release
+
+### Fixed
+- `crlf` scanner missing `return findings` crashed every vuln task and silently
+  discarded ALL findings from every scanner in the batch.
+- Orchestrator task-timeout caps killed the scan/exploit/report phases mid-run —
+  scans ended with no report at all; report now always renders (emergency path).
+- Crawler followed redirects with no scope check, lost 302 endpoints, and — via
+  the registrable-root comparison — could crawl an entire parent domain
+  (scanme.nmap.org → all of nmap.org). Now seed-host + subdomains only.
+- Dead detectors: time-based SQLi (7s floor vs 5s payloads), WebSocket SQLi
+  (3s window vs 4.5s threshold), nosqli boolean (inverted condition) and auth
+  bypass (self-defeating status check).
+- False-positive generators: SSTI on static "49"/"Werkzeug" pages, upload
+  "execution" on raw-served files, version_bypass on any 200, CSRF SameSite read
+  from the wrong cookie, BOLA on public footer markers, h2 CONTINUATION on any
+  frame, XSS via fully-encoded variants, SSRF via echoed URLs.
+- Proof-gate honored stale poc after a failed re-test; revalidation re-fired
+  reflected XSS against the payload-less URL; revalidation now bounded
+  (cap + smuggling reprobe budget) so phase 2 always finishes.
+- Token bucket auto-scale fought the 429 cooldown; scope CIDR checks blocked the
+  event loop; httpx sync response hook broke every request; host filenames with
+  ':' became NTFS alternate data streams; secret validator demoted live
+  credentials on transport errors; Slack `"ok": true` never matched; Zero-finding
+  scans produced no report.
+
+### Added
+- **Detectors**: LFI, host-header injection, HPP, path-normalization auth bypass,
+  security headers, JWT RS256→HS256 JWKS confusion, unkeyed-query cache
+  poisoning, SSRF echo guard, OAuth/GraphQL depth coverage.
+- **Accuracy engine**: spec-compliant CVSS 3.1 calculator (vector/score/band
+  always agree), baseline-gated detectors, per-category revalidators,
+  proof-gate, mock-server regression suite (210+ unit tests, 136 self-checks).
+- **Recon**: wildcard-DNS detection, alt-dns permutations, vhost brute force,
+  TCP port scan with Redis/Mongo/ES/Docker classification, DNS zone transfer,
+  keyed sources (Shodan/VirusTotal/SecurityTrails).
+- **Program automation**: platform scope import + live fetch (HackerOne /
+  Bugcrowd / Intigriti), `scan --program`, `--targets`, `--scan-scope-roots`,
+  parallel roots, HackerOne draft auto-creation (CWE + program linkage).
+- **Persistence**: session cookie/header save-restore, phase checkpoints,
+  incremental rescan by content hash, shared baseline request cache.
+- **Workflow**: `retest`, `triage`, `diff`, `auth-check`, config profiles
+  (fast/deep/stealth), custom headers, proxy rotation pool, sqlmap/Burp handoff
+  files, SARIF/CSV/JSONL exports, Slack/Discord/Telegram alerts, LLM impact
+  triage (Anthropic/OpenAI/DeepSeek/OpenAI-compatible), 20+ secret validators.
+- **Benchmark**: `bench.runner` end-to-end against the lab answer key —
+  recall 1.00, precision 0.67, F1 0.80; CI (unit tests + coverage + selftest),
+  Dockerfile, AGENTS.md, scanner + escalation docs.
+
 ## Unreleased — proof, credibility & new surface
 
 ### Added

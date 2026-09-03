@@ -34,7 +34,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if method.upper() != "GET":
         return findings
     marker_host = f"sx-{random_token(8)}.evil.samaritanx.test"
-    base = await ctx.http.get(url, allow_redirects=False)
+    cache = getattr(ctx, "cache", None)
+    base = await cache.fetch(ctx.http, url, allow_redirects=False) if cache \
+        else await ctx.http.get(url, allow_redirects=False)
     base_blob = ((base.response_body or "") + " "
                  + base.response_headers.get("location", "") + " "
                  + base.response_headers.get("link", "")).lower()

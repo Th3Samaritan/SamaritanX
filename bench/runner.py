@@ -75,13 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     sc = sub.add_parser("scan", help="scan each answer-key target then score")
     sc.add_argument("--answers", required=True, type=Path)
     sc.add_argument("--workspace", default=Path("./workspace"), type=Path)
+    sc.add_argument("--rate", type=float, default=25.0,
+                    help="request rate for the scans (default 25 rps — lab-grade targets)")
+    sc.add_argument("--deadline", type=float, default=600.0,
+                    help="per-target scan deadline in seconds")
 
     args = ap.parse_args(argv)
 
     if args.cmd == "scan":
         try:
-            import asyncio
-            from samaritanx import run_scan  # type: ignore
+            from samaritanx import run_scan
         except Exception as exc:
             print(f"scan mode needs the CLI entrypoint (run_scan): {exc}", file=sys.stderr)
             return 2
@@ -89,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         for target in _answers_by_target(answers):
             print(f"[bench] scanning {target} …", file=sys.stderr)
             try:
-                asyncio.run(run_scan(target))
+                run_scan(target, rate=args.rate, deadline=args.deadline)
             except Exception as exc:  # noqa: BLE001
                 print(f"[bench] scan of {target} failed: {exc}", file=sys.stderr)
 
