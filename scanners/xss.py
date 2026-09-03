@@ -210,7 +210,12 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     ev_fire = await _request(ctx, url, method, param, variant, form)
                 resp = ev_fire.response_body or ""
                 # Did the breakout text + token survive without HTML-encoding?
-                if token in resp and html_lib.escape(payload) not in resp:
+                # Guard against the SENT variant: it must itself contain
+                # HTML-active characters for a reflection to be executable —
+                # a fully-encoded variant (e.g. %C0%BC overlong or %5Cu003c)
+                # echoed verbatim renders inert, so it can't count.
+                if token in resp and html_lib.escape(variant) != variant \
+                        and html_lib.escape(variant) not in resp:
                     findings.append({
                         "category": "xss",
                         "title": f"Reflected XSS in `{param}` "
@@ -239,22 +244,28 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     continue
                 if v["method"] == "GET" and v.get("query"):
                     target = merge_query(url, v["query"])
+                    sent = next(iter(v["query"].values()), "")
                     async with sem:
                         ev_fire = await ctx.http.get(target, headers=v.get("headers") or {})
                 else:
+                    sent = v.get("body") or ""
                     async with sem:
-                        ev_fire = await ctx.http.post(url, data=v.get("body"),
+                        ev_fire = await ctx.http.post(url, data=sent,
                                                      headers=v.get("headers") or {})
-                if "SX_" in (ev_fire.response_body or "") and "alert" in (ev_fire.response_body or ""):
+                resp = ev_fire.response_body or ""
+                # the polyglot carries a unique SX_ token; require it unencoded —
+                # an HTML-encoded reflection (&lt;svg ...&gt;) still contains the
+                # "SX_"/"alert" substrings and must NOT count as a bypass
+                if "SX_" in resp and html_lib.escape(sent) not in resp:
                     findings.append({
                         "category": "xss",
                         "title": f"Reflected XSS in `{param}` via {v['name']} transport mutation",
                         "severity": "high", "cvss": 6.5,
-                        "url": url, "parameter": param, "payload": v.get("body") or str(v.get("query")),
+                        "url": url, "parameter": param, "payload": sent,
                         "evidence": f"WAF was bypassed by switching transport to `{v['name']}` — "
                                     "polyglot landed in the response unencoded.",
                         "request": f"{v['method']} {url}",
-                        "response": (ev_fire.response_body or "")[:1500],
+                        "response": resp[:1500],
                         "metadata": {"transport": v["name"]},
                     })
                     return

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import random
 import re
@@ -26,6 +27,22 @@ def slugify(value: str) -> str:
 
 
 def root_domain(host: str) -> str:
+    """Registrable domain of a host (URL / host:port / IP all accepted)."""
+    if not host:
+        return ""
+    if "://" in host:
+        host = urlparse(host).netloc
+    host = host.strip().lower()
+    if host.startswith("["):  # ipv6 literal
+        return host
+    host = host.split("@")[-1]  # strip userinfo
+    if ":" in host:
+        host = host.rsplit(":", 1)[0]
+    try:
+        ipaddress.ip_address(host)
+        return host  # IPs are their own root
+    except ValueError:
+        pass
     ext = _EXTRACT(host)
     if not ext.suffix:
         return host

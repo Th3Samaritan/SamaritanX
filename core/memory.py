@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS processed_urls (
     processed   INTEGER NOT NULL,
     PRIMARY KEY (target, url, phase)
 );
+
+CREATE TABLE IF NOT EXISTS url_fingerprints (
+    target      TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    updated     INTEGER NOT NULL,
+    PRIMARY KEY (target, url)
+);
 """
 
 
@@ -351,3 +359,23 @@ class Memory:
                 )
             else:
                 conn.execute("DELETE FROM processed_urls WHERE target=?", (target,))
+
+    # ---------- incremental scanning ----------
+    def set_url_fingerprint(self, target: str, url: str, fingerprint: str) -> None:
+        """Record the content fingerprint observed when a URL was scanned."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO url_fingerprints (target, url, fingerprint, updated) "
+                "VALUES (?,?,?,?) "
+                "ON CONFLICT(target, url) DO UPDATE SET "
+                "fingerprint=excluded.fingerprint, updated=excluded.updated",
+                (target, url, fingerprint, int(time.time())),
+            )
+
+    def get_url_fingerprint(self, target: str, url: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT fingerprint FROM url_fingerprints WHERE target=? AND url=?",
+                (target, url),
+            ).fetchone()
+            return str(row["fingerprint"]) if row else None

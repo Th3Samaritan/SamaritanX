@@ -33,8 +33,9 @@
 ### {{ loop.index }}. {{ f.title }}
 
 - **Severity:** `{{ f.severity|upper }}`  (CVSS {{ "%.1f"|format(f.cvss) }})
-- **Category:** `{{ f.category }}`
-- **Confidence:** `{{ (f.confidence_label or 'unknown')|upper }}` ({{ "%.0f"|format((f.confidence or 0)*100) }}%){% if (f.confidence or 1) < 0.6 %} — ⚠ manual verification required before submitting{% endif %}
+{% if f.metadata and f.metadata.cvss_vector %}- **CVSS Vector:** `{{ f.metadata.cvss_vector }}`
+{% endif %}- **Category:** `{{ f.category }}`
+- **Confidence:** `{{ (f.confidence_label or 'unknown')|upper }}` ({{ "%.0f"|format((f.confidence or 0)*100) }}%){{ ' — ⚠ manual verification required before submitting' if (f.confidence or 1) < 0.6 else '' }}
 - **URL:** `{{ f.url or "—" }}`
 {% if f.parameter %}- **Parameter:** `{{ f.parameter }}`{% endif %}
 

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from core.logger import get_logger
 from core.task_queue import Task
-from core.utils import host_of, normalize_url, root_domain
+from core.utils import host_of, normalize_url, random_token, root_domain
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -47,6 +47,13 @@ class ReconAgent(BaseAgent):
         target_url = target if "://" in target else f"http://{target}"
         target_host = host_of(target_url)
         root = root_domain(target_host)
+
+        # resume: recon already completed in a prior run — re-hydrate the
+        # persisted results instead of repeating every network source
+        if ctx.resume and ctx.memory.is_completed(ctx.target_slug, "recon"):
+            await self._resume_from_disk(target_host, ctx)
+            return
+
         ctx.dashboard.event("info", f"recon: starting on root={root}")
 
         live: list[dict] = []
@@ -80,6 +87,16 @@ class ReconAgent(BaseAgent):
         if seed:
             await emit_live(seed)
 
+        # wildcard DNS detection: a target with *.root -> one IP would turn
+        # the brute-force into thousands of phantom hosts. Resolve random
+        # names FIRST and drop brute-force results resolving to wildcard IPs.
+        wildcard_ips: set[str] = set()
+        if ctx.config.get("recon", {}).get("detect_wildcard", True):
+            wildcard_ips = await self._detect_wildcard(root, ctx)
+            if wildcard_ips:
+                ctx.dashboard.event("info",
+                    f"recon: wildcard DNS detected ({len(wildcard_ips)} ip) — filtering phantom hosts")
+
         # 1) Collect subdomains — run every collector concurrently (not
         #    sequentially) so a slow tool can't stall the others.
         subs: set[str] = {root, target_host}
@@ -87,13 +104,21 @@ class ReconAgent(BaseAgent):
         collectors = [
             self._run_subfinder(root, ctx),
             self._passive_http(root, ctx),
-            self._dns_bruteforce(root, ctx),
+            self._dns_bruteforce(root, ctx, wildcard_ips),
         ]
         if not passive_only:
             collectors.append(self._run_amass(root, ctx))
         for result in await asyncio.gather(*collectors, return_exceptions=True):
             if isinstance(result, set):
                 subs.update(result)
+
+        # subdomain permutations (alt-dns style) — prefixes/suffixes/number
+        # swaps seeded from every discovered name, capped and re-resolved
+        if ctx.config.get("recon", {}).get("permutations", True):
+            perms = self._permutate(root, subs)
+            if perms:
+                ctx.dashboard.event("info", f"recon: generated {len(perms)} permutation candidate(s)")
+                subs.update(perms)
 
         # persist the full candidate list + record assets
         (ctx.workspace / "recon" / "subdomains.txt").write_text(
@@ -123,13 +148,72 @@ class ReconAgent(BaseAgent):
         # 3) Probe live endpoints, emitting each one to the crawler as found.
         await self._probe_live(to_probe, ctx, on_live=emit_live)
 
+        # 4) virtual-host discovery — fuzz Host headers against the resolved IP
+        #    (names that exist only as vhosts never resolve publicly)
+        if ctx.config.get("recon", {}).get("vhost_brute", True):
+            await self._vhost_brute(target_host, root, ctx, emit_live)
+
         (ctx.workspace / "recon" / "live.json").write_text(
             json.dumps(live, indent=2), encoding="utf-8")
 
         if not emitted:
             ctx.dashboard.event("err", "recon: no live hosts found — pipeline stops here")
             return
+        ctx.memory.mark_completed(ctx.target_slug, "recon")
         ctx.dashboard.event("ok", f"recon: {len(emitted)} live hosts emitted to crawler + discovery")
+
+    async def _resume_from_disk(self, target_host: str, ctx: "Context") -> None:
+        """--resume path: reload persisted recon output and re-emit crawl /
+        discovery tasks without hitting any network source."""
+        live_path = ctx.workspace / "recon" / "live.json"
+        live: list[dict] = []
+        if live_path.exists():
+            try:
+                live = json.loads(live_path.read_text(encoding="utf-8"))
+            except Exception:
+                live = []
+        if not live:
+            # nothing persisted — fall through to a fresh recon
+            ctx.dashboard.event("info", "recon: no persisted live hosts — running fresh")
+            return await self.handle_resume_fallback(target_host, ctx)
+        emitted = 0
+        for entry in live:
+            if not entry.get("host"):
+                continue
+            ctx.memory.add_asset(ctx.target_slug, "endpoint", entry.get("url", ""),
+                                 metadata=entry)
+            await ctx.queue.put(
+                "crawl",
+                {"url": entry.get("url"), "tech": entry.get("tech", []),
+                 "host": entry["host"]},
+                target=ctx.target_slug, priority=3, producer=self.name,
+            )
+            await ctx.queue.put(
+                "discover",
+                {"host": entry["host"], "base": entry.get("url")},
+                target=ctx.target_slug, priority=3, producer=self.name,
+            )
+            emitted += 1
+        ctx.dashboard.event("ok",
+            f"recon: resumed from disk — {emitted} live host(s) re-emitted")
+
+    async def handle_resume_fallback(self, target_host: str, ctx: "Context") -> None:
+        """Fresh recon when resume found nothing persisted (rare)."""
+        seed = await self._probe_host(target_host, ctx)
+        if seed:
+            await ctx.queue.put(
+                "crawl",
+                {"url": seed["url"], "tech": seed.get("tech", []), "host": seed["host"]},
+                target=ctx.target_slug, priority=3, producer=self.name,
+            )
+            await ctx.queue.put(
+                "discover",
+                {"host": seed["host"], "base": seed["url"]},
+                target=ctx.target_slug, priority=3, producer=self.name,
+            )
+            (ctx.workspace / "recon" / "live.json").write_text(
+                json.dumps([seed], indent=2), encoding="utf-8")
+        ctx.memory.mark_completed(ctx.target_slug, "recon")
 
     # ---------- collectors ----------
     async def _run_subfinder(self, root: str, ctx: "Context") -> set[str]:
@@ -227,26 +311,88 @@ class ReconAgent(BaseAgent):
                 "mail", "git", "jenkins", "grafana", "status", "auth", "sso",
                 "login", "cdn", "static", "internal", "corp", "support"]
 
-    async def _dns_bruteforce(self, root: str, ctx: "Context") -> set:
+    async def _dns_bruteforce(self, root: str, ctx: "Context",
+                              wildcard_ips: set[str] | None = None) -> set:
         wordlist = self._load_wordlist()
         found: set[str] = set()
         loop = asyncio.get_running_loop()
         sem = asyncio.Semaphore(20)  # limit concurrent DNS lookups
+        wildcard_ips = wildcard_ips or set()
 
         async def resolve(name: str) -> None:
             host = f"{name}.{root}"
             async with sem:
                 try:
-                    await asyncio.wait_for(
+                    ip = await asyncio.wait_for(
                         loop.run_in_executor(None, socket.gethostbyname, host),
                         timeout=5.0,
                     )
-                    found.add(host)
+                    if ip not in wildcard_ips:
+                        found.add(host)
                 except Exception:
                     return
 
         await asyncio.gather(*(resolve(w) for w in wordlist))
         return found
+
+    # ------------------------------------------------------------------ #
+    # wildcard DNS + permutations
+    # ------------------------------------------------------------------ #
+    _PERM_PREFIXES = ("www", "api", "dev", "staging", "test", "app", "admin",
+                      "mail", "portal", "vpn", "m", "docs", "assets", "static",
+                      "int", "status", "blog", "cdn", "dashboard", "beta")
+    _PERM_SUFFIXES = ("-dev", "-staging", "-test", "-api", "-admin", "-old",
+                      "-internal", "-backup", "-new")
+
+    async def _detect_wildcard(self, root: str, ctx: "Context") -> set[str]:
+        """Resolve random names under the root; if they all resolve to the same
+        small IP set, the zone is wildcarded. Returns the wildcard IPs."""
+        loop = asyncio.get_running_loop()
+        ips: set[str] = set()
+
+        async def probe(i: int) -> None:
+            host = f"sxw-{random_token(8)}.{root}"
+            try:
+                ip = await asyncio.wait_for(
+                    loop.run_in_executor(None, socket.gethostbyname, host),
+                    timeout=5.0,
+                )
+                ips.add(ip)
+            except Exception:
+                pass
+
+        await asyncio.gather(*(probe(i) for i in range(3)))
+        # 3 distinct answers = NOT a wildcard; 1-2 shared IPs = wildcard
+        return ips if 0 < len(ips) <= 2 else set()
+
+    def _permutate(self, root: str, subs: set[str]) -> set[str]:
+        """alt-dns style mutations of discovered subdomains (bounded)."""
+        cap = 250
+        out: set[str] = set()
+        base_names: set[str] = set()
+        for s in subs:
+            s = s.strip().lower().lstrip("*.")
+            if not s or s == root:
+                continue
+            if s.endswith("." + root):
+                s = s[: -(len(root) + 1)]
+            base_names.add(s.split(".")[0])
+        for name in list(base_names)[:40]:
+            if len(out) >= cap:
+                break
+            for p in self._PERM_PREFIXES:
+                out.add(f"{p}-{name}.{root}")
+                out.add(f"{p}.{name}.{root}")
+            for suf in self._PERM_SUFFIXES:
+                out.add(f"{name}{suf}.{root}")
+            for n in ("01", "02", "1", "2", "3"):
+                out.add(f"{name}{n}.{root}")
+                out.add(f"{name}-{n}.{root}")
+            stripped = name.rstrip("0123456789")
+            if stripped and stripped != name:
+                for n in ("01", "02", "1", "2"):
+                    out.add(f"{stripped}{n}.{root}")
+        return {s for s in out if s not in subs}
 
     async def _resolve_hosts(self, hosts: list[str], ctx: "Context") -> list[str]:
         """Keep only hosts whose DNS resolves. This drops the large tail of
@@ -306,6 +452,105 @@ class ReconAgent(BaseAgent):
 
         await asyncio.gather(*(probe(h) for h in hosts))
         return live
+
+    async def _vhost_brute(self, target_host: str, root: str, ctx: "Context",
+                           on_live) -> None:
+        """Virtual-host discovery: names that exist only as HTTP Host-header
+        vhosts never resolve publicly, so we connect to the target IP and send
+        candidate Host names. A response that differs from a random-Host
+        baseline is a distinct vhost — emitted like any other live host.
+
+        Scope note: the connection goes to the resolved IP (bypass_scope so
+        the IP itself can't be blocked by a domain allow-list), but every
+        candidate Host name is checked against the scope policy FIRST.
+        """
+        loop = asyncio.get_running_loop()
+        from urllib.parse import urlparse as _urlparse
+        netloc = _urlparse(target_host if "://" in target_host
+                           else f"http://{target_host}").netloc or target_host
+        ip = None
+        for h in (root, netloc.split(":")[0]):
+            try:
+                ip = await asyncio.wait_for(
+                    loop.run_in_executor(None, socket.gethostbyname, h), timeout=5.0)
+                break
+            except Exception:
+                continue
+        if not ip:
+            return
+        # baseline signature from a hostname that can never exist
+        base_host = f"sxv-{random_token(10)}.invalid"
+        base_url = f"https://{netloc}"
+        base_ev = await ctx.http.get(base_url, headers={"Host": base_host},
+                                     bypass_scope=True, allow_redirects=False)
+        if not base_ev.status:
+            base_url = f"http://{netloc}"
+            base_ev = await ctx.http.get(base_url, headers={"Host": base_host},
+                                         bypass_scope=True, allow_redirects=False)
+        if not base_ev.status:
+            return
+        base_sig = self._vhost_sig(base_ev)
+        probe_url = base_url
+        scheme = "https" if base_url.startswith("https://") else "http"
+
+        words = self._load_wordlist()[:int(ctx.config.get("recon", {}).get("vhost_words", 60))]
+        sem = asyncio.Semaphore(8)
+        seen_sigs: set = {base_sig}
+        found = 0
+        cap = int(ctx.config.get("recon", {}).get("vhost_cap", 25))
+
+        async def probe(word: str) -> None:
+            nonlocal found
+            for candidate in (f"{word}.{root}", word):
+                if found >= cap:
+                    return
+                # the candidate hostname must be in scope before we touch it
+                if ctx.scope:
+                    ok, _reason = ctx.scope.allows(f"{scheme}://{candidate}")
+                    if not ok:
+                        continue
+                async with sem:
+                    ev = await ctx.http.get(probe_url,
+                                             headers={"Host": candidate},
+                                             bypass_scope=True,
+                                             allow_redirects=False)
+                if not ev.status:
+                    continue
+                sig = self._vhost_sig(ev)
+                if sig in seen_sigs:
+                    continue
+                seen_sigs.add(sig)
+                found += 1
+                title = self._extract_title(ev.response_body)
+                entry = {
+                    "url": normalize_url(f"{scheme}://{candidate}"),
+                    "host": candidate,
+                    "status": ev.status,
+                    "title": title,
+                    "tech": self._fingerprint(ev.response_headers, ev.response_body),
+                    "server": ev.response_headers.get("server", ""),
+                }
+                ctx.dashboard.event("ok", f"recon: vhost discovered — {candidate} "
+                                          f"({ev.status}, {len(ev.response_body or '')}B)")
+                if on_live is not None:
+                    await on_live(entry)
+
+        await asyncio.gather(*(probe(w) for w in words))
+        if found:
+            ctx.dashboard.event("ok", f"recon: vhost brute-force found {found} distinct virtual host(s)")
+
+    @staticmethod
+    def _vhost_sig(ev) -> tuple:
+        body = ev.response_body or ""
+        title = ""
+        lo = body.lower()
+        i = lo.find("<title")
+        if i != -1:
+            j = lo.find(">", i)
+            k = lo.find("</title", j)
+            if j != -1 and k != -1:
+                title = body[j + 1:k].strip()[:80]
+        return (ev.status, len(body), title, ev.response_headers.get("server", ""))
 
     async def _probe_host(self, host: str, ctx: "Context") -> dict | None:
         probe_timeout = float(ctx.config.get("recon", {}).get("probe_timeout", 8.0))

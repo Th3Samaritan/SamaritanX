@@ -106,11 +106,34 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if ev_a.status and ev_a.status < 400 and ev_b.status and ev_b.status < 400 and len(a) >= 120:
         markers_a = identity_markers(a)
         markers_b = identity_markers(b)
+        # public baseline: markers an anonymous client also sees are boilerplate
+        # (support emails, build hashes, analytics ids), never per-user secrets
+        public_markers: set[str] = set()
+        try:
+            ev_pub = await ctx.http.get(url, no_session=True,
+                                        headers={"Authorization": "", "Cookie": ""})
+            if ev_pub.status and ev_pub.status < 400:
+                public_markers = identity_markers(ev_pub.response_body or "")
+        except Exception:
+            pass
         # A's private markers that B can also see, excluding values B legitimately
-        # owns (present in B's own identity set independent of this object).
-        leaked = (markers_a & markers_b)
-        if leaked:
-            sample = sorted(leaked)[:5]
+        # owns (present in B's own identity set independent of this object) and
+        # anything that is public boilerplate.
+        shared = (markers_a & markers_b) - public_markers
+        # identity-shaped markers (email/UUID) are unambiguous; generic long
+        # tokens (build hashes etc.) are too noisy for a critical claim
+        strong = {m for m in shared if EMAIL_RE.fullmatch(m) or UUID_RE.fullmatch(m)}
+        if strong:
+            sample = sorted(strong)[:5]
+            from core.poc import proof_record
+            poc = proof_record(
+                verified=True, method=method.upper(), url=url,
+                request=f"{method.upper()} {url}  (replayed as {label_b})",
+                status=ev_b.status, excerpt=b,
+                rationale=(f"Identity '{label_b}' received identity markers belonging to "
+                           f"'{label_a}' ({sample}). These markers are absent from the "
+                           "unauthenticated response of the same URL, so this is broken "
+                           "object-level authorization, not public content."))
             findings.append({
                 "category": "idor",
                 "title": "BOLA — session B reads session A's object (identity markers leaked)",
@@ -123,7 +146,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 "request": f"{method.upper()} {url}  (replayed as {label_b})",
                 "response": b[:1500],
                 "metadata": {"session_a": label_a, "session_b": label_b,
-                             "leaked_markers": sample, "detection": "cross_session_marker"},
+                             "leaked_markers": sample, "detection": "cross_session_marker",
+                             "poc": poc},
             })
 
     # ---------- 2) id enumeration across the auth boundary ----------

@@ -35,6 +35,9 @@ proxy:
   enabled: false
   url: ""                        # e.g. socks5h://127.0.0.1:9050 for Tor
   tor: false                     # convenience flag — uses 127.0.0.1:9050
+  rotation: []                   # list of proxy URLs — round-robined per request
+                                 # (cookies re-synced across the pool). --proxy
+                                 # also accepts comma-separated URLs.
 
 waf_evasion:
   enabled: true
@@ -63,6 +66,8 @@ scan:
   task_timeout_seconds: 60          # per-scanner task cap (snappy)
   long_phase_timeout_seconds: 600   # recon/crawl/discover budget (fan-out phases)
   deadline_seconds: 0               # 0 = no global wall-clock limit
+  incremental: true                 # skip re-scanning endpoints whose content hash
+                                    # hasn't changed since the last completed scan
 
 recon:
   passive_only: false
@@ -75,6 +80,11 @@ recon:
   probe_timeout: 8              # per-host HTTP probe timeout (seconds)
   port_scan: false              # toggle on for in-scope authorized targets
   tech_fingerprint: true
+  detect_wildcard: true         # resolve random names to spot *.root zones
+  permutations: true            # alt-dns style subdomain mutations (bounded)
+  vhost_brute: true             # fuzz Host headers against the resolved IP
+  vhost_words: 60               # words tried for vhost discovery
+  vhost_cap: 25                 # max distinct vhosts emitted per run
 
 crawler:
   max_depth: 3
@@ -89,6 +99,7 @@ crawler:
 scanners:
   enabled:
     - sqli
+    - lfi                  # in-band /etc/passwd + php://filter chain
     - xss                  # context-aware reflected XSS
     - stored_xss           # multi-step inject -> crawl -> verify in browser
     - dom_xss
@@ -109,6 +120,7 @@ scanners:
     - oauth
     - graphql
     - crlf
+    - host_header          # Host / X-Forwarded-Host reflection (reset-link/SSO poisoning primitive)
     - xxe
     - deserialization
     - version_bypass
@@ -149,6 +161,15 @@ monitor:
   webhook: ""               # optional POST URL for new-surface alerts (Slack/Discord/etc.)
   keep_diffs: 30            # retain only the newest N diff artifacts (0 = keep all)
 
+notify:
+  enabled: false            # structured alerts across channels (all optional)
+  on: ["new_findings", "new_surface", "scan_complete"]
+  slack_webhook: "{ENV:SX_SLACK_WEBHOOK}"
+  discord_webhook: "{ENV:SX_DISCORD_WEBHOOK}"
+  telegram:
+    bot_token: "{ENV:SX_TG_BOT_TOKEN}"
+    chat_id: "{ENV:SX_TG_CHAT_ID}"
+
 reporting:
   format: ["markdown", "pdf"]
   include_walkthrough: true
@@ -161,5 +182,16 @@ memory:
 
 llm:
   enabled: false                # toggle for AI-assisted reasoning
-  provider: "anthropic"         # anthropic | openai
-  model: "claude-opus-4-7"
+  provider: "anthropic"         # anthropic | openai | deepseek | openai_compatible
+  model: "claude-sonnet-5"      # set for your provider (deepseek -> deepseek-chat)
+  api_key: "{ENV:ANTHROPIC_API_KEY}"   # or DEEPSEEK_API_KEY / OPENAI_API_KEY
+                                # (any {ENV:NAME} or literal key; never commit keys)
+  base_url: ""                  # for openai_compatible (Groq/OpenRouter/Ollama/vLLM) —
+                                # e.g. https://api.groq.com/openai/v1
+
+hackerone:
+  enabled: false                # auto-create DRAFT reports (never publishes)
+  api_token: "{ENV:H1_API_TOKEN}"
+  username: "th3Samaritan"      # required by the HackerOne API (User-Agent)
+  program: ""                   # optional program handle to attach drafts to
+  weak_only: false              # only draft non-critical findings for review

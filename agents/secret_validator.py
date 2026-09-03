@@ -6,7 +6,7 @@ the recorded findings, attempts a *benign* read-only API call against
 the originating provider, and updates the finding's severity / metadata
 based on whether the credential is live.
 
-Validators implemented (all benign — no destructive verbs, no billable
+Validators implemented (all benign ΓÇö no destructive verbs, no billable
 operations beyond a single auth-test):
 
     aws_access_key + aws_secret_key   -> sts.GetCallerIdentity
@@ -38,8 +38,17 @@ AKIA_RE = re.compile(r"AKIA[0-9A-Z]{16}")
 AWS_SECRET_RE = re.compile(r"(?i)(?<![A-Za-z0-9/])([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/])")
 SLACK_RE = re.compile(r"xox[baprs]-[A-Za-z0-9-]+")
 GH_PAT_RE = re.compile(r"gh[ops]_[A-Za-z0-9]{36}")
+GH_FINE_RE = re.compile(r"github_pat_[A-Za-z0-9_]{22,}")
+GL_PAT_RE = re.compile(r"glpat-[A-Za-z0-9_\-]{20,}")
+ANTHROPIC_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")
+OPENAI_RE = re.compile(r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}")
+TWILIO_SID_RE = re.compile(r"AC[0-9a-fA-F]{32}")
+TWILIO_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])([0-9a-fA-F]{32})(?![A-Za-z0-9])")
+HEROKU_RE = re.compile(r"(?<![A-Za-z0-9])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![A-Za-z0-9])")
 STRIPE_RE = re.compile(r"sk_live_[0-9a-zA-Z]{24,}")
 SENDGRID_RE = re.compile(r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}")
+MAILGUN_RE = re.compile(r"key-[0-9a-f]{32}")
+CF_API_RE = re.compile(r"[A-Za-z0-9_-]{37,40}")
 NPM_RE = re.compile(r"npm_[A-Za-z0-9]{36}")
 DO_RE = re.compile(r"dop_v1_[A-Za-z0-9]{64}")
 
@@ -80,7 +89,7 @@ class SecretValidatorAgent(BaseAgent):
             elif valid is False:
                 new_severity = "info"
                 new_cvss = 0.0
-                new_title = f"[FALSE POSITIVE — rejected by provider] {f['title']}"
+                new_title = f"[FALSE POSITIVE ΓÇö rejected by provider] {f['title']}"
                 dead += 1
             ctx.memory.update_finding(
                 f["id"],
@@ -93,7 +102,7 @@ class SecretValidatorAgent(BaseAgent):
             f"validator: {live} live secrets confirmed, {dead} demoted as false positives")
 
     async def _validate(self, blob: str, ctx) -> tuple[str, bool | None, dict]:
-        # AWS — needs both access + secret to verify; we look for them together
+        # AWS ΓÇö needs both access + secret to verify; we look for them together
         ak = AKIA_RE.search(blob)
         if ak:
             sk_match = AWS_SECRET_RE.search(blob.replace(ak.group(0), "", 1))
@@ -109,7 +118,18 @@ class SecretValidatorAgent(BaseAgent):
                 headers={"Authorization": f"Bearer {m.group(0)}"},
                 bypass_scope=True,
             )
-            ok = '"ok":true' in (ev.response_body or "")
+            if _transport_failed(ev):
+                return "slack", None, {"reason": "transport_error"}
+            # Slack returns {"ok": true|false, ...} — a *space* after the colon,
+            # so a naive '"ok":true' substring never matches.
+            ok = False
+            try:
+                data = json.loads(ev.response_body or "{}")
+                if isinstance(data, dict):
+                    ok = data.get("ok") is True
+            except Exception:
+                body = (ev.response_body or "").lower()
+                ok = '"ok": true' in body or '"ok":true' in body
             return "slack", bool(ok), {"body": (ev.response_body or "")[:200]}
 
         m = GH_PAT_RE.search(blob)
@@ -120,7 +140,114 @@ class SecretValidatorAgent(BaseAgent):
                          "Accept": "application/vnd.github+json"},
                 bypass_scope=True,
             )
+            if _transport_failed(ev):
+                return "github", None, {"reason": "transport_error"}
             return "github", ev.status == 200, {"login_present": '"login"' in (ev.response_body or "")}
+
+        m = GH_FINE_RE.search(blob)
+        if m:
+            # fine-grained PATs often lack the /user scope — /user 401 may
+            # still be a live token, so fall back to the rate-limit endpoint
+            ev = await ctx.http.get(
+                "https://api.github.com/rate_limit",
+                headers={"Authorization": f"token {m.group(0)}",
+                         "Accept": "application/vnd.github+json"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "github_fine_grained", None, {"reason": "transport_error"}
+            ok = ev.status == 200 and '"resources"' in (ev.response_body or "")
+            return "github_fine_grained", ok, {"status": ev.status}
+
+        m = ANTHROPIC_RE.search(blob)
+        if m:
+            ev = await ctx.http.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": m.group(0), "anthropic-version": "2023-06-01"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "anthropic", None, {"reason": "transport_error"}
+            return "anthropic", ev.status == 200, {"status": ev.status}
+
+        m = OPENAI_RE.search(blob)
+        if m:
+            ev = await ctx.http.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {m.group(0)}"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "openai", None, {"reason": "transport_error"}
+            return "openai", ev.status == 200, {"status": ev.status}
+
+        # Twilio: account SID + auth token pair
+        tsid = TWILIO_SID_RE.search(blob)
+        if tsid:
+            ttok = TWILIO_TOKEN_RE.search(blob.replace(tsid.group(0), "", 1))
+            if ttok:
+                import base64 as _b64
+                cred = _b64.b64encode(f"{tsid.group(0)}:{ttok.group(0)}".encode()).decode()
+                ev = await ctx.http.get(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{tsid.group(0)}.json",
+                    headers={"Authorization": f"Basic {cred}"},
+                    bypass_scope=True,
+                )
+                if _transport_failed(ev):
+                    return "twilio", None, {"reason": "transport_error"}
+                return "twilio", ev.status == 200, {"status": ev.status}
+            return "twilio", None, {"reason": "token_not_found_alongside_SID"}
+
+        m = HEROKU_RE.search(blob)
+        if m:
+            ev = await ctx.http.get(
+                "https://api.heroku.com/account",
+                headers={"Authorization": f"Bearer {m.group(0)}",
+                         "Accept": "application/vnd.heroku+json; version=3"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "heroku", None, {"reason": "transport_error"}
+            return "heroku", ev.status == 200, {"email_present": '"email"' in (ev.response_body or "")}
+
+        m = GL_PAT_RE.search(blob)
+        if m:
+            ev = await ctx.http.get(
+                "https://gitlab.com/api/v4/user",
+                headers={"PRIVATE-TOKEN": m.group(0)},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "gitlab", None, {"reason": "transport_error"}
+            return "gitlab", ev.status == 200, {"username_present": '"username"' in (ev.response_body or "")}
+
+        m = MAILGUN_RE.search(blob)
+        if m:
+            import base64 as _b64
+            cred = _b64.b64encode(f"api:{m.group(0)}".encode()).decode()
+            ev = await ctx.http.get(
+                "https://api.mailgun.net/v3/domains",
+                headers={"Authorization": f"Basic {cred}"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "mailgun", None, {"reason": "transport_error"}
+            return "mailgun", ev.status == 200, {"status": ev.status}
+
+        # Cloudflare tokens carry no distinctive prefix, so only attempt when
+        # the evidence itself mentions cloudflare
+        if re.search(r"cloudflare", blob, re.I):
+            m = CF_API_RE.search(blob)
+            if m:
+                ev = await ctx.http.get(
+                    "https://api.cloudflare.com/client/v4/user/tokens/verify",
+                    headers={"Authorization": f"Bearer {m.group(0)}"},
+                    bypass_scope=True,
+                )
+                if _transport_failed(ev):
+                    return "cloudflare_api", None, {"reason": "transport_error"}
+                ok = ev.status == 200 and '"success": true' in (ev.response_body or "")
+                return "cloudflare_api", ok, {"status": ev.status}
 
         m = STRIPE_RE.search(blob)
         if m:
@@ -129,6 +256,8 @@ class SecretValidatorAgent(BaseAgent):
                 headers={"Authorization": f"Bearer {m.group(0)}"},
                 bypass_scope=True,
             )
+            if _transport_failed(ev):
+                return "stripe", None, {"reason": "transport_error"}
             return "stripe", ev.status == 200, {"status": ev.status}
 
         m = SENDGRID_RE.search(blob)
@@ -138,6 +267,8 @@ class SecretValidatorAgent(BaseAgent):
                 headers={"Authorization": f"Bearer {m.group(0)}"},
                 bypass_scope=True,
             )
+            if _transport_failed(ev):
+                return "sendgrid", None, {"reason": "transport_error"}
             return "sendgrid", ev.status == 200, {"status": ev.status}
 
         m = NPM_RE.search(blob)
@@ -147,6 +278,8 @@ class SecretValidatorAgent(BaseAgent):
                 headers={"Authorization": f"Bearer {m.group(0)}"},
                 bypass_scope=True,
             )
+            if _transport_failed(ev):
+                return "npm", None, {"reason": "transport_error"}
             return "npm", ev.status == 200, {"status": ev.status}
 
         m = DO_RE.search(blob)
@@ -156,12 +289,14 @@ class SecretValidatorAgent(BaseAgent):
                 headers={"Authorization": f"Bearer {m.group(0)}"},
                 bypass_scope=True,
             )
+            if _transport_failed(ev):
+                return "digitalocean", None, {"reason": "transport_error"}
             return "digitalocean", ev.status == 200, {"status": ev.status}
 
         return "unmatched", None, {}
 
-    async def _aws_sts(self, akid: str, secret: str, ctx) -> tuple[bool, dict]:
-        # AWS SigV4 signing in pure Python is verbose — try the import path first
+    async def _aws_sts(self, akid: str, secret: str, ctx) -> tuple[bool | None, dict]:
+        # AWS SigV4 signing in pure Python is verbose ΓÇö try the import path first
         try:
             import datetime, hashlib, hmac
             t = datetime.datetime.now(datetime.timezone.utc)
@@ -197,4 +332,11 @@ class SecretValidatorAgent(BaseAgent):
             return bool(ok), {"status": ev.status,
                               "snippet": (ev.response_body or "")[:300]}
         except Exception as exc:
-            return False, {"error": str(exc)}
+            return None, {"error": str(exc)}
+
+
+def _transport_failed(ev) -> bool:
+    """True when the provider call never completed (network/timeout/DNS) — in
+    that case we learned nothing about the credential and must leave the
+    finding untouched instead of demoting it as rejected."""
+    return bool(getattr(ev, "error", None)) or (getattr(ev, "status", 0) or 0) == 0

@@ -81,7 +81,15 @@ class ScopePolicy:
         f = Path(path)
         if not f.exists():
             raise FileNotFoundError(f"scope file not found: {f}")
-        for raw in f.read_text(encoding="utf-8").splitlines():
+        raw_text = f.read_text(encoding="utf-8")
+        # platform scope exports (HackerOne/Bugcrowd/Intigriti/Chaos JSON, CSV)
+        # are auto-detected and converted to the native rule grammar
+        from .scope_import import looks_like_platform_export, to_rules
+        if looks_like_platform_export(raw_text):
+            rules = to_rules(raw_text)
+        else:
+            rules = raw_text.splitlines()
+        for raw in rules:
             line = raw.split("#", 1)[0].strip()
             if not line:
                 continue

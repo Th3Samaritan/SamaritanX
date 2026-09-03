@@ -64,6 +64,11 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     candidate_params = scored or params
     oob_param_tokens: dict[str, tuple[str, str]] = {}
 
+    # baseline body — an indicator that is already present on the clean page
+    # (docs page mentioning "ami-id" etc.) is not evidence of SSRF
+    base_ev = await ctx.http.get(url)
+    base_body = (base_ev.response_body or "").lower() if base_ev.status else ""
+
     async def test_param(param: str) -> None:
         # 1) in-band cloud-metadata / file:// indicators
         for p in payloads:
@@ -71,7 +76,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 ev = await _request(ctx, url, method, param, p, form)
             body = (ev.response_body or "").lower()
             for label, marker in INDICATORS:
-                if marker.lower() in body:
+                if marker.lower() in body and marker.lower() not in base_body:
                     findings.append(_finding(url, param, p, "in-band", ev,
                         f"Response includes '{marker}' — internal resource reachable",
                         label=label))
@@ -122,31 +127,10 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             async with sem:
                 await ctx.http.get(url, headers={header: target})
 
-    # 4) poll OOB once for both param- and header-based callbacks
-    if ctx.oob and ctx.oob.registered and (oob_param_tokens or oob_header_tokens):
-        await asyncio.sleep(2.0)
-        for param, (token, oob_url) in oob_param_tokens.items():
-            events = await ctx.oob.poll(token)
-            if events:
-                kinds = sorted({(e.get("protocol") or "?").lower() for e in events})
-                findings.append(_finding(
-                    url, param, oob_url, "oob",
-                    type("E", (), {"method": method.upper(), "url": url,
-                                   "response_body": ""})(),
-                    f"OOB callback received via {kinds} — confirms blind SSRF "
-                    f"({len(events)} interactions)",
-                    label="oob"))
-        for header, (token, oob_url) in oob_header_tokens.items():
-            events = await ctx.oob.poll(token)
-            if events:
-                kinds = sorted({(e.get("protocol") or "?").lower() for e in events})
-                findings.append(_finding(
-                    url, f"header:{header}", oob_url, "oob-header",
-                    type("E", (), {"method": "GET", "url": url,
-                                   "response_body": ""})(),
-                    f"OOB callback received via {kinds} after injecting `{header}` — "
-                    f"header-based SSRF ({len(events)} interactions)",
-                    label=f"header:{header}"))
+    # OOB callbacks: both param- and header-based tokens are registered with
+    # the OOB client above — the background poller plus the finalize sweep
+    # emit them via oob.pending_findings(). We must NOT also self-report here;
+    # doing so recorded the same callback twice with two different titles.
     return findings
 
 

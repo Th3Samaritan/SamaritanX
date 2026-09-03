@@ -46,10 +46,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             return [_ss_finding(url, body, "medium", 6.1,
                 "Server reflected the injected prototype property — input merges into an "
                 "object prototype. Confirm a concrete gadget (e.g. status/isAdmin) manually.")]
-        if ev.status >= 500 and base_status and base_status < 500:
-            return [_ss_finding(url, body, "medium", 5.8,
-                f"Prototype-pollution payload caused a {ev.status} where the clean request "
-                f"returned {base_status} — likely unsafe recursive merge. Confirm manually.")]
+        # a single transient 500 (or a 405 from an endpoint that simply doesn't
+        # accept POST) proves nothing — require the crash to REPRODUCE
+        if ev.status >= 500 and base_status and base_status < 500 \
+                and ev.status not in (404, 405):
+            ev2 = await ctx.http.request("POST", url, json_body=body,
+                                         headers={"Content-Type": "application/json"})
+            if ev2.status >= 500:
+                return [_ss_finding(url, body, "medium", 5.8,
+                    f"Prototype-pollution payload caused a {ev.status} twice where the "
+                    f"clean request returned {base_status} — likely unsafe recursive "
+                    "merge. Confirm manually.")]
     return []
 
 

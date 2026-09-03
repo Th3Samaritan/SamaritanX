@@ -155,6 +155,21 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
             open_timeout=8,
             close_timeout=2,
         ) as ws:
+            # control latency: a benign message's round-trip. Sleep-based
+            # detections must beat this by a wide margin, so a merely slow
+            # handler can't false-fire.
+            ctrl_t0 = time.perf_counter()
+            try:
+                await ws.send("ping")
+                for _ in range(2):
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=3.2)
+                    except asyncio.TimeoutError:
+                        break
+            except Exception:
+                pass
+            control_elapsed = time.perf_counter() - ctrl_t0
+
             for label, payload, tok in payloads:
                 # send three message shapes per payload
                 shapes = [
@@ -165,13 +180,16 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
                 ]
                 for shape, msg in shapes:
                     t0 = time.perf_counter()
+                    # sleep payloads need a read window longer than the sleep
+                    # itself, otherwise the timeout hides the delay
+                    recv_timeout = 3.2 if label == "sqli_time" else 1.5
                     try:
                         await ws.send(msg)
                         # try to read up to two response frames
                         received = ""
                         for _ in range(2):
                             try:
-                                frame = await asyncio.wait_for(ws.recv(), timeout=1.5)
+                                frame = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
                                 received += str(frame)
                             except asyncio.TimeoutError:
                                 break
@@ -186,16 +204,18 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
                             f"sqli/{shape}", payload, received,
                             "SQL error string returned in WebSocket reply", "critical", 9.0))
                         return findings
-                    if label == "sqli_time" and elapsed > 4.5:
+                    if label == "sqli_time" and elapsed > 4.5 \
+                            and elapsed - control_elapsed >= 4.0:
                         findings.append(_finding(
                             ws_url, "Blind SQL injection over WebSocket frame (time-based)",
                             f"sqli/{shape}", payload, received,
-                            f"Server delayed {elapsed:.2f}s after sleep payload", "critical", 9.0))
+                            f"Server delayed {elapsed:.2f}s after sleep payload vs "
+                            f"{control_elapsed:.2f}s for a benign control message", "critical", 9.0))
                         return findings
                     if label == "rce_marker" and "SX_WSRCE_OK" in received:
                         findings.append(_finding(
                             ws_url, "OS command injection over WebSocket frame",
-                            f"rce/{shape}", payload, received,
+                            "marker", payload, received,
                             "Injected echo marker returned in WS reply", "critical", 9.8))
                         return findings
                     if label == "ssti" and SSTI_PRODUCT_RE.search(received) and "{{7*7}}" not in received:
@@ -213,17 +233,9 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
     except Exception:
         return findings
 
-    # OOB poll
-    if ctx.oob and ctx.oob.registered and oob_tokens:
-        await asyncio.sleep(2.0)
-        for label, tok in oob_tokens.items():
-            events = await ctx.oob.poll(tok)
-            if events:
-                findings.append(_finding(
-                    ws_url, "Blind RCE over WebSocket frame (OOB confirmed)",
-                    "rce/oob", "(see token)", str(events)[:600],
-                    f"OOB callback received from injected WS command ({len(events)} hits)",
-                    "critical", 9.8))
+    # OOB callbacks: registered above — the background poller + finalize sweep
+    # emit them via oob.pending_findings(), so we must NOT also self-report here
+    # (doing so recorded the same callback twice with two different titles).
     return findings
 
 

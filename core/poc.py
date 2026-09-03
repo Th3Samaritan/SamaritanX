@@ -117,7 +117,13 @@ def build_curl(finding: dict[str, Any]) -> str:
         elif kind == "cookie":
             headers.append(f"Cookie: {loc}={payload}")
         elif kind == "json":
-            data = f'{{"{loc}": "{payload}"}}'
+            # mirror injection._set_dotted: a dotted locator becomes a nested
+            # JSON body, not a flat {"a.b": ...} key that reproduces nothing
+            import json as _json
+            from .injection import _set_dotted
+            nested: dict[str, Any] = {}
+            _set_dotted(nested, loc, payload)
+            data = _json.dumps(nested)
             headers.append("Content-Type: application/json")
         elif kind == "query" and method == "GET" and loc and not loc.startswith("("):
             target = merge_query(url, {loc: payload})

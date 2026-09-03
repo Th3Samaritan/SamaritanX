@@ -41,6 +41,21 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
     oob_tokens: dict[str, str] = {}
 
+    # Baseline (clean request) — used to kill "the marker was already there"
+    # false positives on both the timing and SSTI paths.
+    from core.baseline import TimingBaseline
+    tb = TimingBaseline(k=6.0, min_delta_s=2.0)
+    base_body = ""
+    for _ in range(4):
+        ev0 = await ctx.http.get(url)
+        if ev0.error or ev0.status == 0:
+            continue
+        base_body = ev0.response_body or ""
+        tb.add((ev0.elapsed_ms or 0.0) / 1000.0)
+    base_rtt = tb.median
+    # must be BOTH a statistical outlier and ≥3s slower than the baseline
+    time_threshold = max(tb.threshold(), base_rtt + 3.0) if tb.samples else 4.5
+
     async def test(param: str) -> None:
         # ----- in-band OS command injection -----
         for p in rce_payloads:
@@ -82,22 +97,38 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     await _request(ctx, url, method, param, tpl.format(host=host), form)
 
         # ----- blind RCE via timing -----
+        # Precision: sleep response must be BOTH a statistical outlier vs the
+        # baseline AND ≥3s slower than a no-sleep control injected the same
+        # way, confirmed twice. A merely slow page fails the control delta.
         sleep_payload = ";sleep 5;"
+        control_payload = ";echo SXCTRL;"
+        t0 = time.perf_counter()
+        async with sem:
+            await _request(ctx, url, method, param, control_payload, form)
+        ctrl_elapsed = time.perf_counter() - t0
         t0 = time.perf_counter()
         async with sem:
             ev = await _request(ctx, url, method, param, sleep_payload, form)
         elapsed = time.perf_counter() - t0
-        if elapsed >= 4.5 and ev.status:
-            findings.append({
-                "category": "rce",
-                "title": f"Blind OS command injection in `{param}` (time-based)",
-                "severity": "critical", "cvss": 9.8,
-                "url": url, "parameter": param, "payload": sleep_payload,
-                "evidence": f"Response delayed {elapsed:.2f}s after `;sleep 5;` — confirms blind RCE.",
-                "request": f"{ev.method} {ev.url}",
-                "metadata": {"elapsed_s": elapsed},
-            })
-            return
+        if elapsed >= time_threshold and (elapsed - ctrl_elapsed) >= 3.0 and ev.status:
+            t0 = time.perf_counter()
+            async with sem:
+                await _request(ctx, url, method, param, sleep_payload, form)
+            elapsed2 = time.perf_counter() - t0
+            if elapsed2 >= time_threshold:
+                findings.append({
+                    "category": "rce",
+                    "title": f"Blind OS command injection in `{param}` (time-based)",
+                    "severity": "critical", "cvss": 9.8,
+                    "url": url, "parameter": param, "payload": sleep_payload,
+                    "evidence": f"Two sleep injections delayed the response {elapsed:.2f}s / "
+                                f"{elapsed2:.2f}s vs {ctrl_elapsed:.2f}s for the no-sleep control "
+                                f"(baseline median {base_rtt:.2f}s, outlier threshold "
+                                f"{time_threshold:.2f}s) — confirms blind RCE.",
+                    "request": f"{ev.method} {ev.url}",
+                    "metadata": {"elapsed_s": elapsed, "detection": "time"},
+                })
+                return
 
         # ----- SSTI -----
         for p in ssti_payloads:
@@ -106,11 +137,18 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             body = ev.response_body or ""
             if not body:
                 continue
-            triggered = (
-                ("{{7*7}}" in p and SSTI_PRODUCT_RE.search(body) and "{{7*7}}" not in body)
-                or ("7*'7'" in p and "7777777" in body)
-                or any(h in body for h in SSTI_OBJECT_HINTS)
-            )
+            # The product/hint must be NEW in the response relative to the
+            # baseline — a page that statically contains "49" or "Werkzeug"
+            # must never count as an evaluated expression.
+            if "{{7*7}}" in p:
+                triggered = (SSTI_PRODUCT_RE.search(body) and "{{7*7}}" not in body
+                             and not SSTI_PRODUCT_RE.search(base_body))
+            elif "7*'7'" in p:
+                triggered = ("7777777" in body and "7*'7'" not in body
+                             and "7777777" not in base_body)
+            else:
+                triggered = any(h in body for h in SSTI_OBJECT_HINTS) and \
+                    not any(h in base_body for h in SSTI_OBJECT_HINTS)
             if triggered:
                 findings.append({
                     "category": "ssti",

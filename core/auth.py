@@ -84,6 +84,9 @@ class SessionStore:
         self.cookies: dict[str, str] = {}
         self.headers: dict[str, str] = {}
         self.label: str = "anon"
+        # SameSite attribute observed on the session cookies at login
+        # ("strict" / "lax" / "none" / None = not observed)
+        self.same_site: str | None = None
         self._refreshed_at: float = 0.0
         self.refresh_every: int = 0
         self._refresh_fn = None
@@ -127,6 +130,43 @@ class SessionStore:
         return self.is_authed()
 
 
+def save_session(store: SessionStore, path: str | Path) -> bool:
+    """Persist a session's cookies + headers so the next run can resume the
+    session without re-running the login flow. Returns True when something was
+    written."""
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "label": store.label,
+            "cookies": dict(store.cookies),
+            "headers": dict(store.headers),
+            "same_site": getattr(store, "same_site", None),
+            "saved_at": int(time.time()),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def load_persisted_session(path: str | Path) -> SessionStore | None:
+    """Restore a previously persisted session (see save_session)."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        store = SessionStore()
+        store.label = data.get("label") or "persisted"
+        store.cookies.update(data.get("cookies") or {})
+        store.headers.update(data.get("headers") or {})
+        store.same_site = data.get("same_site")
+        return store
+    except Exception:
+        return None
+
+
 async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
     """Build a SessionStore from a recipe file. `http` is a StealthHttpClient
     used to perform the initial login (without auth)."""
@@ -157,12 +197,26 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
             url = recipe["login_url"]
             method = (recipe.get("method") or "POST").upper()
             fields = recipe.get("fields") or {}
+            # don't follow the login redirect: the Set-Cookie / SameSite
+            # attributes live on the login response itself, and following the
+            # 302 would discard them
             ev = await http.request(method, url, data=fields, headers={
                 "Content-Type": "application/x-www-form-urlencoded",
-            })
+            }, allow_redirects=False)
             indicator = recipe.get("success_indicator") or ""
-            if indicator and indicator not in (ev.response_body or ""):
-                raise RuntimeError(f"form login failed — '{indicator}' not in response")
+            body = ev.response_body or ""
+            if indicator and indicator not in body:
+                # recipe expects a marker on the post-login page — fetch the
+                # redirect target once with cookies from the login response
+                loc = ev.response_headers.get("location") or ""
+                if loc:
+                    from urllib.parse import urljoin
+                    ev2 = await http.request("GET", urljoin(url, loc),
+                                             allow_redirects=False)
+                    body = ev2.response_body or ""
+                    if indicator and indicator not in body:
+                        raise RuntimeError(
+                            f"form login failed — '{indicator}' not in response")
             # capture cookies from httpx's own cookie jar (robust against
             # commas inside Expires=... / cookie values, which naive
             # Set-Cookie splitting corrupts).
@@ -171,6 +225,18 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
                 if jar is not None:
                     for name, val in jar.cookies.items():
                         store.cookies[name] = val
+            except Exception:
+                pass
+            # observe the SameSite attribute of the session cookies as issued
+            try:
+                raw = [v for v in ((ev.extra or {}).get("set_cookie_headers") or [])]
+                blob = " ".join(raw).lower()
+                if "samesite=strict" in blob:
+                    store.same_site = "strict"
+                elif "samesite=lax" in blob:
+                    store.same_site = "lax"
+                elif "samesite=none" in blob:
+                    store.same_site = "none"
             except Exception:
                 pass
             for h, v in (recipe.get("extra_headers") or {}).items():

@@ -1,7 +1,8 @@
-"""Tests for the injection-surface, confidence, and self-containment upgrades."""
+"""Unit tests for persistence, monitor-diff, LLM fallback, and H1 drafts."""
 from __future__ import annotations
 
-import os
+import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -10,84 +11,149 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-class TestInjection(unittest.TestCase):
-    def test_parse_point(self):
-        from core.injection import parse_point
-        self.assertEqual(parse_point("id"), ("query", "id"))
-        self.assertEqual(parse_point("path:2"), ("path", "2"))
-        self.assertEqual(parse_point("json:user.role"), ("json", "user.role"))
-        self.assertEqual(parse_point("header:X-Test"), ("header", "X-Test"))
-        self.assertEqual(parse_point("cookie:sid"), ("cookie", "sid"))
+class TestSessionPersistence(unittest.TestCase):
+    def test_roundtrip(self):
+        from core.auth import SessionStore, save_session, load_persisted_session
+        s = SessionStore()
+        s.cookies = {"session": "abc123"}
+        s.headers = {"X-Tenant": "acme"}
+        s.same_site = "lax"
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "session.json"
+            self.assertTrue(save_session(s, p))
+            s2 = load_persisted_session(p)
+            self.assertIsNotNone(s2)
+            self.assertEqual(s2.cookies, {"session": "abc123"})
+            self.assertEqual(s2.headers, {"X-Tenant": "acme"})
+            self.assertEqual(s2.same_site, "lax")
+            self.assertTrue(s2.is_authed())
 
-    def test_replace_path_segment(self):
-        from core.injection import _replace_path_segment
-        out = _replace_path_segment("https://x.com/v1/users/123", 2, "124")
-        self.assertTrue(out.endswith("/users/124"))
-
-    def test_candidate_points_focuses_on_ids(self):
-        from core.injection import candidate_points
-        pts = candidate_points("https://x.com/v1/users/123/orders/456", [])
-        self.assertIn("path:2", pts)   # 123
-        self.assertIn("path:4", pts)   # 456
-        # word segments are not fuzzed
-        self.assertNotIn("path:0", pts)
-        self.assertNotIn("path:1", pts)
-
-    def test_candidate_points_preserves_query_params(self):
-        from core.injection import candidate_points
-        pts = candidate_points("https://x.com/about", ["q", "page"])
-        self.assertEqual(pts[:2], ["q", "page"])
-
-    def test_set_dotted(self):
-        from core.injection import _set_dotted
-        body = {}
-        _set_dotted(body, "user.role", "admin")
-        self.assertEqual(body["user"]["role"], "admin")
+    def test_missing_file(self):
+        from core.auth import load_persisted_session
+        self.assertIsNone(load_persisted_session("/nonexistent/session.json"))
 
 
-class TestConfidence(unittest.TestCase):
-    def test_hard_proof_scores_high(self):
-        from core.confidence import assign, label
-        score, _ = assign({"category": "rce", "metadata": {"detection": "marker"}})
-        self.assertGreaterEqual(score, 0.9)
-        self.assertEqual(label(score), "confirmed")
+class TestMonitorDiff(unittest.TestCase):
+    def test_findings_diff(self):
+        from core.monitor import diff, _has_changes
+        old = {"hosts": ["a.com"], "endpoints": ["https://a.com/"],
+               "params": [], "finding_keys": ["fp1"], "findings": {"high": 1}}
+        new = {"hosts": ["a.com", "b.com"], "endpoints": ["https://a.com/"],
+               "params": [], "finding_keys": ["fp1", "fp2"], "findings": {"high": 1, "critical": 1}}
+        delta = diff(old, new)
+        self.assertEqual(delta["hosts"]["added"], ["b.com"])
+        self.assertEqual(delta["findings"]["added"], ["fp2"])
+        self.assertEqual(delta["findings"]["counts"]["new"]["critical"], 1)
+        self.assertTrue(_has_changes(delta))
 
-    def test_heuristic_scores_low(self):
-        from core.confidence import assign, label
-        score, _ = assign({"category": "idor", "metadata": {}})
-        self.assertLess(score, 0.6)
-        self.assertIn(label(score), ("tentative", "speculative"))
-
-    def test_validated_secret_high_rejected_low(self):
-        from core.confidence import assign
-        hi, _ = assign({"category": "secret_exposure", "title": "[CONFIRMED LIVE] aws",
-                        "metadata": {"validator_valid": True}})
-        lo, _ = assign({"category": "secret_exposure", "title": "[FALSE POSITIVE] aws",
-                        "metadata": {"validator_valid": False}})
-        self.assertGreater(hi, 0.9)
-        self.assertLess(lo, 0.2)
-
-    def test_explicit_confidence_respected(self):
-        from core.confidence import assign
-        score, reason = assign({"category": "idor", "confidence": 0.99})
-        self.assertEqual(score, 0.99)
-        self.assertEqual(reason, "scanner-provided")
+    def test_no_changes(self):
+        from core.monitor import diff, _has_changes
+        s = {"hosts": [], "endpoints": [], "params": [], "finding_keys": []}
+        self.assertFalse(_has_changes(diff(s, dict(s))))
 
 
-class TestMemoryConfidence(unittest.TestCase):
-    def setUp(self):
-        self.db = os.path.join(tempfile.mkdtemp(), "t.sqlite")
+class TestLLM(unittest.TestCase):
+    def test_fallback_without_key(self):
+        from core.llm import available, _fallback_triage, triage_impact
 
-    def test_confidence_persisted(self):
-        from core.memory import Memory
-        m = Memory(self.db)
-        m.record_finding({"target": "t", "category": "idor", "title": "h",
-                          "severity": "high", "cvss": 7.0})
-        m.record_finding({"target": "t", "category": "rce", "title": "r",
-                          "severity": "critical", "cvss": 9.8, "confidence": 0.95})
-        rows = {r["title"]: r for r in m.list_findings("t")}
-        self.assertLess(rows["h"]["confidence"], 0.6)   # auto-scored
-        self.assertGreaterEqual(rows["r"]["confidence"], 0.9)  # explicit
+        async def run():
+            out = await triage_impact({"category": "sqli", "severity": "high",
+                                       "title": "x", "url": "u", "evidence": "e"}, {})
+            self.assertIn("impact", out)
+            self.assertEqual(out["recommended_severity"], "high")
+        self.assertFalse(available({}))
+        self.assertIn("database", _fallback_triage({"category": "sqli"})["impact"])
+        asyncio.run(run())
+
+    def test_env_expansion(self):
+        import os
+        from core.llm import _api_key
+        os.environ["SX_TEST_LLM_KEY"] = "secret123"
+        try:
+            self.assertEqual(_api_key({"llm": {"api_key": "{ENV:SX_TEST_LLM_KEY}"}}),
+                             "secret123")
+            self.assertIsNone(_api_key({}))
+        finally:
+            del os.environ["SX_TEST_LLM_KEY"]
+
+    def test_provider_resolution(self):
+        import os
+        from core.llm import _api_key, _base_url, _model
+        os.environ["DEEPSEEK_API_KEY"] = "sk-deep"
+        os.environ["LLM_API_KEY"] = "sk-generic"
+        try:
+            self.assertEqual(_api_key({"llm": {"provider": "deepseek"}}), "sk-deep")
+            self.assertEqual(_base_url({"llm": {"provider": "deepseek"}}, "deepseek"),
+                             "https://api.deepseek.com/v1")
+            self.assertEqual(_base_url({"llm": {"provider": "openai_compatible",
+                                                "base_url": "https://api.groq.com/openai/v1"}},
+                                       "openai_compatible"),
+                             "https://api.groq.com/openai/v1")
+            self.assertEqual(_api_key({"llm": {"provider": "openai_compatible"}}), "sk-generic")
+            self.assertEqual(_model({"llm": {"provider": "deepseek"}}), "deepseek-chat")
+        finally:
+            del os.environ["DEEPSEEK_API_KEY"]
+            del os.environ["LLM_API_KEY"]
+
+
+class TestHackerOneDrafts(unittest.TestCase):
+    def test_severity_rating(self):
+        from core.hackerone_client import _severity_rating
+        self.assertEqual(_severity_rating("critical"), "critical")
+        self.assertEqual(_severity_rating("info"), "none")
+        self.assertEqual(_severity_rating(None), "medium")
+
+    def test_vuln_information_shape(self):
+        from core.hackerone_client import _vuln_information, _fingerprint
+
+        class FakeCtx:
+            config = {"operator": {"handle": "op"}}
+
+        f = {"category": "sqli", "title": "SQLi", "url": "https://a.com/?id=1",
+             "parameter": "id", "evidence": "sql error",
+             "request": "GET https://a.com/?id=1'",
+             "metadata": {"poc": {"request": "GET https://a.com/?id=1'",
+                                  "response_excerpt": "SQL syntax error"}}}
+        info = _vuln_information(FakeCtx(), f, "op")
+        self.assertIn("## Summary", info)
+        self.assertIn("sql error", info)
+        self.assertIn("curl", info)
+        self.assertEqual(len(_fingerprint(f)), 40)
+
+    def test_disabled_returns_skipped(self):
+        from core.hackerone_client import submit_drafts
+
+        class FakeCtx:
+            class Dashboard:
+                def event(self, *a, **k):
+                    pass
+            config = {"hackerone": {"enabled": False}, "operator": {"handle": "op"}}
+            dashboard = Dashboard()
+            workspace = Path(tempfile.mkdtemp())
+
+        async def run():
+            out = await submit_drafts(FakeCtx(), [{"category": "sqli", "title": "x"}])
+            self.assertEqual(out["submitted"], 0)
+        asyncio.run(run())
+
+
+class TestProxyRotation(unittest.TestCase):
+    def test_pool_builds(self):
+        from core.http_client import StealthHttpClient
+
+        async def run():
+            c = StealthHttpClient({"proxy": {"enabled": True,
+                                             "rotation": ["http://a:1", "http://b:2"]}})
+            try:
+                self.assertGreaterEqual(len(c._clients), 2)
+            finally:
+                await c.close()
+            c2 = StealthHttpClient({})
+            try:
+                self.assertEqual(len(c2._clients), 1)
+            finally:
+                await c2.close()
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -57,9 +57,11 @@ async def scan(ctx: "Context", url: str, params: list, method: str = "GET", form
     tb, rb = await _baseline(ctx, url)
     base_rtt = tb.median
     size_threshold = rb.length_threshold(k=5.0, floor=200.0)
-    # robust latency outlier threshold, with a hard 7s floor so a slow baseline
-    # can't make the time-based check trivially satisfiable
-    rtt_threshold = max(7.0, tb.threshold()) if tb.samples else 7.0
+    # Robust latency outlier threshold. It must clear BOTH the statistical
+    # outlier bound (median + k*MAD) AND a 3s absolute delta over the baseline
+    # median — this keeps slow endpoints from false-firing while remaining
+    # reachable by the 5s sleep payloads below (a 7s floor made them dead code).
+    rtt_threshold = max(tb.threshold(), base_rtt + 3.0) if tb.samples else 4.0
 
     async def test_param(param: str) -> None:
         # ----- error-based -----

@@ -135,7 +135,10 @@ class AuthzAgent(BaseAgent):
                 })
                 return
 
-        # 2) BOLA / cross-tenant — one regular user sees another's identity markers
+        # 2) BOLA / cross-tenant — one regular user sees another's identity markers.
+        # Subtract the anonymous baseline: a marker anon also sees is public
+        # boilerplate (support email, build hash), not a per-user secret.
+        anon_markers = set((anon or {}).get("markers", []))
         regulars = [(lbl, c) for lbl, c in cells.items() if c["rank"] == 1 and _ok(c["status"])]
         for i in range(len(regulars)):
             for j in range(len(regulars)):
@@ -144,8 +147,11 @@ class AuthzAgent(BaseAgent):
                 (la, ca), (lb, cb) = regulars[i], regulars[j]
                 if not ca["markers"]:
                     continue
-                shared = set(ca["markers"]) & set(cb["markers"])
-                if shared:
+                shared = (set(ca["markers"]) & set(cb["markers"])) - anon_markers
+                # only identity-shaped markers (email/UUID) are unambiguous
+                from scanners.idor_deep import EMAIL_RE, UUID_RE
+                strong = {m for m in shared if EMAIL_RE.fullmatch(m) or UUID_RE.fullmatch(m)}
+                if strong:
                     pii = bool(cb["sensitive"])
                     self.report_finding(ctx, {
                         "category": "idor",
@@ -154,9 +160,9 @@ class AuthzAgent(BaseAgent):
                         "cvss": 9.1 if pii else 8.1,
                         "url": url, "parameter": "(cross-identity matrix)",
                         "evidence": f"{lb} request returned {la}'s identity markers "
-                                    f"{sorted(shared)[:4]} — object-level authorization missing.",
+                                    f"{sorted(strong)[:4]} — object-level authorization missing.",
                         "metadata": {"identity": lb, "owner": la, "detection": "authz_matrix",
-                                     "shared": sorted(shared)[:6]},
+                                     "shared": sorted(strong)[:6]},
                     })
                     return
 

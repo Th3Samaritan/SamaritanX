@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlparse
 
 from core.task_queue import Task
-from core.utils import host_of, normalize_url, root_domain
+from core.utils import host_of, normalize_url, root_domain, slugify
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -65,6 +65,9 @@ class DiscoveryAgent(BaseAgent):
     async def handle(self, task: Task, ctx: "Context") -> None:
         host = task.payload["host"]
         base = task.payload.get("base") or f"https://{host}"
+        if ctx.resume and ctx.memory.is_completed(ctx.target_slug, f"discover:{host}"):
+            ctx.dashboard.event("info", f"discovery: {host} already completed — skipping (resume)")
+            return
         ctx.dashboard.event("info", f"discovery: {host}")
 
         await asyncio.gather(
@@ -75,13 +78,16 @@ class DiscoveryAgent(BaseAgent):
             self._js_endpoints(base, ctx),
             self._openapi(base, host, ctx),
         )
+        ctx.memory.mark_completed(ctx.target_slug, f"discover:{host}")
 
     # ---------- content discovery ----------
     async def _content_discovery(self, base: str, host: str, ctx: "Context") -> None:
         if shutil.which("ffuf"):
             try:
-                await self._run_ffuf(base, host, ctx)
-                return
+                if await self._run_ffuf(base, host, ctx):
+                    return
+                ctx.dashboard.event("err",
+                    f"discovery: ffuf produced no output on {host}, falling back to async wordlist")
             except Exception:
                 ctx.dashboard.event("err", f"discovery: ffuf failed on {host}, falling back to async wordlist")
         wordlist = Path(__file__).resolve().parent.parent / "config" / "payloads" / "wordlist_paths.txt"
@@ -109,13 +115,17 @@ class DiscoveryAgent(BaseAgent):
                                         producer=self.name)
 
         await asyncio.gather(*(probe(w) for w in words))
-        out = ctx.workspace / "discovery" / f"{host}_paths.json"
+        # host may contain ':' (IP:port) — an invalid/ADS filename on Windows
+        file_host = slugify(host)
+        out = ctx.workspace / "discovery" / f"{file_host}_paths.json"
         out.write_text(json.dumps(hits, indent=2), encoding="utf-8")
         ctx.dashboard.event("ok", f"discovery: {host} -> {len(hits)} paths found")
 
-    async def _run_ffuf(self, base: str, host: str, ctx: "Context") -> None:
+    async def _run_ffuf(self, base: str, host: str, ctx: "Context") -> bool:
+        """Run ffuf and return True when it produced usable output."""
         wordlist = Path(__file__).resolve().parent.parent / "config" / "payloads" / "wordlist_paths.txt"
-        out_path = ctx.workspace / "discovery" / f"{host}_ffuf.json"
+        out_path = ctx.workspace / "discovery" / f"{slugify(host)}_ffuf.json"
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffuf", "-u", f"{base}/FUZZ", "-w", str(wordlist),
@@ -126,17 +136,21 @@ class DiscoveryAgent(BaseAgent):
             await asyncio.wait_for(proc.wait(), timeout=600.0)
         except asyncio.TimeoutError:
             ctx.dashboard.event("err", f"ffuf timed out on {host}")
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return
+            return False
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         if not out_path.exists():
-            return
+            return False
         try:
             data = json.loads(out_path.read_text(encoding="utf-8"))
         except Exception:
-            return
+            return False
         hits = data.get("results") or []
         ctx.dashboard.event("ok", f"ffuf: {host} -> {len(hits)} hits")
         for h in hits:
@@ -145,6 +159,7 @@ class DiscoveryAgent(BaseAgent):
                 await ctx.queue.put("crawl", {"url": url, "host": host},
                                     target=ctx.target_slug, priority=4,
                                     producer=self.name)
+        return True
 
     # ---------- historical URLs ----------
     async def _historical_urls(self, host: str, ctx: "Context") -> None:
@@ -177,12 +192,12 @@ class DiscoveryAgent(BaseAgent):
                     continue
                 seen.add(u)
         if seen:
-            (ctx.workspace / "discovery" / f"{host}_historical.txt").write_text(
+            (ctx.workspace / "discovery" / f"{slugify(host)}_historical.txt").write_text(
                 "\n".join(sorted(seen)), encoding="utf-8")
             ctx.dashboard.event("ok", f"historical: {host} -> {len(seen)} URLs")
             # enqueue a sample for the crawler
             for u in list(seen)[:200]:
-                if host_of(u).endswith(host.split(":", 1)[0]):
+                if (urlparse(u).hostname or "").endswith(host.split(":", 1)[0]):
                     await ctx.queue.put("crawl", {"url": u, "host": host},
                                         target=ctx.target_slug, priority=5,
                                         producer=self.name)
@@ -318,7 +333,7 @@ class DiscoveryAgent(BaseAgent):
                 continue
         if not spec:
             return
-        (ctx.workspace / "discovery" / f"{host}_openapi.json").write_text(
+        (ctx.workspace / "discovery" / f"{slugify(host)}_openapi.json").write_text(
             json.dumps(spec, indent=2), encoding="utf-8")
         self.report_finding(ctx, {
             "category": "exposure",

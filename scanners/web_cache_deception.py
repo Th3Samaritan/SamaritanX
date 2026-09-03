@@ -105,6 +105,15 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         esc = severity_for(hits)
         sev, cvss = esc if esc else ("high", 8.2)
         cache_ev = _cache_evidence(anon.response_headers)
+        from core.poc import proof_record
+        poc = proof_record(
+            verified=True, method="GET", url=durl,
+            request=f"victim: GET {durl} (authenticated)\nattacker: GET {durl} (no cookies)",
+            status=anon.status, excerpt=anon.response_body,
+            rationale=(f"The origin served the authenticated user's private page at the "
+                       f"cacheable URL {durl}; an anonymous re-fetch of the same URL returned "
+                       f"that private data ({sorted(leaked)[:3]}) — private content is cached "
+                       "and served without credentials."))
         findings.append({
             "category": "web_cache_deception",
             "title": f"Web cache deception — private response cached publicly ({technique})",
@@ -117,7 +126,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
             "response": anon.response_body[:1500],
             "metadata": {"technique": technique, "leaked": sorted(leaked)[:5],
                          "cache_hit": _is_cache_hit(anon.response_headers),
-                         "original": url},
+                         "original": url, "poc": poc},
         })
         return findings  # one solid PoC is enough
     return findings

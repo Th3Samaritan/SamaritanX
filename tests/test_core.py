@@ -95,8 +95,7 @@ class TestMemory(unittest.TestCase):
 
 
 class TestTaskQueue(unittest.TestCase):
-    async def test_put_get_join(self):
-        import asyncio
+    async def _put_get_join(self):
         from core.task_queue import TaskQueue
 
         q = TaskQueue()
@@ -109,9 +108,9 @@ class TestTaskQueue(unittest.TestCase):
         self.assertTrue(q.empty())
         await q.join()
 
-    def test_sync_wrapper(self):
+    def test_put_get_join(self):
         import asyncio
-        asyncio.run(self.test_put_get_join())
+        asyncio.run(self._put_get_join())
 
 
 class TestUtils(unittest.TestCase):

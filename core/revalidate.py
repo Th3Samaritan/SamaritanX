@@ -34,6 +34,7 @@ _NOSQL_ERR = re.compile(r"(MongoError|BSONObj|E11000|MongoServerError|unknown op
 _RCE_MARKER = re.compile(r"SX_[a-z0-9]{4,12}_OK")
 _SSRF_INDICATORS = ("ami-id", "iam/security-credentials", "computemetadata",
                     "metadata/instance", "root:x:0:0:", "redis_version", "stat pid")
+_SSTI_OBJECT_HINTS = ("<class 'object'>", "<built-in", "java.lang", "Werkzeug")
 
 
 def _capture(f: dict, ev, *, method: str, rationale: str, request: str | None = None) -> bool:
@@ -124,8 +125,17 @@ async def _browser_upgrade(ctx, f, payload: str) -> None:
         if not marker:
             return
         url = f.get("url") or ""
+        # verify_xss expects a URL that already carries the payload — the
+        # finding's url is the clean endpoint, so rebuild the injected URL for
+        # query params (the common reflected-XSS case).
+        param = f.get("parameter") or ""
+        kind, loc = parse_point(param) if ":" in param else ("query", param)
+        target = url
+        if kind == "query" and loc:
+            from .utils import merge_query
+            target = merge_query(url, {loc: payload})
         proof = await browser_verify.verify_xss(
-            ctx.config, url, marker=marker, workspace=getattr(ctx, "workspace", None))
+            ctx.config, target, marker=marker, workspace=getattr(ctx, "workspace", None))
         if proof:
             meta = f.setdefault("metadata", {})
             if isinstance(meta, dict):
@@ -146,17 +156,40 @@ async def _re_rce(ctx, f):
 
 
 async def _re_ssti(ctx, f):
+    payload = f.get("payload") or ""
+    url = f.get("url") or ""
+    # baseline: the evaluation product must NOT already be present on the
+    # clean page — "49" or "Werkzeug" appearing statically is not evaluation.
+    base = await ctx.http.get(url)
+    base_body = (base.response_body or "").lower() if base else ""
     ev = await _refire(ctx, f)
     body = (ev.response_body or "") if ev else ""
-    if ("49" in body) and ("{{7*7}}" not in body):
+    if not body:
+        return False
+    if "{{7*7}}" in payload:
+        hit = re.search(r"\b49\b", body) and "{{7*7}}" not in body \
+            and not re.search(r"\b49\b", base_body)
+    elif "7*'7'" in payload:
+        hit = "7777777" in body and "7*'7'" not in body and "7777777" not in base_body
+    else:
+        hit = any(h in body for h in _SSTI_OBJECT_HINTS) and \
+            not any(h in base_body for h in _SSTI_OBJECT_HINTS)
+    if hit:
         return _capture(f, ev, method=_re_method(f),
-                        rationale="The template expression {{7*7}} evaluated to 49 in the "
-                                  "response — server-side template injection is confirmed.")
+                        rationale="The injected template expression evaluated to a unique "
+                                  "product that was absent from the clean baseline response — "
+                                  "server-side template injection is confirmed.")
     return False
 
 
 async def _re_open_redirect(ctx, f):
-    ev = await _refire(ctx, f)
+    # refire with redirects disabled — following the 302 defeats the check
+    # (the very thing being verified is the Location header itself)
+    from .injection import send as _send
+    url = f.get("url") or ""
+    param = f.get("parameter") or ""
+    payload = f.get("payload") or ""
+    ev = await _send(ctx, url, "GET", param, payload, None, allow_redirects=False)
     if not ev:
         return False
     loc = ev.response_headers.get("location", "")
@@ -299,6 +332,29 @@ async def _re_broken_auth(ctx, f):
     return True
 
 
+async def _re_host_header(ctx, f):
+    """Re-fire with the same poisoned header and confirm the reflection."""
+    meta = f.get("metadata") or {}
+    header = meta.get("header") or "Host"
+    value = f.get("payload") or meta.get("marker")
+    if not value:
+        return None
+    base = await ctx.http.get(f.get("url", ""), allow_redirects=False)
+    base_blob = (base.response_body or "").lower()
+    ev = await ctx.http.get(f.get("url", ""), headers={header: value},
+                            allow_redirects=False)
+    if not ev or not ev.status:
+        return False
+    body = ev.response_body or ""
+    blob = (body + " " + ev.response_headers.get("location", "")).lower()
+    if value.lower() in blob and value.lower() not in base_blob:
+        return _capture(f, ev, method="GET",
+                        request=f"GET {f.get('url','')}\n{header}: {value}",
+                        rationale=f"The poisoned `{header}` value was reflected again on a "
+                                  "fresh re-fire — the Host header is trusted for URL generation.")
+    return False
+
+
 async def _re_smuggling(ctx, f):
     """Confirm a timing-oracle smuggle is reproducible, not a one-off fluke.
 
@@ -331,6 +387,7 @@ REVALIDATORS = {
     "open_redirect": _re_open_redirect,
     "sqli": _re_sql_error, "nosqli": _re_nosql,
     "ssrf": _re_ssrf, "crlf": _re_crlf,
+    "host_header": _re_host_header,
     "broken_auth": _re_broken_auth,
     "smuggling": _re_smuggling,
 }
@@ -369,6 +426,7 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
                 reason = "oracle/replay not applicable" if result is None else ""
 
         meta = f.get("metadata") or {}
+        new_conf = conf
         if result is True:
             reproduced += 1
             new_conf = round(min(1.0, conf + 0.1), 2)
@@ -379,6 +437,9 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
             new_conf = round(conf * 0.4, 2)
             meta["revalidated"] = False
             meta["revalidation_note"] = "did NOT reproduce on fresh re-test — likely false positive"
+            # a scan-time poc that failed the fresh re-test must not keep the
+            # finding "verified" — clear it so the proof gate can't honor it
+            meta.pop("poc", None)
             ctx.memory.update_finding(fid, confidence=new_conf, metadata=meta,
                                       title=f.get("title"))
         else:
@@ -387,7 +448,7 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
             ctx.memory.update_finding(fid, metadata=meta)
         details.append({"id": fid, "category": cat,
                         "result": {True: "reproduced", False: "dropped"}.get(result, "skipped"),
-                        "confidence_label": conf_label(float(meta.get("_c", conf)))})
+                        "confidence_label": conf_label(new_conf)})
 
     summary = {"reproduced": reproduced, "dropped": dropped, "skipped": skipped,
                "total": len(findings), "details": details}

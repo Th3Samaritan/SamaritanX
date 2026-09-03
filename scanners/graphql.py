@@ -113,7 +113,13 @@ async def _classify_schema(ctx, url, schema, findings):
 
 async def _anonymous_mutations(ctx, url, schema, findings):
     """For each known mutation, fire it with stub args sans auth and check
-    for an auth-shaped error. Anything that doesn't refuse is suspicious."""
+    for an auth-shaped error. Anything that doesn't refuse is suspicious.
+
+    This executes real mutation fields against the live API — on a
+    misconfigured endpoint a stub like `deleteUser` actually runs. Gated
+    behind --aggressive."""
+    if not ctx.config.get("safety", {}).get("aggressive"):
+        return
     mname = (schema.get("mutationType") or {}).get("name")
     if not mname:
         return

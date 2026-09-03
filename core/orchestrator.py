@@ -13,7 +13,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agents.base import BaseAgent
 
 from .auth import SessionStore, load_session
 from .dashboard import Dashboard
@@ -53,6 +56,8 @@ class Context:
     # Dynamic rate control — updated by http_client and readable by scanners
     error_rate: float = 0.0
     global_deadline: float = 0.0
+    # True when --resume was passed: agents may skip already-processed work.
+    resume: bool = False
 
 
 
@@ -64,7 +69,8 @@ class Orchestrator:
                  scope_file: str | None = None,
                  resume: bool = False,
                  deadline: float = 0.0,
-                 task_timeout: float = 60.0) -> None:
+                 task_timeout: float = 60.0,
+                 quiet: bool = False) -> None:
         self.config = config
         self.target = target
         self.target_slug = slugify(target)
@@ -92,7 +98,8 @@ class Orchestrator:
             evasion_techniques=config.get("waf_evasion", {}).get("techniques", []),
         )
         self.dashboard = Dashboard(target=self.target,
-                                   operator=config.get("operator", {}).get("handle", "th3Samaritan"))
+                                   operator=config.get("operator", {}).get("handle", "th3Samaritan"),
+                                   quiet=quiet)
 
         # populated by run() — async setup
         self.session: SessionStore | None = None
@@ -105,6 +112,10 @@ class Orchestrator:
         if not resume:
             # fresh run — clear scan_state so completed-task gates don't skip work
             self.memory.reset_scan_state(self.target_slug)
+            # and clear per-URL processed bookmarks, otherwise a fresh scan of a
+            # previously-scanned target silently skips every crawled URL and
+            # produces zero endpoints/params/findings.
+            self.memory.clear_processed_urls(self.target_slug)
 
         # name -> agent instance
         self._agents: dict[str, "BaseAgent"] = {}
@@ -128,6 +139,7 @@ class Orchestrator:
             scope=self.scope,
             oob=self.oob,
             extra_identities=self.extra_identities,
+            resume=self.resume,
         )
 
     def register(self, agent: "BaseAgent") -> None:
@@ -138,8 +150,15 @@ class Orchestrator:
 
     # Long fan-out phases legitimately run longer than a single scanner probe.
     # Capping them at the scanner timeout (default 60s) would kill recon/crawl
-    # mid-sweep before they emit downstream work.
-    _LONG_PHASES = {"recon", "crawl", "discover", "authz"}
+    # mid-sweep before they emit downstream work. Same for the scan task itself
+    # (it fans out to every enabled scanner), logic/authz matrices, the exploit
+    # phase (revalidation re-fires every finding), final reporting, screenshots
+    # and secret validation — they must run to completion or the run ends with
+    # no findings/report at all. Individual scanners still get their own
+    # per-scanner deadline from VulnerabilityAgent._safe.
+    _LONG_PHASES = {"recon", "crawl", "discover", "authz", "scan", "scan.graphql",
+                    "logic", "exploit", "validate_secrets", "screenshot", "report",
+                    "scan.takeover"}
 
     def _timeout_for(self, kind: str) -> float:
         if kind in self._LONG_PHASES:
@@ -211,6 +230,15 @@ class Orchestrator:
         except Exception as exc:
             self.session = SessionStore()
             self.dashboard.event("err", f"auth recipe failed: {exc}")
+        # session persistence: without a recipe, restore the cookies/headers
+        # saved by a previous run so sessions survive across invocations
+        if not self.session.is_authed():
+            from .auth import load_persisted_session
+            persisted = load_persisted_session(self.workspace / "session" / "session.json")
+            if persisted and persisted.is_authed():
+                self.session = persisted
+                self.dashboard.event("info",
+                    "auth: restored persisted session (cookies/headers from a prior run)")
         self.http.attach(session=self.session)
         if self.session.is_authed():
             self.dashboard.event("ok", f"auth: session loaded ({self.session.label})")
@@ -280,6 +308,12 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 self.dashboard.event("err", "global scan deadline reached — stopping")
             finally:
+                # completion notification (before the http client closes)
+                try:
+                    from .notify import scan_complete
+                    await scan_complete(self.context)
+                except Exception:
+                    pass
                 await self._shutdown_workers(workers)
         n = len(self.memory.list_findings(self.target_slug))
         self.dashboard.event("ok",
@@ -351,3 +385,9 @@ class Orchestrator:
             await self.http.close()
         except Exception:
             pass
+        # persist the authenticated session for the next run (refresh tokens
+        # beat re-logging-in; works for static + form + bearer recipes alike)
+        if self.session and self.session.is_authed():
+            from .auth import save_session
+            if save_session(self.session, self.workspace / "session" / "session.json"):
+                log.debug("session persisted to workspace")

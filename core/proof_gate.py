@@ -77,6 +77,11 @@ def poc_status(finding: dict[str, Any]) -> tuple[str, str]:
     cat = (finding.get("category") or "").lower()
     detection = str(meta.get("detection") or "").lower()
 
+    # 0) revalidation explicitly dropped it → definitely a candidate (likely FP),
+    # regardless of any scan-time proof artifact it may still carry
+    if meta.get("revalidated") is False:
+        return "candidate", "did not reproduce on fresh re-test — likely false positive"
+
     # 1) a captured, verified proof record with a real response artifact
     poc = meta.get("poc")
     if isinstance(poc, dict) and poc.get("verified") is True and _poc_has_response(poc):
@@ -105,8 +110,7 @@ def poc_status(finding: dict[str, Any]) -> tuple[str, str]:
         return "candidate", "chain components co-located but escalation not reproduced"
 
     # 6) revalidation explicitly dropped it → definitely a candidate (likely FP)
-    if meta.get("revalidated") is False:
-        return "candidate", "did not reproduce on fresh re-test — likely false positive"
+    # (handled at the very top — see rule 0)
 
     # 7) anything else has no captured proof
     return "candidate", "no captured proof — needs manual confirmation"

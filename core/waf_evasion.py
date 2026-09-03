@@ -19,7 +19,6 @@ multipart boundary vs sent as JSON in a GET query parameter.
 """
 from __future__ import annotations
 
-import html
 import random
 import urllib.parse
 from typing import Callable, Iterable
@@ -58,22 +57,23 @@ def _encoding_chain(payload: str) -> str:
 
     This three-stage chain often slips through WAFs that decode each layer
     once but only inspect the result of a single layer of decoding."""
-    # Stage 1 — URL encode every non-alphanumeric byte
-    s1 = "".join(f"%{ord(c):02X}" if not c.isalnum() else c for c in payload)
-    # Stage 2 — for selected chars, swap to Unicode escape
-    s2 = []
-    for c in s1:
+    # Stage 2+3 first: substitute special chars with their Unicode escape /
+    # HTML-entity form *before* URL encoding, so every stage actually alters
+    # the payload (encoding first made stages 2 and 3 unreachable dead code).
+    out = []
+    for c in payload:
         if c == "<":
-            s2.append("\\u003c")
+            out.append("\\u003c")
         elif c == ">":
-            s2.append("\\u003e")
+            out.append("\\u003e")
         elif c == '"':
-            s2.append("\\u0022")
+            out.append("\\u0022")
         else:
-            s2.append(c)
-    s2_str = "".join(s2)
-    # Stage 3 — HTML-entity-encode any < or > that survived
-    return s2_str.replace("<", "&lt;").replace(">", "&gt;")
+            out.append(c)
+    s2 = "".join(out)
+    s3 = s2.replace("<", "&lt;").replace(">", "&gt;")
+    # Stage 1 — URL encode every non-alphanumeric byte of the final form
+    return "".join(f"%{ord(c):02X}" if not c.isalnum() else c for c in s3)
 
 
 def _parameter_pollution_marker(payload: str) -> str:

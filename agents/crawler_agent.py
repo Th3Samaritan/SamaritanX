@@ -24,7 +24,7 @@ from bs4 import BeautifulSoup
 from core.logger import get_logger
 from core.js_intel import _SECRET_SEV
 from core.task_queue import Task
-from core.utils import normalize_url, host_of, root_domain
+from core.utils import normalize_url, host_of, root_domain, slugify
 from .base import BaseAgent
 
 if TYPE_CHECKING:
@@ -80,19 +80,36 @@ class CrawlerAgent(BaseAgent):
                 if url in state.visited or len(state.visited) >= max_urls:
                     continue
                 # resumability: skip URLs already processed in a prior run
-                if ctx.memory.is_url_processed(ctx.target_slug, url, "crawl"):
+                # (only honored when the run was launched with --resume)
+                if ctx.resume and ctx.memory.is_url_processed(ctx.target_slug, url, "crawl"):
                     state.visited.add(url)
                     ctx.dashboard.advance(f"crawl:{host}")
                     continue
                 state.visited.add(url)
                 ctx.memory.mark_url_processed(ctx.target_slug, url, "crawl")
                 ctx.dashboard.advance(f"crawl:{host}")
-                ev = await ctx.http.get(url)
+                # no auto-redirects: httpx would follow them internally with NO
+                # scope check on the target, and a 302 endpoint would be lost
+                # (recorded as an error when the redirect target is dead)
+                ev = await ctx.http.get(url, allow_redirects=False)
                 if ev.error or ev.status == 0:
                     continue
                 state.endpoints.append({"url": url, "status": ev.status,
                                         "ctype": ev.response_headers.get("content-type", "")})
                 ctx.dashboard.add_count("endpoints")
+                # 3xx with a Location: queue the in-scope target for a later
+                # hop, but keep THIS url (with its params) as an endpoint —
+                # open-redirect and header bugs live on 3xx endpoints
+                if ev.status in (301, 302, 303, 307, 308):
+                    loc = ev.response_headers.get("location") or ""
+                    if loc:
+                        target = normalize_url(urljoin(url, loc))
+                        if root_domain(host_of(target)) == root_domain(host) \
+                                and target not in state.queued:
+                            state.queued.add(target)
+                            next_frontier.append(target)
+                    self._extract_url_params(url, state, ctx)
+                    continue
                 self._scan_secrets(url, ev.response_body, state, ctx)
 
                 ctype = ev.response_headers.get("content-type", "").lower()
@@ -138,19 +155,26 @@ class CrawlerAgent(BaseAgent):
         if ctx.config.get("crawler", {}).get("api_discovery", True):
             await self._discover_api_surface(seed_url, state, ctx)
 
+        # Fetch the JS/OpenAPI/browser-discovered routes authenticated, so their
+        # bodies/forms become injection surface instead of param-less dead ends.
+        if ctx.config.get("crawler", {}).get("refetch_routes", True):
+            await self._crawl_discovered_routes(seed_url, state, ctx)
+
         # GraphQL introspection probe
         await self._probe_graphql(seed_url, ctx)
 
-        # persist findings
+        # persist findings (host may contain ':' for IP:port targets — Windows
+        # treats that as an NTFS alternate-data-stream, so sanitize it)
+        file_host = slugify(host)
         out_dir = ctx.workspace / "crawl"
-        (out_dir / f"{host}_endpoints.json").write_text(
+        (out_dir / f"{file_host}_endpoints.json").write_text(
             json.dumps(state.endpoints, indent=2), encoding="utf-8")
-        (out_dir / f"{host}_forms.json").write_text(
+        (out_dir / f"{file_host}_forms.json").write_text(
             json.dumps(state.forms, indent=2), encoding="utf-8")
-        (out_dir / f"{host}_params.txt").write_text(
+        (out_dir / f"{file_host}_params.txt").write_text(
             "\n".join(sorted(f"{u} :: {p}" for u, p in state.params)), encoding="utf-8")
         if state.secrets:
-            (out_dir / f"{host}_secrets.json").write_text(
+            (out_dir / f"{file_host}_secrets.json").write_text(
                 json.dumps(state.secrets, indent=2), encoding="utf-8")
 
         # emit scanning tasks
@@ -179,14 +203,12 @@ class CrawlerAgent(BaseAgent):
         soup = BeautifulSoup(body or "", "lxml")
         links: list[str] = []
         scripts: list[str] = []
-        for tag in soup.find_all(["a", "link", "script", "iframe"], href=True):
-            href = tag.get("href")
+        for tag in soup.find_all(["a", "link", "script", "iframe"]):
+            href = tag.get("href") or (tag.get("src") if tag.name in ("script", "iframe") else None)
             if href and not href.startswith(("javascript:", "mailto:", "tel:")):
                 links.append(normalize_url(urljoin(base, href)))
-        for tag in soup.find_all("script", src=True):
-            src = normalize_url(urljoin(base, tag["src"]))
-            links.append(src)
-            scripts.append(src)
+            if tag.name == "script" and tag.get("src"):
+                scripts.append(normalize_url(urljoin(base, tag["src"])))
         forms: list[dict] = []
         for f in soup.find_all("form"):
             action = normalize_url(urljoin(base, f.get("action") or base))
@@ -214,6 +236,72 @@ class CrawlerAgent(BaseAgent):
                 await self._mine_js_intel(seed_url, state, ctx)
         except Exception as exc:
             log.debug("js intelligence failed: %s", exc)
+
+    async def _crawl_discovered_routes(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
+        """Second, bounded pass over the routes JS-mining / OpenAPI / the
+        authenticated browser render surfaced but the BFS never actually
+        fetched. We visit each **as the authenticated user** (``ctx.http``
+        carries the session) so a mined route like ``/api/account/settings``
+        or a param-less privileged path becomes a *real* injection target:
+        its JSON body yields ``json:`` points and its HTML yields forms/params,
+        instead of being dropped as a param-less scan task.
+
+        Non-recursive (one hop) and capped so it can't turn into an unbounded
+        second crawl.
+        """
+        seed_root = root_domain(host_of(seed_url))
+        cap = int(ctx.config.get("crawler", {}).get("max_route_refetch", 150))
+        max_urls = int(ctx.config.get("crawler", {}).get("max_urls_per_host", 1000))
+
+        # GET routes from JS/OpenAPI tasks + endpoints the browser render found
+        # but left unfetched (status == -1).
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for t in state.api_tasks:
+            if (t.get("method", "GET") or "GET").upper() != "GET":
+                continue
+            u = normalize_url(t.get("url", ""))
+            if u and u not in seen:
+                seen.add(u)
+                candidates.append(u)
+        for ep in state.endpoints:
+            if ep.get("status") == -1:
+                u = normalize_url(ep["url"])
+                if u not in seen:
+                    seen.add(u)
+                    candidates.append(u)
+
+        fetched = 0
+        for url in candidates:
+            if fetched >= cap or len(state.visited) >= max_urls:
+                break
+            if url in state.visited or root_domain(host_of(url)) != seed_root:
+                continue
+            state.visited.add(url)
+            ev = await ctx.http.get(url, allow_redirects=False)
+            if ev.error or ev.status == 0:
+                continue
+            fetched += 1
+            state.endpoints.append({"url": url, "status": ev.status,
+                                    "ctype": ev.response_headers.get("content-type", ""),
+                                    "source": "route_refetch"})
+            self._scan_secrets(url, ev.response_body, state, ctx)
+            ctype = ev.response_headers.get("content-type", "").lower()
+            if "json" in ctype:
+                from core.surface import synthesize_json_points
+                pts = synthesize_json_points(ev.response_body)
+                if pts:
+                    state.json_points[url] = pts
+            elif "html" in ctype:
+                _links, forms, scripts = self._parse_html(url, ev.response_body)
+                state.forms.extend(forms)
+                state.scripts.update(scripts)
+            self._extract_url_params(url, state, ctx)
+
+        if fetched:
+            ctx.dashboard.event("ok",
+                f"route-refetch: fetched {fetched} JS/OpenAPI route(s) authenticated → "
+                f"{len(state.json_points)} JSON body target(s), {len(state.forms)} form(s)")
 
     async def _mine_js_intel(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
         from core.js_intel import harvest_js
@@ -406,6 +494,17 @@ class CrawlerAgent(BaseAgent):
         for url, params in by_url.items():
             points = candidate_points(url, params)
             if not points:
+                # param-less 2xx endpoints still matter: nosql auth bypass,
+                # deserialization in cookies, API exposure, prompt injection
+                # and similar scanners don't need a parameter to run
+                status = next((e.get("status") for e in state.endpoints
+                               if e.get("url") == url), 0)
+                if status and status < 400:
+                    await ctx.queue.put(
+                        "scan",
+                        {"url": url, "method": "GET", "params": []},
+                        target=ctx.target_slug, priority=4, producer=self.name,
+                    )
                 continue
             await ctx.queue.put(
                 "scan",

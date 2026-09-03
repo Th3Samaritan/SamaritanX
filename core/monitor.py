@@ -60,8 +60,14 @@ def _snapshot(ctx: "Context") -> dict:
 
     findings = ctx.memory.list_findings(ctx.target_slug)
     sev_counts: dict[str, int] = {}
+    finding_keys: list[str] = []
     for f in findings:
-        sev_counts[f.get("severity", "info")] = sev_counts.get(f.get("severity", "info"), 0) + 1
+        sev = f.get("severity", "info")
+        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        # stable fingerprint for cross-run diffing (None-fingerprint fallback)
+        key = f.get("fingerprint") or f"{f.get('category','')}||{f.get('url','')}||" \
+              f"{f.get('parameter','')}||{(f.get('title') or '').lower()}"
+        finding_keys.append(key)
 
     return {
         "ts": int(time.time()),
@@ -69,6 +75,7 @@ def _snapshot(ctx: "Context") -> dict:
         "endpoints": sorted(endpoints),
         "params": sorted(params),
         "findings": sev_counts,
+        "finding_keys": sorted(finding_keys),
     }
 
 
@@ -77,11 +84,16 @@ def diff(old: dict, new: dict) -> dict:
     def d(key):
         o, n = set(old.get(key, [])), set(new.get(key, []))
         return {"added": sorted(n - o), "removed": sorted(o - n)}
-    return {k: d(k) for k in ("hosts", "endpoints", "params")}
+    delta = {k: d(k) for k in ("hosts", "endpoints", "params")}
+    delta["findings"] = d("finding_keys")
+    delta["findings"]["counts"] = {"old": old.get("findings", {}),
+                                   "new": new.get("findings", {})}
+    return delta
 
 
 def _has_changes(delta: dict) -> bool:
-    return any(delta[k]["added"] or delta[k]["removed"] for k in delta)
+    return any(delta[k]["added"] or delta[k]["removed"] for k in
+               ("hosts", "endpoints", "params", "findings"))
 
 
 def _prune_diffs(out_dir: Path, keep: int) -> None:
@@ -112,6 +124,8 @@ async def run(ctx: "Context") -> dict | None:
     new = _snapshot(ctx)
     if not baseline_path.exists():
         baseline_path.write_text(json.dumps(new, indent=2), encoding="utf-8")
+        (out_dir / f"snap_{new['ts']}.json").write_text(json.dumps(new, indent=2),
+                                                        encoding="utf-8")
         ctx.dashboard.event("info", "monitor: baseline established (first run — no diff)")
         return None
 
@@ -123,6 +137,7 @@ async def run(ctx: "Context") -> dict | None:
     delta = diff(old, new)
     ts = new["ts"]
     (out_dir / f"diff_{ts}.json").write_text(json.dumps(delta, indent=2), encoding="utf-8")
+    (out_dir / f"snap_{ts}.json").write_text(json.dumps(new, indent=2), encoding="utf-8")
     baseline_path.write_text(json.dumps(new, indent=2), encoding="utf-8")
     _prune_diffs(out_dir, int(mon_cfg.get("keep_diffs", 30)))
 
@@ -134,24 +149,61 @@ async def run(ctx: "Context") -> dict | None:
             f"(diff_{ts}.json)")
         for h in delta["hosts"]["added"][:10]:
             ctx.dashboard.event("info", f"monitor: new host {h}")
-        await _notify(ctx, mon_cfg.get("webhook"), new["ts"], delta)
+        # new FINDINGS deserve the loudest alert — a new bug class on the
+        # target is the thing a hunter wants paged about first
+        new_fps = delta["findings"]["added"]
+        new_details = _finding_details(ctx, new_fps)
+        if new_details:
+            for d_ in new_details:
+                ctx.dashboard.event("crit",
+                    f"monitor: NEW finding [{d_['severity']}] {d_['title'][:70]} — {d_['url'][:60]}")
+        # legacy webhook + structured Slack/Discord/Telegram notifications
+        await _notify(ctx, mon_cfg.get("webhook"), new["ts"], delta, new_details)
+        try:
+            from .notify import new_findings, new_surface
+            await new_findings(ctx, new_details)
+            await new_surface(ctx, delta["hosts"]["added"],
+                              delta["endpoints"]["added"], delta["params"]["added"])
+        except Exception:  # noqa: BLE001
+            pass
     else:
         ctx.dashboard.event("info", "monitor: no attack-surface change since last run")
     return delta
 
 
-async def _notify(ctx: "Context", webhook: str | None, ts: int, delta: dict) -> None:
+def _finding_details(ctx: "Context", fingerprints: list[str]) -> list[dict]:
+    """Map snapshot fingerprints back to finding dicts for alerts."""
+    out: list[dict] = []
+    try:
+        for f in ctx.memory.list_findings(ctx.target_slug):
+            key = f.get("fingerprint") or f"{f.get('category','')}||{f.get('url','')}||" \
+                  f"{f.get('parameter','')}||{(f.get('title') or '').lower()}"
+            if key in fingerprints:
+                out.append({"severity": f.get("severity", "info"),
+                            "title": f.get("title", ""),
+                            "url": f.get("url", ""),
+                            "category": f.get("category", "")})
+    except Exception:
+        pass
+    return out
+
+
+async def _notify(ctx: "Context", webhook: str | None, ts: int, delta: dict,
+                  new_findings: list[dict] | None = None) -> None:
     if not webhook:
         return
     payload = {
         "text": f"SamaritanX monitor [{ctx.target}]: "
                 f"+{len(delta['hosts']['added'])} hosts, "
                 f"+{len(delta['endpoints']['added'])} endpoints, "
-                f"+{len(delta['params']['added'])} params",
+                f"+{len(delta['params']['added'])} params, "
+                f"+{len(delta['findings']['added'])} findings",
         "target": ctx.target,
         "ts": ts,
         "new_hosts": delta["hosts"]["added"][:25],
         "new_endpoints": delta["endpoints"]["added"][:50],
+        "new_findings": new_findings[:20],
+        "finding_counts": delta.get("findings", {}).get("counts", {}),
     }
     try:
         await ctx.http.request("POST", webhook, json_body=payload, bypass_scope=True)

@@ -63,24 +63,33 @@ def parse_money(text: str) -> list[float]:
 
 
 def find_total(body: str) -> Optional[float]:
-    """Return the money value most tightly associated with a total/amount word."""
+    """Return the money value most tightly associated with a total/amount word.
+
+    The distance used is the *actual character distance* between the hint word
+    and the money value in the text (ties broken by hint priority), not the
+    hint's position in a constant tuple."""
     body = (body or "").lower()
     best: Optional[float] = None
     best_dist = 10 ** 9
-    for hint in _TOTAL_HINTS:
+    best_rank = 10 ** 9
+    for rank, hint in enumerate(_TOTAL_HINTS):
         start = 0
         while True:
             idx = body.find(hint, start)
             if idx == -1:
                 break
             window = body[idx: idx + 60]
-            vals = parse_money(window)
-            if vals:
-                # take the first money value after the hint word
-                dist = _TOTAL_HINTS.index(hint)
-                if dist < best_dist:
-                    best_dist = dist
-                    best = vals[0]
+            # take the first money value after the hint word and measure how
+            # far it sits from the hint itself
+            for m in _MONEY.finditer(window):
+                try:
+                    val = float(m.group(0).replace(",", ""))
+                except ValueError:
+                    continue
+                dist = m.start()
+                if (dist, rank) < (best_dist, best_rank):
+                    best_dist, best_rank, best = dist, rank, val
+                break
             start = idx + len(hint)
     return best
 

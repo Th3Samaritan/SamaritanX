@@ -408,7 +408,10 @@ async def _continuation_flood(host, port, path, use_tls, bucket, url) -> list[di
     # shape* — but a single accepted burst is not proof of unbounded buffering or
     # a real DoS. Emit as an unverified candidate (no captured proof) so the
     # proof-gate quarantines it until a human confirms the impact.
-    if data and elapsed < _HANG and (b" 200 " in data or b"\x00\x00" in data[:9]):
+    # Note: any H2 frame header contains \x00\x00 bytes (stream-id low bytes),
+    # so that can NEVER be a signal — only a real HTTP/1.1-style status line in
+    # the response bytes counts as a response artifact.
+    if data and elapsed < _HANG and b" 200 " in data:
         findings.append({
             "category": "smuggling",
             "title": "HTTP/2 CONTINUATION-frame flood accepted — unverified DoS/smuggling candidate",

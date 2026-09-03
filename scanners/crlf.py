@@ -67,4 +67,4 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     return
 
     await asyncio.gather(*(test(p) for p in params))
-    
+    return findings

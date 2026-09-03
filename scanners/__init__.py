@@ -8,14 +8,18 @@ invoked once per run from the `scan.takeover` task kind.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
+
+if TYPE_CHECKING:
+    from core.orchestrator import Context
 
 ScanFn = Callable[
-    ["core.orchestrator.Context", str, list[str], str, dict[str, Any] | None],
+    ["Context", str, list[str], str, dict[str, Any] | None],
     Coroutine[Any, Any, list[dict[str, Any]]],
 ]
 
 from .sqli import scan as scan_sqli  # noqa: E402
+from .lfi import scan as scan_lfi  # noqa: E402
 from .xss import scan as scan_xss  # noqa: E402
 from .stored_xss import scan as scan_stored_xss  # noqa: E402
 from .ssrf import scan as scan_ssrf  # noqa: E402
@@ -36,6 +40,7 @@ from .websocket import scan as scan_websocket  # noqa: E402
 from .oauth import scan as scan_oauth  # noqa: E402
 from .graphql import scan as scan_graphql  # noqa: E402
 from .crlf import scan as scan_crlf  # noqa: E402
+from .host_header import scan as scan_host_header  # noqa: E402
 from .xxe import scan as scan_xxe  # noqa: E402
 from .deserialization import scan as scan_deserialization  # noqa: E402
 from .version_bypass import scan as scan_version_bypass  # noqa: E402
@@ -49,6 +54,7 @@ from .subdomain_takeover import scan_takeover  # noqa: E402
 
 REGISTRY: dict[str, ScanFn] = {
     "sqli": scan_sqli,
+    "lfi": scan_lfi,
     "xss": scan_xss,
     "stored_xss": scan_stored_xss,
     "dom_xss": scan_dom_xss,
@@ -69,6 +75,7 @@ REGISTRY: dict[str, ScanFn] = {
     "oauth": scan_oauth,
     "graphql": scan_graphql,
     "crlf": scan_crlf,
+    "host_header": scan_host_header,
     "xxe": scan_xxe,
     "deserialization": scan_deserialization,
     "version_bypass": scan_version_bypass,

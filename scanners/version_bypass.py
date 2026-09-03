@@ -58,20 +58,36 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     async def probe(sib: str) -> None:
         async with sem:
             e = await ctx.http.get(sib)
-        if e.status == 200 and len(e.response_body or "") > 200:
-            findings.append({
-                "category": "broken_auth",
-                "title": f"API version-bypass: privileged data via sibling URL {sib}",
-                "severity": "critical", "cvss": 9.0,
-                "url": sib,
-                "evidence": f"Original {url} returned {ev.status}, but {sib} returned 200 "
-                            f"with {len(e.response_body or '')} bytes — sibling endpoint "
-                            "exposes data the canonical version protects.",
-                "request": f"GET {sib}",
-                "response": (e.response_body or "")[:1500],
-                "metadata": {"original": url, "sibling": sib,
-                             "original_status": ev.status},
-            })
+        body = e.response_body or ""
+        if e.status != 200 or len(body) <= 200:
+            return
+        # a 200 can be a login page / SPA catch-all / error page — require real
+        # privileged-looking content, not just "something answered 200"
+        from core.poc import is_auth_wall, is_static_asset
+        wall, why = is_auth_wall(e.status, e.response_headers, body, sib)
+        if wall or is_static_asset(sib, e.response_headers):
+            return
+        from scanners.idor_deep import identity_markers
+        from core.escalation import sensitive_hits
+        markers = identity_markers(body)
+        sensitive = [k for k, _ in sensitive_hits(body, e.response_headers)]
+        if not markers and not sensitive:
+            return
+        findings.append({
+            "category": "broken_auth",
+            "title": f"API version-bypass: privileged data via sibling URL {sib}",
+            "severity": "critical", "cvss": 9.0,
+            "url": sib,
+            "evidence": f"Original {url} returned {ev.status}, but {sib} returned 200 "
+                        f"with {len(body)} bytes of privileged content "
+                        f"(identity markers={sorted(markers)[:5]}, sensitive={sensitive}) — "
+                        "sibling endpoint exposes data the canonical version protects.",
+            "request": f"GET {sib}",
+            "response": body[:1500],
+            "metadata": {"original": url, "sibling": sib,
+                         "original_status": ev.status,
+                         "markers": sorted(markers)[:6], "sensitive": sensitive},
+        })
 
     await asyncio.gather(*(probe(s) for s in siblings))
     return findings

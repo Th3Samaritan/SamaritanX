@@ -28,7 +28,9 @@ if TYPE_CHECKING:
 PHP_SER_RE   = re.compile(r"^[Oa]:\d+:\"")
 JAVA_B64_RE  = re.compile(r"^rO0AB[A-Za-z0-9+/=]{20,}")
 JAVA_RAW_RE  = re.compile(rb"\xac\xed\x00\x05")
-PY_PKL_B64   = re.compile(r"^gA[SJ]V[A-Za-z0-9+/=]{20,}")
+# protocol 0/1: gAJx… (0x80 0x02), protocol 4: gASV (0x80 0x04),
+# protocol 5: gAV (0x80 0x05)
+PY_PKL_B64   = re.compile(r"^gA(?:Jx|J[A-Za-z0-9+/=]|SV|V)[A-Za-z0-9+/=]{8,}")
 RUBY_RE      = re.compile(rb"\x04\x08")
 NET_BF_RE    = re.compile(r"^AAEAAAD/////[A-Za-z0-9+/=]{20,}")
 YAML_PY_RE   = re.compile(r"!!python/object")

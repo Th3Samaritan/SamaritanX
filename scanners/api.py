@@ -122,6 +122,10 @@ async def _api_versioning(ctx, url):
 async def _mass_assignment(ctx, url, method):
     if method.upper() not in ("POST", "PUT", "PATCH"):
         return []
+    # this POSTs privileged fields to real endpoints — it can create an
+    # admin-grade record on a vulnerable service. Aggressive-only.
+    if not ctx.config.get("safety", {}).get("aggressive"):
+        return []
     payload = {
         "username": "sx_test", "email": "sx@test.invalid",
         "is_admin": True, "role": "admin", "balance": 999999,
@@ -135,6 +139,14 @@ async def _mass_assignment(ctx, url, method):
             return []
         for k in ("is_admin", "role", "balance"):
             if isinstance(data, dict) and data.get(k) == payload[k]:
+                from core.poc import proof_record
+                poc = proof_record(
+                    verified=True, method="POST", url=url,
+                    request=f"POST {url}\n\n{json.dumps(payload)}",
+                    status=ev.status, excerpt=ev.response_body,
+                    rationale=(f"The server stored and returned the attacker-supplied "
+                               f"privileged field `{k}` — the API accepts and persists "
+                               "fields the client should not control (mass assignment)."))
                 return [{
                     "category": "api",
                     "title": f"API6 — Mass assignment: privileged field `{k}` honored",
@@ -143,6 +155,7 @@ async def _mass_assignment(ctx, url, method):
                     "evidence": f"Server returned `{k}` set to attacker-supplied value.",
                     "request": f"POST {url}\n\n{json.dumps(payload)}",
                     "response": ev.response_body[:1500],
+                    "metadata": {"poc": poc},
                 }]
     return []
 

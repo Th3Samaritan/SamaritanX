@@ -41,6 +41,14 @@ class ReportingAgent(BaseAgent):
         findings, candidates = partition(all_findings)
         confirmed = findings  # every reported finding is, by definition, proven
 
+        # CVSS 3.1 normalization: every verified finding gets a real vector
+        # whose computed score matches the reported number + severity band
+        from core.cvss import annotate as cvss_annotate
+        for f in findings:
+            cvss_annotate(f)
+            ctx.memory.update_finding(f.get("id"), severity=f["severity"],
+                                      cvss=f["cvss"], metadata=f.get("metadata") or {})
+
         # LLM assist (judge over captured evidence, never a detector): write an
         # impact narrative + CVSS rationale for each PROVEN finding. Falls back to
         # deterministic templates when no API key is configured.
@@ -60,8 +68,13 @@ class ReportingAgent(BaseAgent):
         if exploit_path.exists():
             data = json.loads(exploit_path.read_text(encoding="utf-8"))
             playbooks = {pb["finding_id"]: pb["steps"] for pb in data.get("playbooks", [])}
-            chains = data.get("chains", [])
-            priority = data.get("priority", [])
+            # only chains whose escalation step was actually reproduced belong
+            # in the report; co-located-but-unproven chains stay out
+            chains = [c for c in data.get("chains", []) if c.get("verified") is True]
+            # priority table must only list PROVEN findings — candidates that
+            # the proof-gate quarantined must not appear as top findings
+            verified_ids = {f["id"] for f in findings}
+            priority = [p for p in data.get("priority", []) if p.get("id") in verified_ids]
 
         # annotate every finding with walkthrough + impact + remediation
         for f in findings:
@@ -145,6 +158,24 @@ class ReportingAgent(BaseAgent):
         (ctx.workspace / "reports" / "findings.json").write_text(
             json.dumps(findings, indent=2, default=str), encoding="utf-8")
 
+        # interchange formats: SARIF 2.1.0 (static-analysis tooling), CSV
+        # (spreadsheets / program triage), JSONL (data pipelines)
+        from core.exports import write_exports
+        try:
+            write_exports(findings, ctx.workspace / "reports")
+        except Exception as exc:  # noqa: BLE001
+            ctx.dashboard.event("err", f"export formats failed: {exc}")
+
+        # sqlmap + Burp handoff artifacts for verified SQL-class findings
+        from core.handoff import write_handoffs
+        try:
+            n_hand = write_handoffs(findings, ctx.workspace / "reports" / "handoff")
+            if n_hand:
+                ctx.dashboard.event("ok",
+                    f"handoff: {n_hand} sqlmap/Burp artifact(s) -> reports/handoff")
+        except Exception as exc:  # noqa: BLE001
+            ctx.dashboard.event("err", f"handoff export failed: {exc}")
+
         # quarantined candidates — unproven signals, kept out of the report but
         # retained (with the reason each was held back) for manual review
         candidates_out = [{
@@ -170,3 +201,11 @@ class ReportingAgent(BaseAgent):
             slug = f"{f['id']:04d}_{f['category']}_{(f.get('severity') or 'info')}.md"
             (h1_dir / slug).write_text(md, encoding="utf-8")
         ctx.dashboard.event("ok", f"report: {len(findings)} HackerOne submissions -> {h1_dir}")
+
+        # opt-in: auto-create HackerOne DRAFT reports (never publishes)
+        if (ctx.config.get("hackerone") or {}).get("enabled"):
+            try:
+                from core.hackerone_client import submit_drafts
+                await submit_drafts(ctx, findings)
+            except Exception as exc:  # noqa: BLE001
+                ctx.dashboard.event("err", f"hackerone drafts failed: {exc}")

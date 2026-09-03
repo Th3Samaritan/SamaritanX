@@ -38,19 +38,23 @@ Each layer of work is isolated as an asynchronous agent that consumes and produc
 
 | Layer | What it does |
 | ----- | ------------ |
-| **Recon** | subfinder, amass-passive, crt.sh / certspotter / hackertarget, DNS brute force, live HTTP probe with tech fingerprint |
+| **Recon** | subfinder, amass-passive, crt.sh / certspotter / hackertarget, DNS brute force, **wildcard-DNS detection** (phantom-host filtering), **alt-dns style subdomain permutations**, **virtual-host brute force** (Host-header fuzzing against the resolved IP), live HTTP probe with tech fingerprint |
 | **Discovery** | content discovery (ffuf or async wordlist), Wayback / URLScan / OTX historical URLs, JS LinkFinder regex sweep, OpenAPI/Swagger ingestion (auto-emits scan tasks per operation), cloud-bucket enumeration (S3/GCS/Azure), GitHub dorks |
 | **Crawler** | depth-bounded BFS, Playwright-driven JS render, GraphQL `__schema` probe, 13 secret regex rules |
 | **Authentication** | static / form-login / bearer-from-JSON recipes, env-var expansion for credentials, periodic token refresh, **second-session** mode for cross-tenant BOLA testing |
 | **Scope enforcement** | allow/deny rules (glob, regex, CIDR) checked at the HTTP boundary — every out-of-scope request is dropped before egress |
-| **Vuln scanners** | SQLi (error/boolean/time), reflected XSS, **DOM XSS via Playwright** (real browser sink hooks), SSRF (cloud metadata + **interactsh OOB**), IDOR (heuristic) + **deep IDOR/BOLA** with second session, CSRF, **hardened upload** (.phtml / .phar / .htaccess / double-extension / null-byte / GIF polyglot), Open Redirect, CORS, Cache Poisoning, RCE + SSTI (in-band, time-based, **OOB**), **HTTP request smuggling** (CL.TE / TE.CL via raw socket), **WebSocket CSWH**, API Top-10 (BOLA / Mass-assign / JWT / rate-limit / excessive exposure), LLM prompt injection, optional `nuclei` sweep |
+| **Vuln scanners** | SQLi (error/boolean/time), **LFI/path-traversal** (in-band `/etc/passwd` + php://filter chains), reflected XSS, **DOM XSS via Playwright** (real browser sink hooks), SSRF (cloud metadata + **interactsh OOB**), IDOR (heuristic) + **deep IDOR/BOLA** with second session, CSRF, **hardened upload** (.phtml / .phar / .htaccess / double-extension / null-byte / GIF polyglot), Open Redirect, CORS, Cache Poisoning, **host-header injection** (reset-link/SSO poisoning primitive), RCE + SSTI (in-band, time-based, **OOB**), **HTTP request smuggling** (CL.TE / TE.CL via raw socket), **WebSocket CSWH**, API Top-10 (BOLA / Mass-assign / JWT — **alg=none, RS256→HS256 JWKS confusion, kid traversal, claim tampering** / rate-limit / excessive exposure), OAuth (redirect_uri, state, PKCE, implicit, scope escalation), GraphQL (introspection, alias bomb, depth bomb, anonymous mutations), LLM prompt injection, optional `nuclei` sweep |
 | **Subdomain takeover** | 25-service CNAME fingerprint sweep across every collected host |
 | **OOB collaborator** | interactsh client (RSA / AES decrypt of polled events) — proves blind SSRF / RCE / DNSlog with attributable callbacks |
 | **Logic** | sensitive-path enumeration, anonymous admin probe, pricing tampering, race-condition probe |
-| **Exploit** | per-finding playbook, 8 chain rules (SSRF→IMDS, prompt-injection→tool-call SSRF, upload→RCE, IDOR+mass-assign, etc.) |
-| **Reporting** | Markdown + PDF (weasyprint) with executive summary, top-10 priority table, per-finding PoC + impact + remediation + walkthrough, **plus per-finding HackerOne-style submissions ready to paste**, plus **Playwright PoC screenshots** |
+| **Exploit** | per-finding playbook, 8 chain rules (SSRF→IMDS, prompt-injection→tool-call SSRF, upload→RCE, IDOR+mass-assign, etc.), **bounded impact provers** (SQLi version/current-user extraction, RCE `id/uname` fingerprint, LFI second-file read, SSRF IMDS creds — all `--aggressive` gated) |
+| **Reporting** | Markdown + PDF (weasyprint) with executive summary, top-10 priority table, per-finding PoC + impact + remediation + walkthrough, **spec-compliant CVSS 3.1 vectors** (real calculator — vector, score and severity band always agree), **plus per-finding HackerOne-style submissions ready to paste**, plus **Playwright PoC screenshots**, plus **SARIF / CSV / JSONL exports** for program triage and pipelines, plus **sqlmap + Burp handoff files** for SQL-class findings |
 | **Memory** | SQLite store of findings (deduplicated by stable fingerprint) + payload effectiveness re-ranked by Wilson lower-bound + scan-resume cursors |
-| **Stealth** | global + per-host token-bucket rate limit, **reactive 429/503 backoff with Retry-After**, jitter, UA / Referer rotation, Tor or HTTP/SOCKS proxy, six WAF evasion transforms |
+| **Stealth** | global + per-host token-bucket rate limit, **reactive 429/503 backoff with Retry-After**, jitter, UA / Referer rotation, Tor or HTTP/SOCKS proxy, **proxy rotation pool** (round-robin across a list of proxies with cookie sync), six WAF evasion transforms |
+| **Persistence** | SQLite memory (findings deduped by stable fingerprint, payload re-ranking, scan-resume cursors), **session persistence** (cookies/headers saved to the workspace and restored on the next run — no re-login), **phase checkpoints** for `--resume`, **incremental scanning** (endpoints whose content hash is unchanged skip the scanner fan-out on re-runs — scheduled scans get dramatically cheaper) |
+| **LLM assist** | opt-in impact triage + scanner planning (`llm.enabled`, Anthropic or OpenAI — judge over captured proof only, never a detector; deterministic fallback without a key) |
+| **Integrations** | **HackerOne draft auto-creation** (opt-in, drafts only — never auto-publishes; CWE weakness attached, optional program linkage), **Slack / Discord / Telegram alerts** (new findings, new surface, scan complete), monitor webhooks, SARIF/CSV/JSONL exports |
+| **Workflow** | `retest <target> <id>` re-fires one finding fresh; **interactive `triage` loop** walks unproven candidates (accept / reject / duplicate / skip) with decisions persisted |
 
 ## Project layout
 
@@ -140,8 +144,31 @@ python samaritanx.py scan example.com \
 # passive recon only, no OOB callback host (offline-friendly)
 python samaritanx.py scan example.com --passive --no-oob
 
-# resume a long scan that was interrupted
+# resume a long scan that was interrupted (recon/discovery/scan phases
+# checkpoint to memory and skip already-completed work)
 python samaritanx.py scan example.com --resume
+
+# custom headers on every request (repeatable)
+python samaritanx.py scan example.com \
+    --header "X-BB-Program: acme" --header "Authorization: Bearer $TOKEN"
+
+# proxy rotation pool (comma-separated; cookies stay in sync across the pool)
+python samaritanx.py scan example.com \
+    --proxy "socks5://p1:1080,socks5://p2:1080"
+
+# continuous monitoring with webhook alerts (new hosts/endpoints/findings)
+python samaritanx.py scan example.com --monitor --resume
+
+# structured alerts to Slack / Discord / Telegram (config: notify: section)
+export SX_SLACK_WEBHOOK="https://hooks.slack.com/services/..."
+
+# LLM impact triage (judge over captured proof; never a detector)
+export ANTHROPIC_API_KEY=...
+python samaritanx.py scan example.com   # llm.enabled: true in config
+
+# auto-create HackerOne DRAFT reports (review in the UI, submit manually)
+export H1_API_TOKEN=...
+python samaritanx.py scan example.com   # hackerone.enabled: true in config
 
 # rebuild reports later from memory (no network calls)
 python samaritanx.py report example.com
@@ -149,6 +176,15 @@ python samaritanx.py report example.com
 # inspect findings + reset scan state
 python samaritanx.py memory list example.com
 python samaritanx.py memory reset example.com
+
+# re-fire a single finding fresh (does it still reproduce?)
+python samaritanx.py retest example.com 42
+
+# interactive triage of unproven candidates (accept/reject/duplicate/skip)
+python samaritanx.py triage example.com
+
+# show what changed between the two most recent monitor runs
+python samaritanx.py diff example.com
 ```
 
 ## Auth recipes
@@ -179,6 +215,31 @@ Every outbound URL is checked against the policy before the request
 leaves the box. Out-of-scope requests are dropped, counted on the
 dashboard, and surface in the run summary. **Use this on every real bug
 bounty engagement.**
+
+### Importing scope from bug-bounty platforms
+
+Platform exports (HackerOne `structured_scopes` JSON, Bugcrowd CSV/JSON,
+Intigriti JSON, projectdiscovery Chaos JSON) are converted to the rule
+grammar above automatically — pass them straight to `--scope`, or
+generate a reusable scope file first:
+
+```bash
+# generate a scope file from a platform export (file or URL)
+python samaritanx.py scope-import h1_scope.json -o config/scope.acme.txt
+
+# …or fetch it live from the platform (no manual export needed)
+python samaritanx.py scope-import --program acme --platform hackerone -o config/scope.acme.txt
+
+# …then scan with it (also accepted directly: --scope h1_scope.json)
+python samaritanx.py scan example.com --scope config/scope.acme.txt
+
+# or run the whole program: fetch live scope + scan every in-scope root
+python samaritanx.py scan example.com --program acme --parallel 3
+```
+
+`eligible_for_bounty` / `eligible_for_submission` / `in_scope` flags are
+mapped to allow/deny rules automatically, URLs become full-URL regex
+rules, and CIDR/IP assets become `cidr:` rules.
 
 ## Walkthrough mode
 

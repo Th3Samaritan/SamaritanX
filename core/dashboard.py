@@ -23,10 +23,12 @@ from .logger import get_console
 
 
 class Dashboard:
-    def __init__(self, target: str, operator: str = "th3Samaritan") -> None:
+    def __init__(self, target: str, operator: str = "th3Samaritan",
+                 quiet: bool = False) -> None:
         self.console: Console = get_console()
         self.target = target
         self.operator = operator
+        self.quiet = quiet  # no Live rendering — used in parallel program mode
         self.start_time = time.time()
         self._lock = RLock()
         self._agents: dict[str, dict] = {}
@@ -50,6 +52,8 @@ class Dashboard:
 
     # ---------- lifecycle ----------
     def __enter__(self) -> "Dashboard":
+        if self.quiet:
+            return self
         layout = self._render()
         self._live = Live(layout, console=self.console, refresh_per_second=4, screen=False)
         self._live.__enter__()

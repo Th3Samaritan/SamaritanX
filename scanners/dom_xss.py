@@ -231,8 +231,12 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 await page.close()
                 relevant = [h for h in hits if token.lower() in (h.get("v") or "").lower()]
                 # only flag if a *non-receiver* sink fired — that proves the page
-                # acted on the attacker-controlled message instead of just hearing it
-                actionable = [h for h in relevant if h["k"] != "postMessage.recv"]
+                # acted on the attacker-controlled message instead of just hearing
+                # it. console.* is excluded: an error handler that merely logs the
+                # incoming message is not an execution sink.
+                actionable = [h for h in relevant
+                              if h["k"] != "postMessage.recv"
+                              and not str(h["k"]).lower().startswith("console")]
                 if actionable:
                     sinks = sorted({h["k"] for h in actionable})
                     findings.append({

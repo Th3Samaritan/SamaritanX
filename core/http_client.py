@@ -112,10 +112,15 @@ class _TokenBucket:
 
     async def take(self) -> None:
         async with self._lock:
-            self.auto_scale()
             now = time.monotonic()
-            if now > self.cooldown_until and self.rate != self.base_rate:
-                self.rate = self.base_rate
+            if now < self.cooldown_until:
+                # reactive backoff active: keep the slow_down() rate untouched —
+                # auto_scale() would otherwise bump it back up mid-cooldown
+                pass
+            else:
+                # cooldown over: let the error-fraction governor adjust toward
+                # (or away from) the base rate
+                self.auto_scale()
             self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
             self.last = now
             if self.tokens < 1:
@@ -124,6 +129,17 @@ class _TokenBucket:
                 self.tokens = 0
             else:
                 self.tokens -= 1
+
+
+class _ScopeRedirectBlocked(Exception):
+    """Raised from the response hook when httpx is about to follow a redirect
+    to an out-of-scope URL — stops the internal redirect chain so the request
+    never leaves the box for a host the operator hasn't authorized."""
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(f"redirect to out-of-scope URL blocked: {url} ({reason})")
+        self.url = url
+        self.reason = reason
 
 
 class StealthHttpClient:
@@ -158,16 +174,36 @@ class StealthHttpClient:
         elif proxy_cfg.get("enabled") and proxy_cfg.get("url"):
             proxy_url = proxy_cfg["url"]
 
+        # proxy rotation pool: one httpx client per proxy, round-robined per
+        # request. Cookies are re-synced across the pool after every response
+        # so sessions survive rotation.
+        rotation = [str(p).strip() for p in (proxy_cfg.get("rotation") or [])
+                    if str(p).strip()]
+        proxies: list[str | None]
+        if rotation:
+            proxies = list(rotation)
+        elif proxy_url:
+            proxies = [proxy_url]
+        else:
+            proxies = [None]
+
         transport = httpx.AsyncHTTPTransport(retries=1, verify=self.verify)
-        self._client = httpx.AsyncClient(
-            transport=transport,
-            timeout=self.timeout,
-            verify=self.verify,
-            follow_redirects=True,
-            max_redirects=self.max_redirects,
-            proxy=proxy_url,
-            http2=True,
-        )
+        self._clients: list[httpx.AsyncClient] = [
+            httpx.AsyncClient(
+                transport=transport,
+                timeout=self.timeout,
+                verify=self.verify,
+                follow_redirects=True,
+                max_redirects=self.max_redirects,
+                proxy=p,
+                http2=True,
+                event_hooks={"response": [self._redirect_scope_guard]},
+            )
+            for p in proxies
+        ]
+        # primary client — kept for cookie-jar access (auth recipes) and back-compat
+        self._client = self._clients[0]
+        self._pool_idx = 0
 
         # injected by orchestrator after construction
         self.session: "SessionStore | None" = None
@@ -183,7 +219,11 @@ class StealthHttpClient:
         await self.close()
 
     async def close(self) -> None:
-        await self._client.aclose()
+        for c in self._clients:
+            try:
+                await c.aclose()
+            except Exception:
+                pass
 
     def attach(self, *, session=None, scope=None, dashboard=None) -> None:
         if session is not None:
@@ -192,6 +232,26 @@ class StealthHttpClient:
             self.scope = scope
         if dashboard is not None:
             self.dashboard = dashboard
+
+    async def _redirect_scope_guard(self, resp) -> None:
+        """httpx response hook: abort the redirect chain when the next hop is
+        out of scope. Without this, an in-scope URL that 302s to an external
+        host would be followed with zero scope enforcement.
+
+        Must be async — httpx awaits response hooks unconditionally."""
+        nxt = getattr(resp, "next_request", None)
+        if nxt is None or self.scope is None:
+            return
+        nxt_url = str(nxt.url)
+        if nxt_url.startswith("socks5") or nxt_url.startswith("socks5h"):
+            return
+        ok, reason = self.scope.allows(nxt_url)
+        if not ok:
+            self.scoped_out += 1
+            if self.dashboard:
+                self.dashboard.event("info",
+                    f"scope-block: redirect -> {nxt_url} ({reason})")
+            raise _ScopeRedirectBlocked(nxt_url, reason)
 
     def _build_headers(self, extra: dict[str, str] | None, target_host: str) -> dict[str, str]:
         h = dict(self.default_headers)
@@ -245,7 +305,9 @@ class StealthHttpClient:
     ) -> HttpEvidence:
         # 1) scope check
         if self.scope and not bypass_scope:
-            ok, reason = self.scope.allows(url)
+            # scope.allows() may perform a blocking DNS resolution for CIDR
+            # rules — offload it so it can't stall the event loop
+            ok, reason = await asyncio.to_thread(self.scope.allows, url)
             if not ok:
                 self.scoped_out += 1
                 if self.dashboard:
@@ -284,8 +346,13 @@ class StealthHttpClient:
             cookies = self._cookies(cookies)
 
         start = time.perf_counter()
+        # round-robin across the proxy pool (single client when no rotation)
+        client = self._client
+        if len(self._clients) > 1:
+            self._pool_idx = (self._pool_idx + 1) % len(self._clients)
+            client = self._clients[self._pool_idx]
         try:
-            resp = await self._client.request(
+            resp = await client.request(
                 method.upper(),
                 url,
                 params=params,
@@ -325,6 +392,27 @@ class StealthHttpClient:
             elif resp.status_code < 400:
                 self._host_buckets[host].record_success()
 
+            # all Set-Cookie values (httpx collapses multi-headers into one
+            # comma-joined entry in the plain dict) — raw list for SameSite checks
+            set_cookies: list[str] = []
+            try:
+                set_cookies = [v for k, v in resp.headers.multi_items()
+                               if k.lower() == "set-cookie"]
+            except Exception:
+                pass
+            # keep every proxy client's cookie jar in sync so sessions survive
+            # proxy rotation (httpx cookies are per-client)
+            if len(self._clients) > 1 and set_cookies:
+                try:
+                    extracted = httpx.Cookies()
+                    extracted.extract_cookies(resp)
+                    for c in self._clients:
+                        try:
+                            c._cookies.update(extracted)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             return HttpEvidence(
                 method=method.upper(),
                 url=str(resp.url),
@@ -334,6 +422,7 @@ class StealthHttpClient:
                 response_headers=dict(resp.headers),
                 response_body=body,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
+                extra={"set_cookie_headers": set_cookies},
             )
         except Exception as exc:
             return HttpEvidence(
