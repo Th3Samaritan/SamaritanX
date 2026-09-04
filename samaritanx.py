@@ -33,6 +33,30 @@ from core.config_validator import validate_config  # noqa: E402
 from core.logger import configure_logging  # noqa: E402
 from core.orchestrator import Orchestrator  # noqa: E402
 
+
+def _load_dotenv() -> None:
+    """Load a gitignored .env file from the repo root into os.environ.
+
+    Credentials for auth recipes ({ENV:NAME} expansion) can live here instead
+    of the shell — never committed (see .gitignore)."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 from agents.recon_agent import ReconAgent  # noqa: E402
 from agents.crawler_agent import CrawlerAgent  # noqa: E402
 from agents.discovery_agent import DiscoveryAgent  # noqa: E402
