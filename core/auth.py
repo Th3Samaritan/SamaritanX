@@ -36,6 +36,15 @@ Supported recipe shapes:
     header_template: "Bearer {token}"
     refresh_every: 3300
 
+    # 4) Livewire login (Laravel Livewire wire:submit XHR flow)
+    type: livewire
+    login_url: https://target/login
+    fields:                               # wire:model names to update
+      email: "{ENV:TARGET_USER}"
+      password: "{ENV:TARGET_PASS}"
+    method: login                         # the wire method the form calls
+    success_indicator: ""                 # optional text on the post-login page
+
 Environment variables are expanded via the {ENV:NAME} placeholder so the
 secret never sits inside the repo.
 """
@@ -259,6 +268,94 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
             store.headers[header] = template.format(token=token)
             for h, v in (recipe.get("extra_headers") or {}).items():
                 store.headers[h] = v
+        store._refresh_fn = _refresh
+        await _refresh()
+        store._refreshed_at = time.time()
+
+    elif kind == "livewire":
+        async def _refresh():
+            url = recipe["login_url"]
+            method = recipe.get("method") or "login"
+            fields = recipe.get("fields") or {}
+
+            # 1) GET the login page — grab the CSRF token and the form's
+            #    Livewire snapshot (the wire:snapshot attribute)
+            page = await http.request("GET", url, allow_redirects=False)
+            body = page.response_body or ""
+            import html as _html
+            csrf = ""
+            m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)', body)
+            if m:
+                csrf = _html.unescape(m.group(1))
+            snapshot_obj = None
+            snap = re.search(r'wire:snapshot=["\']([^"\']+)["\']', body, re.S)
+            if snap:
+                try:
+                    snapshot_obj = json.loads(_html.unescape(snap.group(1)))
+                except Exception:
+                    snapshot_obj = None
+            if snapshot_obj is None:
+                raise RuntimeError("livewire login failed — no wire:snapshot found on the login page")
+
+            # 2) POST the Livewire update payload: snapshot + field updates +
+            #    the wire method call. Cookies from this response are the
+            #    authenticated session.
+            payload = {
+                "_token": csrf,
+                "components": [{
+                    "snapshot": snapshot_obj,
+                    "updates": dict(fields),
+                    "calls": [{"path": "", "method": method, "params": []}],
+                }],
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "X-Livewire": "true",
+            }
+            if csrf:
+                headers["X-CSRF-TOKEN"] = csrf
+            from urllib.parse import urlparse, urlunparse
+            _p = urlparse(url)
+            endpoint = urlunparse((_p.scheme, _p.netloc, "/livewire/update", "", "", ""))
+            ev = await http.request("POST", endpoint,
+                                    json_body=payload, headers=headers,
+                                    allow_redirects=False)
+            # follow a redirect effect when the framework emits one
+            try:
+                data = json.loads(ev.response_body or "{}")
+                comps = (data.get("components") or [data]) if isinstance(data, dict) else []
+                redirect = ""
+                if isinstance(data, dict):
+                    effects = data.get("effects") or {}
+                    redirect = effects.get("redirect") or ""
+                    if not redirect and comps:
+                        redirect = (comps[0].get("effects") or {}).get("redirect") or ""
+                if redirect:
+                    from urllib.parse import urljoin
+                    await http.request("GET", urljoin(url, redirect), allow_redirects=False)
+            except Exception:
+                pass
+            indicator = recipe.get("success_indicator") or ""
+            if indicator and indicator not in (ev.response_body or ""):
+                raise RuntimeError(f"livewire login failed — '{indicator}' not in response")
+            try:
+                jar = getattr(http, "_client", None)
+                if jar is not None:
+                    for name, val in jar.cookies.items():
+                        store.cookies[name] = val
+            except Exception:
+                pass
+            try:
+                raw = [v for v in ((ev.extra or {}).get("set_cookie_headers") or [])]
+                blob = " ".join(raw).lower()
+                if "samesite=strict" in blob:
+                    store.same_site = "strict"
+                elif "samesite=lax" in blob:
+                    store.same_site = "lax"
+                elif "samesite=none" in blob:
+                    store.same_site = "none"
+            except Exception:
+                pass
         store._refresh_fn = _refresh
         await _refresh()
         store._refreshed_at = time.time()
