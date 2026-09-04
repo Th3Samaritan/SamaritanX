@@ -117,6 +117,8 @@ crawler:
   extract_secrets: true
   api_discovery: true           # probe OpenAPI/Swagger specs -> typed injection points
   mine_javascript: true         # mine JS bundles for endpoints + params (SPA/API targets)
+  probe_privileged_paths: true  # with a session: GET curated account/admin paths
+                                # (BOLA/mass-assignment surface invisible to anon)
 
 scanners:
   enabled:

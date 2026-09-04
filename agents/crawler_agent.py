@@ -176,6 +176,14 @@ class CrawlerAgent(BaseAgent):
         if ctx.config.get("crawler", {}).get("refetch_routes", True):
             await self._crawl_discovered_routes(seed_url, state, ctx)
 
+        # Authenticated privileged-path probing: account-scoped endpoints
+        # (BOLA/mass-assignment/exposure surface) are unreachable anonymously —
+        # with a session, probe the curated list and treat 2xx results as
+        # first-class injection targets.
+        if (ctx.http.session and ctx.http.session.is_authed()
+                and ctx.config.get("crawler", {}).get("probe_privileged_paths", True)):
+            await self._probe_privileged_paths(seed_url, state, ctx)
+
         # GraphQL introspection probe
         await self._probe_graphql(seed_url, ctx)
 
@@ -319,6 +327,54 @@ class CrawlerAgent(BaseAgent):
                 f"route-refetch: fetched {fetched} JS/OpenAPI route(s) authenticated → "
                 f"{len(state.json_points)} JSON body target(s), {len(state.forms)} form(s)")
 
+    async def _probe_privileged_paths(self, seed_url: str, state: CrawlState,
+                                      ctx: "Context") -> None:
+        """Probe the curated privileged-path list with the authenticated session.
+
+        Account-scoped endpoints are invisible to anonymous crawling; any 2xx
+        response becomes a scan target — JSON bodies yield json: injection
+        points (mass assignment / IDOR / excessive exposure), HTML yields
+        forms and params. Bounded: one GET per path, in-scope only."""
+        wordlist = Path(ctx.payloads.payload_dir) / "privileged_paths.txt"
+        if not wordlist.exists():
+            return
+        paths = [p.strip() for p in wordlist.read_text(encoding="utf-8").splitlines()
+                 if p.strip() and not p.startswith("#")]
+        from urllib.parse import urlparse as _up
+        base = f"{_up(seed_url).scheme}://{_up(seed_url).netloc}"
+        sem = asyncio.Semaphore(8)
+        found = 0
+
+        async def probe(path: str) -> None:
+            nonlocal found
+            target = base.rstrip("/") + path
+            async with sem:
+                ev = await ctx.http.get(target, allow_redirects=False)
+            if ev.status not in range(200, 300) or not ev.response_body:
+                return
+            found += 1
+            state.endpoints.append({"url": target, "status": ev.status,
+                                    "ctype": ev.response_headers.get("content-type", ""),
+                                    "source": "privileged_probe"})
+            ctx.dashboard.add_count("endpoints")
+            self._scan_secrets(target, ev.response_body, state, ctx)
+            ctype = (ev.response_headers.get("content-type") or "").lower()
+            if "json" in ctype:
+                from core.surface import synthesize_json_points
+                pts = synthesize_json_points(ev.response_body)
+                if pts:
+                    state.json_points[target] = pts
+            elif "html" in ctype:
+                _links, forms, _scripts = self._parse_html(target, ev.response_body)
+                state.forms.extend(forms)
+            self._extract_url_params(target, state, ctx)
+
+        await asyncio.gather(*(probe(p) for p in paths))
+        if found:
+            ctx.dashboard.event("ok",
+                f"crawler: privileged-path probe found {found} authenticated endpoint(s) "
+                f"-> {len(state.json_points)} JSON injection target(s)")
+
     async def _mine_js_intel(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
         from core.js_intel import harvest_js
         intel = await harvest_js(ctx, list(state.scripts), seed_url)
@@ -377,6 +433,9 @@ class CrawlerAgent(BaseAgent):
         try:
             from playwright.async_api import async_playwright
         except ImportError:
+            ctx.dashboard.event("info",
+                "crawler: Playwright unavailable — JS render + authenticated XHR "
+                "capture skipped (SPA/API surface will be thinner)")
             log.debug("playwright not installed — skipping JS render")
             return
         from core.browser_pool import browser_slot

@@ -1,0 +1,34 @@
+# Privileged / account-scoped paths probed with the authenticated session.
+# A 2xx here becomes injection surface (mass assignment, IDOR, excessive
+# exposure) that anonymous crawling can never reach.
+/api/user
+/api/account
+/api/me
+/api/profile
+/api/settings
+/api/orders
+/api/invoices
+/api/wallet
+/api/transactions
+/api/notifications
+/api/messages
+/api/addresses
+/api/cards
+/api/payment-methods
+/api/subscriptions
+/api/admin
+/api/dashboard
+/api/v1/user
+/api/v1/account
+/api/v2/user
+/account
+/profile
+/settings
+/dashboard
+/admin
+/user
+/orders
+/wallet
+/notifications
+/billing
+/messages
