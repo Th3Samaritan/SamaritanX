@@ -330,13 +330,17 @@ The completed implementation does not provide the following capabilities. They r
 - Exhaustive branch coverage for all scanners or all Nuclei templates.
 - Automatic publication or external report submission.
 
-Further improvements should be driven by measured failures and observed coverage gaps. The immediate next implementation task is the catalog startup investigation in section 8.
+Further improvements should be driven by measured failures and observed
+coverage gaps. The catalog startup investigation (section 8) is resolved and
+the additional improvement roadmap (section 11) has been delivered; see
+§11.13–§11.16 for per-milestone evidence.
 
 
 ## 11. Additional improvement roadmap
 
 Status update (2026-09-12): **Milestone 1 is implemented** — the four P1 items
-below are done (see §11.13 for delivery evidence). P2/P3 items remain proposed.
+below are done (see §11.13 for delivery evidence). The P2/P3 items were
+subsequently delivered as well (see the 2026-09-14 updates below).
 
 Status update (2026-09-14): **Milestone 2 and Milestone 3 are implemented** —
 see §11.14 (circuit breakers, resumable template batches, database recovery)
