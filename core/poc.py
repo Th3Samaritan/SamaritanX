@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -83,7 +84,8 @@ def proof_record(*, verified: bool, method: str, url: str, request: str,
     response it produced, and a plain-English statement of why that proves the
     bug — not a curl string that reproduces nothing."""
     rec: dict[str, Any] = {
-        "verified": verified, "method": method, "url": url, "request": request,
+      "verified": verified, "method": method, "url": url, "request": request,
+        "captured_at": time.time(),
         "rationale": rationale,
     }
     if status is not None:

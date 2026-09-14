@@ -56,12 +56,14 @@ class ScreenshotAgent(BaseAgent):
                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
             except Exception:
                 return
-            context = await browser.new_context(
+            context = await browser.new_context(service_workers="block",
                 ignore_https_errors=True,
                 viewport={"width": 1280, "height": 720},
                 # inject auth cookies + headers from session
                 extra_http_headers=(ctx.session.headers if ctx.session else {}) or {},
             )
+            from core.transport import guard_browser
+            await guard_browser(context)
             if ctx.session and ctx.session.cookies:
                 from urllib.parse import urlparse
                 cookies = []

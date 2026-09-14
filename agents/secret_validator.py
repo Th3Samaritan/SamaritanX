@@ -49,6 +49,7 @@ STRIPE_RE = re.compile(r"sk_live_[0-9a-zA-Z]{24,}")
 SENDGRID_RE = re.compile(r"SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}")
 MAILGUN_RE = re.compile(r"key-[0-9a-f]{32}")
 CF_API_RE = re.compile(r"[A-Za-z0-9_-]{37,40}")
+GCP_KEY_RE = re.compile(r"AIza[0-9A-Za-z_-]{35}")
 NPM_RE = re.compile(r"npm_[A-Za-z0-9]{36}")
 DO_RE = re.compile(r"dop_v1_[A-Za-z0-9]{64}")
 
@@ -233,6 +234,28 @@ class SecretValidatorAgent(BaseAgent):
             if _transport_failed(ev):
                 return "mailgun", None, {"reason": "transport_error"}
             return "mailgun", ev.status == 200, {"status": ev.status}
+
+        # GCP API keys: Google rejects invalid keys with reason `keyInvalid`,
+        # while a VALID key (even one not enabled for this API) answers with
+        # accessNotConfigured / billing / quota errors — the error-message
+        # difference is a free, zero-cost validity oracle.
+        m = GCP_KEY_RE.search(blob)
+        if m:
+            ev = await ctx.http.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": m.group(0), "q": "sx"},
+                bypass_scope=True,
+            )
+            if _transport_failed(ev):
+                return "gcp_api_key", None, {"reason": "transport_error"}
+            body = (ev.response_body or "").lower()
+            if "keyinvalid" in body or "badrequest" in body or "apikeynotfound" in body:
+                return "gcp_api_key", False, {"reason": "keyInvalid"}
+            if "accessnotconfigured" in body or "billing" in body or \
+                    "dailylimitexceeded" in body or "usagelimits" in body or \
+                    "forbidden" in body:
+                return "gcp_api_key", True, {"reason": "key exists (API not enabled / quota)"}
+            return "gcp_api_key", None, {"reason": "indeterminate", "body": body[:160]}
 
         # Cloudflare tokens carry no distinctive prefix, so only attempt when
         # the evidence itself mentions cloudflare

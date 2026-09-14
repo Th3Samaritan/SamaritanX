@@ -23,7 +23,7 @@ import asyncio
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlparse
 
-from core.browser_pool import browser_slot
+from core.browser_pool import browser_slot, launch_chromium
 from core.utils import host_of, random_token
 
 if TYPE_CHECKING:
@@ -36,8 +36,11 @@ SEED_PATHS = ("/", "/home", "/profile", "/dashboard", "/posts", "/comments",
 JS_HOOK = """
 window.__sx_hits__ = [];
 const tag = (k, v) => window.__sx_hits__.push({k, v: String(v).slice(0, 200)});
-const _alert = window.alert;
-window.alert = (m) => { tag('alert', m); try { return _alert(m); } catch(e) {} };
+// tag only — never invoke the native dialog: a real alert() blocks headless
+// navigation until Playwright handles it
+window.alert = (m) => { tag('alert', m); };
+window.confirm = (m) => { tag('confirm', m); return false; };
+window.prompt  = (m) => { tag('prompt', m); return null; };
 const _eval = window.eval;
 window.eval = (s) => { tag('eval', s); try { return _eval(s); } catch(e) {} };
 const ihDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
@@ -137,56 +140,54 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
     try:
         async with browser_slot(ctx.config), async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = await launch_chromium(pw, headless=True, args=["--no-sandbox"])
+            context = await browser.new_context(service_workers="block",
+                ignore_https_errors=True,
+                extra_http_headers=(ctx.session.headers if ctx.session else {}) or {},
+            )
+            from core.transport import guard_browser
+            await guard_browser(context)
+            if ctx.session and ctx.session.cookies:
+                from urllib.parse import urlparse as _u
+                cookies = []
+                for u in reflectors:
+                    domain = _u(u).hostname
+                    if not domain:
+                        continue
+                    for k, v in ctx.session.cookies.items():
+                        cookies.append({"name": k, "value": v, "domain": domain, "path": "/"})
+                if cookies:
+                    try:
+                        await context.add_cookies(cookies)
+                    except Exception:
+                        pass
+
+            for u in reflectors[:8]:
+                page = await context.new_page()
+                await page.add_init_script(JS_HOOK)
+                try:
+                    await page.goto(u, wait_until="networkidle", timeout=15000)
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    await page.close(); continue
+                try:
+                    hits = await page.evaluate("window.__sx_hits__ || []")
+                except Exception:
+                    hits = []
+                await page.close()
+                relevant = [h for h in hits if token in (h.get("v") or "")]
+                if relevant:
+                    confirmed_url = u
+                    confirmed_sinks = sorted({h["k"] for h in relevant})
+                    break
+            await browser.close()
     except Exception:
-        # browser unavailable (no chromium build / sandbox) — never swallow the
-        # reflection evidence: still report the stored-reflection candidates
+        # browser unavailable (no chromium build / sandbox) or verification
+        # failure — never swallow the reflection evidence: still report the
+        # stored-reflection candidates
         _reflection_candidates("Browser unavailable for execution verification "
                                "(chromium missing).")
         return findings
-
-    try:
-        context = await browser.new_context(
-            ignore_https_errors=True,
-            extra_http_headers=(ctx.session.headers if ctx.session else {}) or {},
-        )
-        if ctx.session and ctx.session.cookies:
-            from urllib.parse import urlparse as _u
-            cookies = []
-            for u in reflectors:
-                domain = _u(u).hostname
-                if not domain:
-                    continue
-                for k, v in ctx.session.cookies.items():
-                    cookies.append({"name": k, "value": v, "domain": domain, "path": "/"})
-            if cookies:
-                try:
-                    await context.add_cookies(cookies)
-                except Exception:
-                    pass
-
-        for u in reflectors[:8]:
-            page = await context.new_page()
-            await page.add_init_script(JS_HOOK)
-            try:
-                await page.goto(u, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(1.0)
-            except Exception:
-                await page.close(); continue
-            try:
-                hits = await page.evaluate("window.__sx_hits__ || []")
-            except Exception:
-                hits = []
-            await page.close()
-            relevant = [h for h in hits if token in (h.get("v") or "")]
-            if relevant:
-                confirmed_url = u
-                confirmed_sinks = sorted({h["k"] for h in relevant})
-                break
-        await browser.close()
-    except Exception:
-        # any browser failure still leaves the reflection evidence reportable
-        pass
 
     if confirmed_url:
         findings.append({

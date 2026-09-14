@@ -82,8 +82,11 @@ scan:
   task_timeout_seconds: 60          # per-scanner task cap (snappy)
   long_phase_timeout_seconds: 600   # recon/crawl/discover budget (fan-out phases)
   deadline_seconds: 0               # 0 = no global wall-clock limit
-  incremental: true                 # skip re-scanning endpoints whose content hash
-                                    # hasn't changed since the last completed scan
+  incremental: false                # opt-in reuse of successful execution contexts
+  recheck_after_seconds: 86400
+  scanner_timeout_seconds: 180
+  scanner_retries: 1                 # disabled for mutation methods/aggressive scans
+  scanner_request_budget: 250        # shared HTTP attempts per scanner, including retries
   revalidate_cap: 150               # max findings re-fired per run (bounded phase2)
 
 recon:
@@ -198,6 +201,7 @@ notify:
     chat_id: "{ENV:SX_TG_CHAT_ID}"
 
 reporting:
+  evidence_max_age_seconds: 86400
   format: ["markdown", "pdf"]
   include_walkthrough: true
   cvss_baseline: 5.0
@@ -222,3 +226,41 @@ hackerone:
   username: "th3Samaritan"      # required by the HackerOne API (User-Agent)
   program: ""                   # optional program handle to attach drafts to
   weak_only: false              # only draft non-critical findings for review
+
+# Explicit expectations are required before shared identity markers prove BOLA.
+transport:
+  operation_budget: 100000           # HTTP hops, browser requests, raw connections/writes
+  strict_mutations: false            # when true: unclassified state-changing requests
+                                     # require safety.aggressive (auth login flows stay
+                                     # explicitly sanctioned)
+  circuit_breaker:
+    enabled: true                    # per-origin breakers: failing hosts can't starve healthy ones
+    failure_threshold: 5             # failures inside window_s that trip the breaker
+    window_s: 60
+    cooldown_s: 30                   # open duration before half-open recovery probes
+    half_open_probes: 2              # max read-only recovery probes
+    latency_high_s: 30               # one response this slow also counts as a failure
+
+authorization:
+  workflows: []
+  # - action: approve
+  #   roles: [reviewer]
+  #   from_states: [pending]
+  #   to_states: [approved]
+  #   owner_only: true
+  objects: []
+  # - url: https://owned.example/api/objects/123
+  #   owner: alice
+  #   tenant: tenant-a
+  #   role: member
+  #   denied_viewers: [bob]
+  #   private_markers: ["unique-fixture-marker"]
+
+# Cooperative proxy routing, not OS-level egress isolation. Trusted binaries only.
+external_tools:
+  enabled: true
+  binary_dir: ./workspace/tools
+  nuclei_templates: ./workspace/tools/nuclei-templates/http
+  nuclei_group_timeout: 120   # per top-level template directory (plan section 8)
+  request_budget: 250
+  verify_tls: true

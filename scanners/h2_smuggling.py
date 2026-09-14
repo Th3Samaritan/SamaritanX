@@ -35,6 +35,8 @@ frame. Honors scope and the per-host token bucket.
 """
 from __future__ import annotations
 
+from core.transport import open_connection as managed_open_connection
+
 import asyncio
 import re
 import secrets
@@ -92,7 +94,7 @@ async def _h2_open(host: str, port: int, use_tls: bool, bucket=None):
         ctx_ssl = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx_ssl,
+            managed_open_connection(host, port, ssl=ctx_ssl,
                                     server_hostname=host if use_tls else None),
             timeout=5.0,
         )

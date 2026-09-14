@@ -104,7 +104,7 @@ class TestCorrelation(unittest.TestCase):
     def test_prefer_verified_representative(self):
         unproven = {"category": "cors", "url": "https://x.test/a", "confidence": 0.9}
         proven = {"category": "cors", "url": "https://x.test/b",
-                  "metadata": {"poc": {"verified": True, "response_status": 200}}}
+                  "metadata": {"poc": {"verified": True, "response_excerpt": "captured CORS response headers"}}}
         out = deduplicate([unproven, proven])
         self.assertEqual(len(out), 1)
         self.assertIs(out[0], proven)

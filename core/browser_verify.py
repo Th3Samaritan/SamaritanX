@@ -82,9 +82,13 @@ async def verify_xss(cfg: dict[str, Any], url: str, *, marker: str,
 
     try:
         async with browser_slot(cfg), async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True,
-                                               args=["--no-sandbox", "--disable-dev-shm-usage"])
-            page = await browser.new_page()
+            from .browser_pool import launch_chromium
+            browser = await launch_chromium(pw, headless=True,
+                                            args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(service_workers="block")
+            from core.transport import guard_browser
+            await guard_browser(context)
+            page = await context.new_page()
             await page.add_init_script(_HOOK)
 
             def _on_dialog(d):

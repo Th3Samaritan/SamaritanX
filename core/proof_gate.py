@@ -10,7 +10,7 @@ can look at and agree the bug is real:
     produced by the revalidators when they re-fire a finding and it reproduces),
   * an out-of-band callback that fired during the scan (blind SSRF/RCE/XXE),
   * a provider-validated secret,
-  * a dangling-CNAME + service-fingerprint takeover,
+  * a takeover with captured verification beyond a service fingerprint,
   * a chain whose escalation step was actively reproduced.
 
 Everything else is a *candidate*: possibly real, but unproven, so it is
@@ -36,7 +36,7 @@ _HARDPROOF_DETECTIONS = {
     "client_proto",        # Object.prototype mutated in a real browser
 }
 
-# Categories whose finding is a captured hard artifact by construction.
+# Fingerprint-only categories still need a captured verification record.
 _HARDPROOF_CATEGORIES = {
     "takeover",            # dangling CNAME + live service fingerprint
     "subdomain_takeover",
@@ -49,13 +49,11 @@ def _poc_has_response(poc: dict[str, Any]) -> bool:
     A verified proof must show what the server *did*, not just what we sent.
     Timing `samples` alone are not a response — a hang proves nothing on its own
     (an origin waiting for a promised Content-Length body hangs identically), so
-    they only count when paired with a captured response body/status.
+    they only count when paired with a captured response content.
     """
     if not isinstance(poc, dict):
         return False
     if poc.get("response_excerpt"):
-        return True
-    if poc.get("response_status") is not None:
         return True
     # timing samples count only if a sample also captured a response artifact
     samples = poc.get("samples")
@@ -74,8 +72,22 @@ def poc_status(finding: dict[str, Any]) -> tuple[str, str]:
     means it does not (yet) — quarantine it, don't report it.
     """
     meta = finding.get("metadata") or {}
+    if not isinstance(meta, dict):
+        return "candidate", "malformed proof metadata"
+    if meta.get("lifecycle_state") == "fixed":
+        return "candidate", "marked fixed by operator; awaiting a reproduced regression"
+    if meta.get("evidence_integrity") in {"mismatch", "missing"}:
+        return "candidate", "evidence bundle failed integrity verification"
+    if meta.get("evidence_expired") is True:
+        return "candidate", "evidence expired; a fresh retest is required"
+    if meta.get("verification_outcome") == "inconclusive":
+        detection = str(meta.get("detection", ""))
+        if detection not in {"oob", "oob-header", "client_proto"} and not meta.get("validator_valid"):
+            return "candidate", "fresh verification was inconclusive"
     cat = (finding.get("category") or "").lower()
     detection = str(meta.get("detection") or "").lower()
+    if detection == "identity_matrix" and meta.get("authorization_expected_denial") is not True:
+        return "candidate", "object ownership and expected denial have not been established"
 
     # 0) revalidation explicitly dropped it → definitely a candidate (likely FP),
     # regardless of any scan-time proof artifact it may still carry
@@ -95,17 +107,18 @@ def poc_status(finding: dict[str, Any]) -> tuple[str, str]:
 
     # 3) out-of-band / in-band hard proof captured at scan time
     if detection in _HARDPROOF_DETECTIONS:
-        if finding.get("evidence") or finding.get("response") or finding.get("request"):
+        if (detection in {"marker", "ssti-product"} and finding.get("response")
+                and meta.get("baseline_checked") is True):
             return "verified", f"hard proof captured at scan time ({detection})"
         return "candidate", f"{detection} claimed but no artifact captured"
 
-    # 4) categories that are a hard artifact by construction
+    # 4) a provider error page alone does not establish claimability
     if cat in _HARDPROOF_CATEGORIES:
-        return "verified", "dangling CNAME + service fingerprint"
+        return "candidate", "service fingerprint requires captured ownership verification"
 
     # 5) a chain is only proof if its escalation step was actively reproduced
     if cat == "chain":
-        if meta.get("verified") is True:
+        if meta.get("verified") is True and finding.get("response"):
             return "verified", "chain escalation step reproduced"
         return "candidate", "chain components co-located but escalation not reproduced"
 

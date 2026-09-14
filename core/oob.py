@@ -181,7 +181,7 @@ def build_oob_finding(template: dict, events: list[dict]) -> dict:
             excerpt = str(e["raw-request"])[:1000]
             break
     poc = proof_record(
-        verified=True, method=template.get("_method", "GET"),
+        verified=bool(events), method=template.get("_method", "GET"),
         url=template.get("url", ""),
         request=template.get("_request") or template.get("request")
         or f"payload referencing {template.get('_oob_ref','the OOB host')}",
@@ -201,6 +201,7 @@ def build_oob_finding(template: dict, events: list[dict]) -> dict:
     meta["detection"] = template.get("_detection", "oob")
     meta["poc"] = poc
     meta["oob_interactions"] = len(events)
+    meta["oob_reference"] = template.get("_oob_ref", "")
     return f
 
 

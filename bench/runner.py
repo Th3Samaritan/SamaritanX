@@ -67,6 +67,7 @@ def score_existing(answers_path: Path, workspace: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bench.runner")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("inventory", help="show paired-fixture coverage and gaps by scanner")
 
     s = sub.add_parser("score", help="score existing workspace reports")
     s.add_argument("--answers", required=True, type=Path)
@@ -81,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="per-target scan deadline in seconds")
 
     args = ap.parse_args(argv)
+    if args.cmd == "inventory":
+        from .coverage import inventory
+        print(json.dumps(inventory(), indent=2))
+        return 0
 
     if args.cmd == "scan":
         try:

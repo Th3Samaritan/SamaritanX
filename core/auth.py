@@ -74,6 +74,20 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+async def _sanctioned_request(http, method, url, **kwargs):
+    """Perform a login-flow request that is EXPLICITLY classified as a
+    sanctioned mutation — strict mutation policy never blocks authentication."""
+    try:
+        from .http_client import _sanctioned_var
+        tok = _sanctioned_var.set(True)
+        try:
+            return await http.request(method, url, **kwargs)
+        finally:
+            _sanctioned_var.reset(tok)
+    except ImportError:
+        return await http.request(method, url, **kwargs)
+
+
 def _dotted_get(obj: Any, path: str) -> Any:
     cur = obj
     for part in path.split("."):
@@ -96,6 +110,9 @@ class SessionStore:
         # SameSite attribute observed on the session cookies at login
         # ("strict" / "lax" / "none" / None = not observed)
         self.same_site: str | None = None
+        # origin the credentials belong to (from the login URL); requests to
+        # other origins must not carry them
+        self.origin: str | None = None
         self._refreshed_at: float = 0.0
         self.refresh_every: int = 0
         self._refresh_fn = None
@@ -151,6 +168,7 @@ def save_session(store: SessionStore, path: str | Path) -> bool:
             "cookies": dict(store.cookies),
             "headers": dict(store.headers),
             "same_site": getattr(store, "same_site", None),
+            "origin": getattr(store, "origin", None),
             "saved_at": int(time.time()),
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -171,6 +189,7 @@ def load_persisted_session(path: str | Path) -> SessionStore | None:
         store.cookies.update(data.get("cookies") or {})
         store.headers.update(data.get("headers") or {})
         store.same_site = data.get("same_site")
+        store.origin = data.get("origin")
         return store
     except Exception:
         return None
@@ -196,6 +215,15 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
     kind = (recipe.get("type") or "static").lower()
     store.label = recipe.get("label") or kind
     store.refresh_every = int(recipe.get("refresh_every") or 0)
+    # credential origin boundary: credentials from a login flow belong to the
+    # login host only
+    login_url = recipe.get("login_url")
+    if login_url:
+        from urllib.parse import urlparse as _up
+        try:
+            store.origin = (_up(login_url).hostname or "").lower() or None
+        except Exception:
+            store.origin = None
 
     if kind == "static":
         store.cookies.update(recipe.get("cookies") or {})
@@ -209,7 +237,7 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
             # don't follow the login redirect: the Set-Cookie / SameSite
             # attributes live on the login response itself, and following the
             # 302 would discard them
-            ev = await http.request(method, url, data=fields, headers={
+            ev = await _sanctioned_request(http, method, url, data=fields, headers={
                 "Content-Type": "application/x-www-form-urlencoded",
             }, allow_redirects=False)
             indicator = recipe.get("success_indicator") or ""
@@ -256,9 +284,9 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
 
     elif kind == "bearer_json":
         async def _refresh():
-            ev = await http.request("POST", recipe["login_url"],
-                                    json_body=recipe.get("json") or {},
-                                    headers={"Content-Type": "application/json"})
+            ev = await _sanctioned_request(http, "POST", recipe["login_url"],
+                                           json_body=recipe.get("json") or {},
+                                           headers={"Content-Type": "application/json"})
             data = json.loads(ev.response_body or "{}")
             token = _dotted_get(data, recipe["token_path"])
             if not token:
@@ -317,9 +345,9 @@ async def load_session(recipe_path: str | Path | None, http) -> SessionStore:
             from urllib.parse import urlparse, urlunparse
             _p = urlparse(url)
             endpoint = urlunparse((_p.scheme, _p.netloc, "/livewire/update", "", "", ""))
-            ev = await http.request("POST", endpoint,
-                                    json_body=payload, headers=headers,
-                                    allow_redirects=False)
+            ev = await _sanctioned_request(http, "POST", endpoint,
+                                           json_body=payload, headers=headers,
+                                           allow_redirects=False)
             # follow a redirect effect when the framework emits one
             try:
                 data = json.loads(ev.response_body or "{}")

@@ -18,6 +18,7 @@ runs (no `--aggressive` needed). A summary lands in
 from __future__ import annotations
 
 import json
+import time
 import re
 from typing import TYPE_CHECKING, Optional
 
@@ -451,7 +452,19 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
             reason = _SKIP_REASON.get(cat, "no single-shot re-check")
         else:
             try:
-                result = await checker(ctx, f)
+                from core.verification import fresh_check
+                from core.evidence import capture, capture_finding
+                token = capture.set([])
+                try:
+                    if _re_method(f) not in {"GET", "HEAD"} and not ctx.config.get("safety", {}).get("aggressive"):
+                        result = None
+                    else:
+                        outcomes = [await fresh_check(ctx, f, checker) for _ in range(2)]
+                        result = outcomes[0] if outcomes[0] == outcomes[1] else None
+                    if getattr(ctx, "workspace", None) is not None:
+                        f.setdefault("metadata", {})["evidence_bundle"] = capture_finding(ctx, f)
+                finally:
+                    capture.reset(token)
             except Exception as exc:  # noqa: BLE001
                 result = None
                 reason = f"recheck error: {exc}"
@@ -464,11 +477,14 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
             reproduced += 1
             new_conf = round(min(1.0, conf + 0.1), 2)
             meta["revalidated"] = True
+            meta["verified_at"] = time.time()
+            meta["verification_outcome"] = "reproduced"
             ctx.memory.update_finding(fid, confidence=new_conf, metadata=meta)
         elif result is False:
             dropped += 1
             new_conf = round(conf * 0.4, 2)
             meta["revalidated"] = False
+            meta["verification_outcome"] = "not_reproduced"
             meta["revalidation_note"] = "did NOT reproduce on fresh re-test — likely false positive"
             # a scan-time poc that failed the fresh re-test must not keep the
             # finding "verified" — clear it so the proof gate can't honor it
@@ -478,7 +494,12 @@ async def revalidate(ctx: "Context", findings: list[dict]) -> dict:
         else:
             skipped += 1
             meta["revalidation"] = f"skipped: {reason}"
+            meta["verification_outcome"] = "inconclusive"
             ctx.memory.update_finding(fid, metadata=meta)
+        if hasattr(ctx.memory, "set_finding_state") and fid:
+            prior = ctx.memory.finding_states(ctx.target_slug).get(fid)
+            state = ("reopened" if prior in {"fixed", "reopened"} else "confirmed") if result is True else "inconclusive"
+            ctx.memory.set_finding_state(fid, state, meta.get("verification_outcome", "recheck skipped"))
         details.append({"id": fid, "category": cat,
                         "result": {True: "reproduced", False: "dropped"}.get(result, "skipped"),
                         "confidence_label": conf_label(new_conf)})

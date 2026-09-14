@@ -30,6 +30,8 @@ mis-targeted smuggling can DoS shared infrastructure.
 """
 from __future__ import annotations
 
+from core.transport import open_connection as managed_open_connection
+
 import asyncio
 import re
 import ssl
@@ -72,7 +74,7 @@ async def _raw_send(host: str, port: int, payload: bytes, use_tls: bool,
     start = time.perf_counter()
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx_ssl, server_hostname=host if use_tls else None),
+            managed_open_connection(host, port, ssl=ctx_ssl, server_hostname=host if use_tls else None),
             timeout=5.0,
         )
         writer.write(payload)
@@ -166,7 +168,7 @@ async def _desync_capture(host: str, port: int, path: str, kind: str,
         ctx_ssl.verify_mode = ssl.CERT_NONE
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx_ssl,
+            managed_open_connection(host, port, ssl=ctx_ssl,
                                     server_hostname=host if use_tls else None),
             timeout=5.0)
     except Exception:

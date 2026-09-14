@@ -45,6 +45,11 @@ class BaseAgent(ABC):
         except Exception:
             pass
         fid = ctx.memory.record_finding(finding)
+        if getattr(ctx, "workspace", None) is not None:
+            from core.evidence import capture_finding
+            finding["_id"] = fid
+            finding.setdefault("metadata", {})["evidence_bundle"] = capture_finding(ctx, finding)
+            ctx.memory.update_finding(fid, metadata=finding["metadata"])
         ctx.dashboard.add_count("findings")
         sev = finding.get("severity", Severity.INFO).lower()
         if sev in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO):

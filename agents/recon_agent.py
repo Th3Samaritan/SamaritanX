@@ -10,6 +10,10 @@ Pipeline:
 """
 from __future__ import annotations
 
+from core.transport import external_tool_path, create_subprocess_exec as managed_create_subprocess_exec
+
+from core.transport import open_connection as managed_open_connection
+
 import asyncio
 import json
 import shutil
@@ -142,11 +146,13 @@ class ReconAgent(BaseAgent):
 
         # subdomain permutations (alt-dns style) — prefixes/suffixes/number
         # swaps seeded from every discovered name, capped and re-resolved
+        perm_names: set[str] = set()
         if ctx.config.get("recon", {}).get("permutations", True):
             perms = self._permutate(root, subs)
             if perms:
                 ctx.dashboard.event("info", f"recon: generated {len(perms)} permutation candidate(s)")
                 subs.update(perms)
+                perm_names = set(perms)
 
         # persist the full candidate list + record assets
         (ctx.workspace / "recon" / "subdomains.txt").write_text(
@@ -167,12 +173,26 @@ class ReconAgent(BaseAgent):
         ctx.dashboard.event("info", f"recon: {len(subs)} candidates — resolving DNS")
         resolvable = await self._resolve_hosts(sorted(subs), ctx)
         if wildcard_ips:
+            # GUESSED names (permutations) resolving to a wildcard IP are
+            # phantom — drop them. Evidence-based names (crt.sh/passive) and
+            # brute words stay: on wildcard-hosting platforms (Netlify/Vercel)
+            # they can be real deployments sharing the wildcard IP.
             before = len(resolvable)
             resolvable = [h for h in resolvable
-                          if await self._resolves_to(h, ctx) not in wildcard_ips]
-            if before != len(resolvable):
+                          if h not in perm_names
+                          or await self._resolves_to(h, ctx) not in wildcard_ips]
+            dropped = before - len(resolvable)
+            if dropped:
                 ctx.dashboard.event("info",
-                    f"recon: dropped {before - len(resolvable)} wildcard-resolving host(s)")
+                    f"recon: dropped {dropped} wildcard permutation phantom(s)")
+            # bound the remaining wildcard-resolving hosts so the probe sweep
+            # can't balloon on a fully-wildcarded zone
+            wild = [h for h in resolvable
+                    if await self._resolves_to(h, ctx) in wildcard_ips]
+            if len(wild) > 20:
+                keep = set(wild[:20])
+                resolvable = [h for h in resolvable
+                              if h not in wild or h in keep]
         max_probe = int(ctx.config.get("recon", {}).get("max_probe_hosts", 750))
         to_probe = [h for h in resolvable if h not in emitted][:max_probe]
         ctx.dashboard.task("subdomain probe", len(to_probe))
@@ -260,17 +280,19 @@ class ReconAgent(BaseAgent):
 
     # ---------- collectors ----------
     async def _run_subfinder(self, root: str, ctx: "Context") -> set[str]:
-        if not shutil.which("subfinder") or not ctx.config.get("recon", {}).get("subfinder", True):
+        if not external_tool_path("subfinder", ctx.config) or not ctx.config.get("recon", {}).get("subfinder", True):
             return set()
         timeout = float(ctx.config.get("recon", {}).get("subfinder_timeout", 120))
         ctx.dashboard.event("info", f"recon: invoking subfinder (≤{timeout:.0f}s)")
         proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await managed_create_subprocess_exec(
                 "subfinder", "-silent", "-d", root,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                return set()
             return {l.strip() for l in out.decode("utf-8", "ignore").splitlines() if l.strip()}
         except Exception as exc:
             ctx.dashboard.event("err", f"subfinder failed: {exc}")
@@ -278,17 +300,19 @@ class ReconAgent(BaseAgent):
             return set()
 
     async def _run_amass(self, root: str, ctx: "Context") -> set[str]:
-        if not shutil.which("amass") or not ctx.config.get("recon", {}).get("amass", True):
+        if not external_tool_path("amass", ctx.config) or not ctx.config.get("recon", {}).get("amass", True):
             return set()
         timeout = int(ctx.config.get("recon", {}).get("amass_timeout", 180))
         ctx.dashboard.event("info", f"recon: invoking amass (≤{timeout}s)")
         proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await managed_create_subprocess_exec(
                 "amass", "enum", "-passive", "-norecursive", "-d", root,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                return set()
             return {l.strip() for l in out.decode("utf-8", "ignore").splitlines() if l.strip()}
         except Exception as exc:
             ctx.dashboard.event("err", f"amass timed out/failed: {exc}")
@@ -700,7 +724,7 @@ class ReconAgent(BaseAgent):
         async def probe(port: int, label: str) -> None:
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=2.0)
+                    managed_open_connection(host, port), timeout=2.0)
             except Exception:
                 return
             banner = ""

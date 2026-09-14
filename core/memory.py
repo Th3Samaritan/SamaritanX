@@ -16,6 +16,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+# bump when the schema changes; recorded in run manifests for reproducibility
+SCHEMA_VERSION = 8
+
 
 def _fingerprint(finding: dict[str, Any]) -> str:
     """Stable hash so the same bug isn't recorded twice on re-runs."""
@@ -31,6 +34,34 @@ def _fingerprint(finding: dict[str, Any]) -> str:
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS execution_contexts (
+    target TEXT, execution_key TEXT, context TEXT, PRIMARY KEY(target,execution_key)
+);
+CREATE TABLE IF NOT EXISTS finding_lifecycle (
+    finding_id INTEGER PRIMARY KEY, state TEXT NOT NULL, updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS finding_history (
+    id INTEGER PRIMARY KEY, finding_id INTEGER, state TEXT, snapshot TEXT, updated REAL
+);
+CREATE TABLE IF NOT EXISTS scanner_tasks (
+    target TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (target, task_key)
+);
+CREATE TABLE IF NOT EXISTS scanner_executions (
+    target TEXT NOT NULL,
+    execution_key TEXT NOT NULL,
+    scanner TEXT NOT NULL,
+    url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    requests INTEGER NOT NULL,
+    updated REAL NOT NULL,
+    PRIMARY KEY (target, execution_key)
+);
 CREATE TABLE IF NOT EXISTS targets (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     slug        TEXT UNIQUE NOT NULL,
@@ -109,6 +140,86 @@ CREATE TABLE IF NOT EXISTS url_fingerprints (
 
 
 class Memory:
+    def record_execution_context(self, target, key, context):
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO execution_contexts VALUES (?,?,?)", (target, key, json.dumps(context)))
+
+    def set_finding_state(self, finding_id, state, note=""):
+        if state not in {"new", "confirmed", "fixed", "reopened", "inconclusive"}:
+            raise ValueError("invalid finding state")
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
+            if not row:
+                raise ValueError("finding not found")
+            conn.execute("INSERT OR REPLACE INTO finding_lifecycle VALUES (?,?,?)", (finding_id, state, time.time()))
+            conn.execute("INSERT INTO finding_history(finding_id,state,snapshot,updated) VALUES (?,?,?,?)",
+                         (finding_id, state, json.dumps({"finding": dict(row), "note": note}), time.time()))
+
+    def finding_states(self, target):
+        with self._connect() as conn:
+            return {r["finding_id"]: r["state"] for r in conn.execute(
+                "SELECT l.finding_id,l.state FROM finding_lifecycle l JOIN findings f ON f.id=l.finding_id WHERE f.target=?", (target,))}
+
+    def finding_history(self, finding_id):
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT state,snapshot,updated FROM finding_history WHERE finding_id=? ORDER BY id", (finding_id,))]
+
+    def remember_scan_task(self, target, kind, payload):
+        encoded = json.dumps(payload, sort_keys=True)
+        key = hashlib.sha256((kind + encoded).encode()).hexdigest()
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO scanner_tasks VALUES (?,?,?,?)",
+                         (target, key, kind, encoded))
+
+    def remembered_scan_tasks(self, target):
+        with self._connect() as conn:
+            rows = conn.execute("SELECT kind,payload FROM scanner_tasks WHERE target=?", (target,)).fetchall()
+        return [(row["kind"], json.loads(row["payload"])) for row in rows]
+
+    def record_execution(self, target, key, scanner, url, status, reason="", attempts=0,
+                         requests=0, *, run_id="", exit_code=None, phase="",
+                         startup_s=None, duration_s=None, diagnostics=""):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO scanner_executions "
+                "(target, execution_key, scanner, url, status, reason, attempts, requests, "
+                " updated, run_id, exit_code, phase, startup_s, duration_s, diagnostics) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (target, key, scanner, url, status, reason, attempts, requests, time.time(),
+                 run_id, exit_code, phase, startup_s, duration_s,
+                 (diagnostics or "")[:2000]))
+
+    def execution_summary(self, target):
+        """Attempted / completed / incomplete counts for coverage reporting."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM scanner_executions WHERE target=? "
+                "GROUP BY status", (target,)).fetchall()
+        counts = {r["status"]: r[1] for r in rows}
+        total = sum(counts.values())
+        completed = counts.get("completed", 0)
+        return {"attempted": total, "completed": completed,
+                "incomplete": total - completed, "by_status": counts}
+
+    def execution_reusable(self, target, key, max_age):
+        with self._connect() as conn:
+            row = conn.execute("SELECT status, updated FROM scanner_executions WHERE target=? AND execution_key=?",
+                               (target, key)).fetchone()
+        return bool(row and row["status"] == "completed" and time.time() - row["updated"] < max_age)
+
+    def execution_coverage(self, target):
+        with self._connect() as conn:
+            rows = conn.execute("SELECT e.scanner,e.url,e.status,e.reason,e.attempts,e.requests,e.updated,c.context FROM scanner_executions e LEFT JOIN execution_contexts c ON e.target=c.target AND e.execution_key=c.execution_key WHERE e.target=? ORDER BY e.updated DESC",
+                                (target,)).fetchall()
+        records = [dict(r) for r in rows]
+        for row in records:
+            row["context"] = json.loads(row["context"]) if row["context"] else {}
+        counts = {}
+        for row in records:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        return {"counts": counts, "records": records,
+                "scope": "Latest persisted scanner executions by context; not a complete inventory of undiscovered surface."}
+
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,6 +230,31 @@ class Memory:
                 conn.execute("ALTER TABLE findings ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5")
             except Exception:
                 pass  # column already exists
+            # structured-execution migrations (plan 11.3) — additive, preserving
+            # historical rows
+            for col, decl in (
+                ("run_id", "TEXT NOT NULL DEFAULT ''"),
+                ("exit_code", "INTEGER"),
+                ("phase", "TEXT NOT NULL DEFAULT ''"),
+                ("startup_s", "REAL"),
+                ("duration_s", "REAL"),
+                ("diagnostics", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE scanner_executions ADD COLUMN {col} {decl}")
+                except Exception:
+                    pass
+        # ordered, transactional migrations with pre-upgrade backup (plan 11.9)
+        try:
+            from .migrations import migrate
+            migrate(self.db_path, target=SCHEMA_VERSION)
+        except Exception as exc:
+            try:
+                from .logger import get_logger
+                get_logger("memory").warning(
+                    "migration failed (old database preserved): %s", exc)
+            except Exception:
+                pass
 
 
     @contextmanager
@@ -127,6 +263,12 @@ class Memory:
         conn.row_factory = sqlite3.Row
         try:
             yield conn
+            if conn.in_transaction:
+                conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -159,11 +301,25 @@ class Memory:
                 finding["confidence"] = 0.5
         fp = _fingerprint(finding)
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT id FROM findings WHERE target=? AND fingerprint=?",
+                "SELECT * FROM findings WHERE target=? AND fingerprint=?",
                 (finding["target"], fp),
             ).fetchone()
             if existing:
+                fid = int(existing["id"])
+                old = conn.execute("SELECT state FROM finding_lifecycle WHERE finding_id=?", (fid,)).fetchone()
+                conn.execute("INSERT INTO finding_history(finding_id,state,snapshot,updated) VALUES (?,?,?,?)",
+                             (fid, old["state"] if old else "new", json.dumps(dict(existing)), time.time()))
+                from core.proof_gate import is_verified
+                state = "reopened" if old and old["state"] == "fixed" and is_verified(finding) else "new"
+                if state == "new" and old:
+                    state = "inconclusive"
+                conn.execute("UPDATE findings SET metadata=?, evidence=?, request=?, response=?, confidence=?, discovered=?, payload=?, severity=?, cvss=? WHERE id=?",
+                             (json.dumps(finding["metadata"]), finding.get("evidence"), finding.get("request"),
+                              finding.get("response"), finding["confidence"], finding["discovered"],
+                              finding.get("payload"), finding.get("severity", "info"), float(finding.get("cvss", 0)), fid))
+                conn.execute("INSERT OR REPLACE INTO finding_lifecycle VALUES (?,?,?)", (fid, state, time.time()))
                 return int(existing["id"])
             cur = conn.execute(
                 """
@@ -191,7 +347,9 @@ class Memory:
                     json.dumps(finding.get("metadata") or {}),
                 ),
             )
-            return int(cur.lastrowid)
+            fid = int(cur.lastrowid)
+            conn.execute("INSERT OR REPLACE INTO finding_lifecycle VALUES (?,'new',?)", (fid, time.time()))
+            return fid
 
     def update_finding(self, finding_id: int, **fields) -> None:
         """Update fields on an existing finding. Thread-safe, uses parameterized queries."""
@@ -205,6 +363,13 @@ class Memory:
         set_clause = ", ".join(f"{k}=?" for k in updates)
         values = list(updates.values()) + [finding_id]
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if set(updates) & {"metadata", "request", "response", "evidence"}:
+                previous = conn.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
+                if previous:
+                    state = conn.execute("SELECT state FROM finding_lifecycle WHERE finding_id=?", (finding_id,)).fetchone()
+                    conn.execute("INSERT INTO finding_history(finding_id,state,snapshot,updated) VALUES (?,?,?,?)",
+                                 (finding_id, state["state"] if state else "new", json.dumps(dict(previous)), time.time()))
             conn.execute(
                 f"UPDATE findings SET {set_clause} WHERE id=?",
                 values,

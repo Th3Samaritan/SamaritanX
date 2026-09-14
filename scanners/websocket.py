@@ -147,8 +147,9 @@ async def _message_injection(ctx: "Context", ws_url: str) -> list[dict]:
         else:
             payloads.append((label, p, None))
 
+    from core.transport import websocket_connect
     try:
-        async with websockets.connect(
+        async with websocket_connect(
             ws_url,
             additional_headers=headers,
             max_size=2 ** 20,

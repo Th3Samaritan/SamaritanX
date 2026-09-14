@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 from urllib.parse import urlparse
@@ -45,6 +47,10 @@ class HttpEvidence:
     elapsed_ms: float
     error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        from core.evidence import observe
+        observe(self)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +148,23 @@ class _ScopeRedirectBlocked(Exception):
         self.reason = reason
 
 
+_bypass_var: "ContextVar[bool]" = ContextVar("sx_bypass_scope", default=False)
+_sanctioned_var: "ContextVar[bool]" = ContextVar("sx_sanctioned_mutation", default=False)
+
+# header names that may carry credentials — never forwarded across origins
+_CRED_HEADER_RE = re.compile(r"(authorization|cookie|proxy-authorization|x-api-key|"
+                             r"api[-_]?key|token|secret|credential)", re.I)
+
+
+def _same_credential_origin(host: str, origin: str | None) -> bool:
+    """True when `host` may receive credentials bound to `origin`."""
+    if not origin:
+        return True
+    host = (host or "").lower().rstrip(".")
+    origin = origin.lower().rstrip(".")
+    return host == origin or host.endswith("." + origin)
+
+
 class StealthHttpClient:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
@@ -197,7 +220,7 @@ class StealthHttpClient:
                 max_redirects=self.max_redirects,
                 proxy=p,
                 http2=True,
-                event_hooks={"response": [self._redirect_scope_guard]},
+                event_hooks={"request": [self._transport_request_guard], "response": [self._redirect_scope_guard]},
             )
             for p in proxies
         ]
@@ -211,6 +234,14 @@ class StealthHttpClient:
         self.dashboard = None  # set by orchestrator
         self.request_count = 0
         self.scoped_out = 0
+        self.circuit_blocked_count = 0
+        self._circuits = None  # CircuitRegistry, built lazily from config
+
+    def _circuit_registry(self):
+        if self._circuits is None:
+            from .circuit import CircuitRegistry
+            self._circuits = CircuitRegistry(self.cfg)
+        return self._circuits
 
     async def __aenter__(self) -> "StealthHttpClient":
         return self
@@ -232,6 +263,28 @@ class StealthHttpClient:
             self.scope = scope
         if dashboard is not None:
             self.dashboard = dashboard
+
+    async def _transport_request_guard(self, request):
+        from core.transport import current_transport
+        from core.scan_execution import request_budget
+        controller = getattr(self, "transport", None) or current_transport.get()
+        bypass = _bypass_var.get()
+        mutating = request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+        sanctioned = _sanctioned_var.get()
+        if controller:
+            # bypass_scope=True calls route through the external-provider
+            # allowlist instead of the target scope policy
+            kind = "external_provider" if bypass else "http"
+            await controller.admit(str(request.url), kind, mutating=mutating,
+                                   sanctioned=sanctioned)
+        else:
+            budget = request_budget.get()
+            if budget is not None:
+                budget.take()
+        if self.scope and not bypass:
+            ok, reason = await asyncio.to_thread(self.scope.allows, str(request.url))
+            if not ok:
+                raise _ScopeRedirectBlocked(str(request.url), reason)
 
     async def _redirect_scope_guard(self, resp) -> None:
         """httpx response hook: abort the redirect chain when the next hop is
@@ -259,17 +312,26 @@ class StealthHttpClient:
             h["User-Agent"] = random.choice(self.user_agents)
         if self.rotate_referer:
             h.setdefault("Referer", f"https://{target_host}/")
-        # session-attached headers (auth, tenant, etc.)
+        # session-attached headers (auth, tenant, etc.) — credential-shaped
+        # ones are withheld when the request crosses the session's origin
         if self.session and self.session.headers:
-            h.update(self.session.headers)
+            hostname = (urlparse(f"//{target_host}").hostname or target_host).lower()
+            if _same_credential_origin(hostname, getattr(self.session, "origin", None)):
+                h.update(self.session.headers)
+            else:
+                h.update({k: v for k, v in self.session.headers.items()
+                          if not _CRED_HEADER_RE.search(k)})
         if extra:
             h.update(extra)
         return h
 
-    def _cookies(self, extra: dict[str, str] | None) -> dict[str, str]:
+    def _cookies(self, extra: dict[str, str] | None, target_host: str) -> dict[str, str]:
         c: dict[str, str] = {}
+        # session cookies never cross the credential origin boundary
         if self.session and self.session.cookies:
-            c.update(self.session.cookies)
+            hostname = (urlparse(f"//{target_host}").hostname or target_host).lower()
+            if _same_credential_origin(hostname, getattr(self.session, "origin", None)):
+                c.update(self.session.cookies)
         if extra:
             c.update(extra)
         return c
@@ -329,6 +391,23 @@ class StealthHttpClient:
 
         host = urlparse(url).netloc or "unknown"
         await self._stealth_pause(host)
+        # circuit breaker: a failing origin must not consume the run
+        circuits = self._circuit_registry()
+        breaker = circuits.breaker(host)
+        if not breaker.allows(method.upper()):
+            self.circuit_blocked_count += 1
+            if self.dashboard:
+                self.dashboard.event("info", f"circuit-open: {host}")
+            from core.transport import current_transport as _ct
+            _ctrl = getattr(self, "transport", None) or _ct.get()
+            if _ctrl:
+                _ctrl.blocked["circuit_open"] = _ctrl.blocked.get("circuit_open", 0) + 1
+            return HttpEvidence(
+                method=method.upper(), url=url, request_headers={},
+                request_body=None, status=0, response_headers={},
+                response_body="", elapsed_ms=0.0,
+                error=f"circuit-open: {host}",
+            )
         if no_session:
             # explicit anonymous request — used by web-cache-deception and the
             # anonymous-admin probe to prove a victim's private response is
@@ -343,7 +422,7 @@ class StealthHttpClient:
             cookies = dict(cookies or {})
         else:
             hdrs = self._build_headers(headers, host)
-            cookies = self._cookies(cookies)
+            cookies = self._cookies(cookies, host)
 
         start = time.perf_counter()
         # round-robin across the proxy pool (single client when no rotation)
@@ -351,18 +430,22 @@ class StealthHttpClient:
         if len(self._clients) > 1:
             self._pool_idx = (self._pool_idx + 1) % len(self._clients)
             client = self._clients[self._pool_idx]
+        _tok = _bypass_var.set(bypass_scope)
         try:
-            resp = await client.request(
-                method.upper(),
-                url,
-                params=params,
-                data=data,
-                json=json_body,
-                files=files,
-                headers=hdrs,
-                cookies=cookies,
-                follow_redirects=allow_redirects,
-            )
+            try:
+                resp = await client.request(
+                    method.upper(),
+                    url,
+                    params=params,
+                    data=data,
+                    json=json_body,
+                    files=files,
+                    headers=hdrs,
+                    cookies=cookies,
+                    follow_redirects=allow_redirects,
+                )
+            finally:
+                _bypass_var.reset(_tok)
             body = ""
             try:
                 body = resp.text
@@ -372,7 +455,8 @@ class StealthHttpClient:
             if self.dashboard:
                 self.dashboard.add_count("requests")
 
-            # 3) reactive backoff on 429 / 503
+            # 3) reactive backoff on 429 / 503 + circuit outcomes
+            elapsed_s = (time.perf_counter() - start)
             if resp.status_code in (429, 503):
                 retry = resp.headers.get("retry-after")
                 wait = 30.0
@@ -384,13 +468,16 @@ class StealthHttpClient:
                 wait = min(wait, 120.0)
                 self._host_buckets[host].slow_down(wait, factor=0.2)
                 self._host_buckets[host].record_error()
+                breaker.record_failure(elapsed_s)
                 if self.dashboard:
                     self.dashboard.event("info",
                         f"backoff: host={host} status={resp.status_code} cooldown={wait:.0f}s")
             elif resp.status_code >= 500:
                 self._host_buckets[host].record_error()
+                breaker.record_failure(elapsed_s)
             elif resp.status_code < 400:
                 self._host_buckets[host].record_success()
+                breaker.record_success()
 
             # all Set-Cookie values (httpx collapses multi-headers into one
             # comma-joined entry in the plain dict) — raw list for SameSite checks
@@ -422,9 +509,11 @@ class StealthHttpClient:
                 response_headers=dict(resp.headers),
                 response_body=body,
                 elapsed_ms=(time.perf_counter() - start) * 1000,
-                extra={"set_cookie_headers": set_cookies},
+                extra={"set_cookie_headers": set_cookies,
+                       "identity": "anonymous" if no_session else getattr(self.session, "label", "anonymous")},
             )
         except Exception as exc:
+            breaker.record_failure()
             return HttpEvidence(
                 method=method.upper(),
                 url=url,

@@ -23,7 +23,19 @@ class ReportingAgent(BaseAgent):
 
     async def handle(self, task: Task, ctx: "Context") -> None:
         all_findings = ctx.memory.list_findings(ctx.target_slug)
+        from core.verification import report_freshness
+        from core.evidence import capture_finding, verify_bundle
+        states = ctx.memory.finding_states(ctx.target_slug)
         for f in all_findings:
+            f.setdefault("metadata", {})["lifecycle_state"] = states.get(f["id"], "new")
+            report_freshness(f, ctx.config.get("reporting", {}).get("evidence_max_age_seconds", 86400))
+            if not (f.get("metadata") or {}).get("evidence_bundle"):
+                f.setdefault("metadata", {})["evidence_bundle"] = capture_finding(ctx, f)
+            artifact = f["metadata"]["evidence_bundle"]
+            try:
+                f["metadata"]["evidence_integrity"] = "valid" if verify_bundle(artifact["file"], artifact["sha256"]) else "mismatch"
+            except (OSError, KeyError):
+                f["metadata"]["evidence_integrity"] = "missing"
             f.setdefault("confidence", 0.5)
             f["confidence_label"] = conf_label(float(f["confidence"]))
         all_findings.sort(key=lambda f: (float(f.get("confidence", 0)), f.get("cvss", 0)), reverse=True)
@@ -44,10 +56,14 @@ class ReportingAgent(BaseAgent):
         # CVSS 3.1 normalization: every verified finding gets a real vector
         # whose computed score matches the reported number + severity band
         from core.cvss import annotate as cvss_annotate
+        from core.decision_trace import build_trace
         for f in findings:
             cvss_annotate(f)
+            f_meta = f.get("metadata") or {}
+            if isinstance(f_meta, dict):
+                f_meta["proof_trace"] = build_trace(f)
             ctx.memory.update_finding(f.get("id"), severity=f["severity"],
-                                      cvss=f["cvss"], metadata=f.get("metadata") or {})
+                                      cvss=f["cvss"], metadata=f_meta)
 
         # LLM assist (judge over captured evidence, never a detector): write an
         # impact narrative + CVSS rationale for each PROVEN finding. Falls back to
@@ -114,7 +130,17 @@ class ReportingAgent(BaseAgent):
         elif proxy_cfg.get("enabled") and proxy_cfg.get("url"):
             proxy_label = proxy_cfg["url"]
 
+        coverage = ctx.memory.execution_coverage(ctx.target_slug)
+        from core.transport import current_transport
+        controller = current_transport.get() or getattr(ctx.http, "transport", None)
+        coverage["transport"] = controller.snapshot() if controller else {"status": "unavailable"}
+        from core.job_store import JobStore
+        coverage["jobs"] = JobStore(ctx.memory.db_path).list(ctx.target_slug)
+        coverage["finding_states"] = ctx.memory.finding_states(ctx.target_slug)
+        (ctx.workspace / "reports" / "coverage.json").write_text(
+            json.dumps(coverage, indent=2), encoding="utf-8")
         bundle = {
+            "coverage": coverage,
             "target": ctx.target,
             "operator": ctx.config.get("operator", {}).get("handle", "th3Samaritan"),
             "findings": findings,

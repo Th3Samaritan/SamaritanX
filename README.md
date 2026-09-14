@@ -53,7 +53,7 @@ Each layer of work is isolated as an asynchronous agent that consumes and produc
 | **Reporting** | Markdown + PDF (weasyprint) with executive summary, top-10 priority table, per-finding PoC + impact + remediation + walkthrough, **spec-compliant CVSS 3.1 vectors** (real calculator — vector, score and severity band always agree), **plus per-finding HackerOne-style submissions ready to paste**, plus **Playwright PoC screenshots**, plus **SARIF / CSV / JSONL exports** for program triage and pipelines, plus **sqlmap + Burp handoff files** for SQL-class findings |
 | **Memory** | SQLite store of findings (deduplicated by stable fingerprint) + payload effectiveness re-ranked by Wilson lower-bound + scan-resume cursors |
 | **Stealth** | global + per-host token-bucket rate limit, **reactive 429/503 backoff with Retry-After**, jitter, UA / Referer rotation, Tor or HTTP/SOCKS proxy, **proxy rotation pool** (round-robin across a list of proxies with cookie sync), six WAF evasion transforms |
-| **Persistence** | SQLite memory (findings deduped by stable fingerprint, payload re-ranking, scan-resume cursors), **session persistence** (cookies/headers saved to the workspace and restored on the next run — no re-login), **phase checkpoints** for `--resume`, **incremental scanning** (endpoints whose content hash is unchanged skip the scanner fan-out on re-runs — scheduled scans get dramatically cheaper) |
+| **Persistence** | SQLite memory (findings deduped by stable fingerprint, payload re-ranking, scan-resume cursors), **session persistence** (cookies/headers saved to the workspace and restored on the next run — no re-login), **phase checkpoints** for `--resume`, **incremental scanning** (opt-in reuse of recent successful scanner execution contexts) |
 | **LLM assist** | opt-in impact triage + scanner planning (`llm.enabled`, Anthropic or OpenAI — judge over captured proof only, never a detector; deterministic fallback without a key) |
 | **Integrations** | **HackerOne draft auto-creation** (opt-in, drafts only — never auto-publishes; CWE weakness attached, optional program linkage), **Slack / Discord / Telegram alerts** (new findings, new surface, scan complete), monitor webhooks, SARIF/CSV/JSONL exports |
 | **Workflow** | `retest <target> <id>` re-fires one finding fresh; **interactive `triage` loop** walks unproven candidates (accept / reject / duplicate / skip) with decisions persisted |
@@ -105,6 +105,133 @@ SamaritanX/
         ├── crawl/                # endpoints.json, forms.json, params.txt, secrets.json
         ├── vulns/                # raw nuclei output
         └── reports/              # report.md, report.pdf, findings.json, exploitation.json
+```
+
+## Reliability, evidence, and operator review
+
+The queue persists jobs in SQLite, suppresses duplicate pending work, and leases
+running jobs with ownership checks and renewal. Queued jobs survive restart.
+Expired running jobs become interrupted rather than silently completed. A lease
+cannot guarantee exactly-once remote effects: mutation requests require an
+explicit retest after interruption. Scanner concurrency is bounded separately
+from queue workers. Failed, timed-out, skipped, queued, and interrupted scanner
+executions remain visible in coverage.
+
+Successful scan checkpoints include method, inputs, body, engine source,
+configuration, and session identities. Incremental reuse is opt-in; the default
+expiry is 86400 seconds. `--resume` reloads saved read-only scan requests.
+Original request bodies remain in the private runtime database.
+
+A shared controller enforces scope, cancellation, global/per-host rates, and
+`transport.operation_budget` across managed HTTP hops (including redirects),
+browser requests, raw connections/writes, and native WebSocket handshakes/sends.
+`scan.scanner_request_budget` uses these same operation units across retries.
+They are operation counts, not a count of every network packet. HTTP redirects
+cannot bypass the gate. Service workers and browser WebSockets are blocked;
+native WebSocket redirects and automatic keepalive pings are disabled.
+
+Managed adapters for trusted Nuclei, subfinder, and ffuf are enabled in the
+shipped configuration (`external_tools.enabled: true`). Binaries are resolved
+from `external_tools.binary_dir` (default `./workspace/tools`) before PATH.
+Nuclei uses `external_tools.nuclei_templates` for its local HTTP template catalog. Their HTTP/HTTPS
+requests pass through an authenticated local proxy with per-request scope,
+rate, and budget checks. `external_tools.request_budget` defaults to 250;
+`external_tools.verify_tls` defaults to true. Temporary certificates and proxy
+resources are cleaned up on exit or cancellation. Mutations require aggressive
+mode. Unsupported flags, protocols, and executables (including Amass) are blocked.
+
+This is cooperative proxy routing, **not OS-level network isolation**. Binaries
+must honor their proxy options. Nuclei is restricted to HTTP templates, with
+internal proxying enabled and update checks/Interactsh disabled. Default tool
+configuration directories are isolated, so saved provider settings may be absent.
+Real Windows binaries passed the local smoke harness: ffuf 2.2.1 and Nuclei
+3.11.1 used a localhost HTTP target; subfinder 2.16.0 used an HTTPS provider
+emulator behind the proxy. This verifies routing, output parsing, and metering
+for those versions; it does not verify a live provider account or every template.
+The smoke report and download provenance are in `workspace/adapter-smoke.json`
+and `workspace/tools/*manifest.json`. These runtime artifacts are gitignored.
+
+To reproduce on Windows AMD64:
+
+```bash
+python -m bench.install_smoke_tools
+python -m bench.install_smoke_tools --templates-only
+python -m bench.adapter_smoke
+```
+
+Installation downloads official GitHub releases; binary archives are checked
+against their published checksums. The template source archive is fetched over
+HTTPS from the official tagged release, with its digest recorded. The smoke
+harness sends no scan requests to third-party targets.
+
+Native fallbacks remain available where implemented. Skips are visible in job or
+transport accounting; Nuclei also gets a scanner coverage entry. Passive DNS,
+collaborator/provider API traffic, and opt-in notification integrations are not
+part of this scan-transport operation budget. Existing separate controls still
+apply to them. Older WebSocket/Playwright versions without required interception
+hooks skip the affected operation rather than run without those controls.
+
+Before reporting, supported revalidators use two fresh client/cache contexts with
+the same configured identity credentials and a fresh baseline. This does not
+perform a new login. Inconsistent results and unavailable/auth-expired baselines
+are inconclusive. State-changing replays require aggressive mode. Evidence older
+than `reporting.evidence_max_age_seconds` is quarantined. Non-replayable callback
+artifacts remain subject to the proof gate and expiry check.
+
+`evidence/<sha256>.json` contains versioned, redacted proof bundles with timestamps,
+identity, captured observations, and rationale. Capture is bounded to the first
+8 and latest 56 HTTP observations per scanner; browser/raw proof artifacts are
+included when their detectors provide them. Digests detect modification, not
+whether a detector is correct. Redaction covers credential keys, headers, common
+inline token formats, and known session credentials; inspect artifacts before
+sharing. Private database history and pre-existing report exports are separate
+from these redacted bundles.
+
+Repeated observations update current evidence and preserve previous versions.
+Lifecycle states are new, confirmed, fixed, reopened, and inconclusive. A failed
+retest never automatically means fixed; marking fixed requires an operator note.
+A subsequently verified observation reopens a fixed finding.
+
+```bash
+python samaritanx.py review example.com
+python samaritanx.py review example.com --gaps
+python samaritanx.py review example.com --finding 42
+python samaritanx.py review example.com --finding 42 --retest
+python samaritanx.py review example.com --finding 42 --state fixed --note "Confirmed after patch"
+python samaritanx.py review example.com --json
+```
+
+Review is offline unless `--retest` is supplied. It joins finding states, proof
+decisions, evidence integrity, and method/input/identity coverage. Report output
+includes `coverage.json`, job status, transport totals, and evidence hashes.
+Historical coverage does not claim that all application surface was discovered.
+
+`authorization.objects` defines explicit ownership and denied viewers.
+`authorization.workflows` defines allowed roles, ownership, and state transitions.
+Audit captured workflow observations without sending any requests:
+
+```bash
+python samaritanx.py workflow-check observations.json
+```
+
+Each observation provides `action`, `role`, `actor`, `owner`, `before`, `after`,
+and `evidence`. Missing context or an absent state change is inconclusive.
+Workflow audit results are policy comparisons, not automatically verified findings.
+
+The local lab runs paired vulnerable/clean cases with repeated detection for 16
+scanner families, plus paired replay fixtures for the other 19 families. Each
+registered family has at least one positive/clean detection-branch pair, repeated
+twice. Replay fixtures cover HTTP responses, form/format observations, browser
+sinks, and protocol/timing transcripts; they do not establish end-to-end browser
+or protocol accuracy or coverage of every branch. Other scanner-specific regression tests remain in place. CI runs these
+accuracy checks. Metrics include precision, recall, reproducibility, and operations
+per reproduced true positive; they are fixture results, not production estimates.
+The inventory distinguishes local HTTP from replay fixtures. A registry consistency
+test fails when a newly registered scanner lacks a fixture entry:
+
+```bash
+python -m bench.runner inventory
+python -m unittest discover -s tests -p test_scanner_lab.py
 ```
 
 ## Setup (Kali Linux)

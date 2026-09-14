@@ -441,8 +441,11 @@ class CrawlerAgent(BaseAgent):
         from core.browser_pool import browser_slot
         try:
             async with browser_slot(ctx.config), async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-                context = await browser.new_context(ignore_https_errors=True)
+                from core.browser_pool import launch_chromium
+                browser = await launch_chromium(pw, headless=True, args=["--no-sandbox"])
+                context = await browser.new_context(service_workers="block", ignore_https_errors=True)
+                from core.transport import guard_browser
+                await guard_browser(context)
                 # Drive the browser as the authenticated user so post-login
                 # dashboards / account pages / API calls are reachable — that's
                 # where BOLA, priv-esc and admin-only bugs live.
@@ -577,13 +580,15 @@ class CrawlerAgent(BaseAgent):
                 if status and status < 400:
                     await ctx.queue.put(
                         "scan",
-                        {"url": url, "method": "GET", "params": []},
+                        {"url": url, "method": "GET", "params": [],
+                         "content_type": next((e.get("ctype", "") for e in state.endpoints if e.get("url") == url), "")},
                         target=ctx.target_slug, priority=4, producer=self.name,
                     )
                 continue
             await ctx.queue.put(
                 "scan",
-                {"url": url, "method": "GET", "params": points},
+                {"url": url, "method": "GET", "params": points,
+                 "content_type": next((e.get("ctype", "") for e in state.endpoints if e.get("url") == url), "")},
                 target=ctx.target_slug, priority=3, producer=self.name,
             )
         for form in state.forms:

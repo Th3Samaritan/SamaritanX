@@ -34,7 +34,7 @@ class TestProofGate(unittest.TestCase):
     def test_oob_callback_is_verified(self):
         f = {"category": "ssrf", "evidence": "interactsh callback received",
              "metadata": {"detection": "oob"}}
-        self.assertTrue(is_verified(f))
+        self.assertFalse(is_verified(f))
 
     def test_validated_secret_is_verified(self):
         f = {"category": "secret_exposure", "metadata": {"validator_valid": True}}
@@ -44,11 +44,12 @@ class TestProofGate(unittest.TestCase):
         f = {"category": "secret_exposure", "metadata": {"validator_valid": False}}
         self.assertFalse(is_verified(f))
 
-    def test_takeover_is_verified(self):
-        self.assertTrue(is_verified({"category": "subdomain_takeover", "metadata": {}}))
+    def test_takeover_category_alone_is_candidate(self):
+        self.assertFalse(is_verified({"category": "subdomain_takeover", "metadata": {}}))
 
     def test_chain_needs_reproduced_escalation(self):
-        self.assertTrue(is_verified({"category": "chain", "metadata": {"verified": True}}))
+        self.assertFalse(is_verified({"category": "chain", "metadata": {"verified": True}}))
+        self.assertTrue(is_verified({"category": "chain", "response": "captured escalation", "metadata": {"verified": True}}))
         self.assertFalse(is_verified({"category": "chain", "metadata": {"verified": False}}))
 
     def test_dropped_finding_is_candidate(self):
@@ -57,7 +58,7 @@ class TestProofGate(unittest.TestCase):
 
     def test_partition_annotates_quarantine_reason(self):
         proven = {"category": "xss", "metadata": {"poc": {
-            "verified": True, "response_status": 200, "rationale": "x"}}}
+            "verified": True, "response_excerpt": "captured execution", "rationale": "x"}}}
         junk = {"category": "smuggling", "metadata": {}}
         v, c = partition([proven, junk])
         self.assertEqual(v, [proven])

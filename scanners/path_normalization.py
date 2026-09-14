@@ -95,6 +95,10 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if ev.status not in range(200, 300) or ev.status in (204,):
             return
         body = ev.response_body or ""
+        if header:
+            clean = await ctx.http.get(variant, allow_redirects=False)
+            if clean.status == ev.status and clean.response_body == body:
+                return
         if len(body) < 80 or is_static_asset(variant, ev.response_headers):
             return
         wall, _why = is_auth_wall(ev.status, ev.response_headers, body, variant)

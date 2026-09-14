@@ -5,15 +5,10 @@ authorization: can identity B read or act on identity A's data? A single-request
 scanner can't answer that — it needs two (or three) authenticated sessions and a
 cross-replay. This engine drives exactly that.
 
-For a given endpoint it fetches the same URL as every configured identity plus
-an unauthenticated client, then looks for **one identity's private, high-entropy
-markers (emails, UUIDs, long numeric/opaque IDs) appearing in another
-identity's response**. That is a captured, unambiguous proof of broken object
-isolation — not a heuristic — so it satisfies the proof-gate directly.
-
-To keep false positives near zero it only counts a marker as "private" when it
-does NOT also appear in the unauthenticated response (i.e. it isn't public
-boilerplate like a support email in the footer).
+For each endpoint, compare authenticated responses with a public baseline.
+Shared markers are candidates unless the operator declares object ownership,
+private markers, and denied viewers in authorization.objects. Tenant and role
+are captured as context; shared authenticated content alone proves no violation.
 
 Identities come from the orchestrator Context: the primary session (``ctx.http``),
 an optional second session (``ctx.http2``), and any ``ctx.extra_identities``.
@@ -103,18 +98,25 @@ async def cross_access_check(ctx: "Context", url: str) -> Optional[dict]:
 
     # public baseline (unauthenticated) — markers here are NOT per-user secrets
     public_markers: set[str] = set()
+    st_pub = 0
     try:
         st_pub, body_pub = await _fetch_unauth(ctx, url)
         public_markers = extract_identity_markers(body_pub)
     except Exception:
         pass
 
+    if not st_pub:
+        return None
+    rules = getattr(ctx, "config", {}).get("authorization", {}).get("objects", [])
+    rule = next((r for r in rules if r.get("url") == url), {})
+
     responses: list[tuple[str, int, str, set[str]]] = []
     for label, client in identities:
         status, body = await _fetch(client, url)
-        if status and body:
+        if 200 <= status < 300 and body:
             responses.append((label, status, body, extract_identity_markers(body)))
 
+    responses.sort(key=lambda row: row[0] != rule.get("owner"))
     for owner_label, _os, _ob, owner_markers in responses:
         if not owner_markers:
             continue
@@ -123,15 +125,18 @@ async def cross_access_check(ctx: "Context", url: str) -> Optional[dict]:
                                viewer_body, public_markers)
             if leaked:
                 sample = sorted(leaked)[:5]
+                expected_denial = (rule.get("owner") == owner_label
+                                   and viewer_label in rule.get("denied_viewers", [])
+                                   and bool(set(rule.get("private_markers", [])) & leaked))
                 poc = proof_record(
-                    verified=True, method="GET", url=url,
+                    verified=expected_denial, method="GET", url=url,
                     request=f"GET {url}\n(as identity '{viewer_label}')",
                     status=viewer_status, excerpt=viewer_body,
                     rationale=(f"Identity '{viewer_label}' received private data belonging to "
                                f"'{owner_label}' — leaked markers: {sample}. These markers are "
                                "absent from the unauthenticated response, so this is broken "
                                "object-level authorization (BOLA/IDOR), not public content."))
-                return {
+                finding = {
                     "category": "idor_deep",
                     "title": "Broken object-level authorization — cross-identity data exposure",
                     "severity": "high", "cvss": 8.2, "confidence": 0.9,
@@ -141,8 +146,15 @@ async def cross_access_check(ctx: "Context", url: str) -> Optional[dict]:
                     "request": f"GET {url} (as '{viewer_label}')",
                     "metadata": {"detection": "identity_matrix", "poc": poc,
                                  "owner": owner_label, "viewer": viewer_label,
-                                 "leaked_markers": sample},
+                                 "leaked_markers": sample, "authorization_expected_denial": expected_denial,
+                                 "authorization_context": {k: rule.get(k) for k in ("owner", "tenant", "role", "denied_viewers")}},
                 }
+                if not expected_denial:
+                    finding["title"] = "Cross-identity shared content requires ownership confirmation"
+                    finding["evidence"] = "Shared authenticated markers observed; expected permissions are unknown."
+                    poc["rationale"] = finding["evidence"]
+                from core.cvss import annotate
+                return annotate(finding)
     return None
 
 

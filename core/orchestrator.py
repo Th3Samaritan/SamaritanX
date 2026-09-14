@@ -60,6 +60,9 @@ class Context:
     global_deadline: float = 0.0
     # True when --resume was passed: agents may skip already-processed work.
     resume: bool = False
+    # Run-manifest id (plan 11.2) — execution rows reference it
+    run_id: str = ""
+    auth_required: bool = False
 
 
 
@@ -90,10 +93,11 @@ class Orchestrator:
         for sub in ("recon", "crawl", "vulns", "reports", "raw", "screenshots", "discovery"):
             ensure_dir(self.workspace / sub)
 
-        self.queue = TaskQueue()
         self.http = StealthHttpClient(config)
         self.http2: StealthHttpClient | None = None
         self.memory = Memory(config.get("memory", {}).get("db_path") or (ws_root / ".samaritanx.sqlite"))
+        from .job_store import JobStore
+        self.queue = TaskQueue(JobStore(self.memory.db_path))
         self.payloads = PayloadEngine(
             payload_dir=Path(__file__).resolve().parent.parent / "config" / "payloads",
             memory=self.memory,
@@ -147,6 +151,7 @@ class Orchestrator:
             cache=self.cache,
             extra_identities=self.extra_identities,
             resume=self.resume,
+            run_id=getattr(self, "_run_id", ""),
         )
 
     def register(self, agent: "BaseAgent") -> None:
@@ -191,26 +196,41 @@ class Orchestrator:
                 agent_name = self._routes.get(task.kind)
                 if not agent_name:
                     log.debug("worker %s: no route for kind %s", _worker_name, task.kind)
-                    self.queue.task_done()
+                    self.queue.task_done("failed", "no registered handler")
                     continue
                 agent = self._agents[agent_name]
                 self.dashboard.update_agent(agent.name, "running", task.kind)
                 _deadline = self._timeout_for(task.kind)
+                status, reason = "completed", ""
+                from .transport import current_transport, current_phase
+                transport_token = current_transport.set(self.transport)
+                phase_token = current_phase.set(task.kind)
+                execution = asyncio.create_task(agent.handle(task, ctx))
+                heartbeat = asyncio.create_task(self.queue.maintain_lease(task, execution))
                 try:
                     await asyncio.wait_for(
-                        agent.handle(task, ctx),
+                        execution,
                         timeout=_deadline,
                     )
                 except asyncio.TimeoutError:
+                    status, reason = "timed_out", "task deadline exceeded"
                     log.warning("worker %s: task %s timed out after %.0fs",
                                 _worker_name, task.kind, _deadline)
                     self.dashboard.event("err",
                         f"{agent.name} timed out on {task.kind} ({_deadline:.0f}s)")
+                except asyncio.CancelledError:
+                    status, reason = "interrupted", "cancelled or lease lost"
+                    raise
                 except Exception as exc:
+                    status, reason = "failed", type(exc).__name__
                     log.exception("agent %s failed on %s: %s", agent.name, task.kind, exc)
                     self.dashboard.event("err", f"{agent.name} crash on {task.kind}: {exc}")
                 finally:
-                    self.queue.task_done()
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                    current_transport.reset(transport_token)
+                    current_phase.reset(phase_token)
+                    self.queue.task_done(status, reason)
                     self.dashboard.update_agent(agent.name, "idle", "")
         except asyncio.CancelledError:
             pass
@@ -229,6 +249,9 @@ class Orchestrator:
             self.scope.allow_globs.append(self.root)
             # default_allow stays True — without a scope file we should not
             # block access to external recon/passive-intel services.
+        from .transport import TransportController
+        self.transport = TransportController(self.config, self.scope, self.target)
+        self.http.transport = self.transport
         self.http.attach(scope=self.scope, dashboard=self.dashboard)
 
         # 2) primary auth session (login uses the un-authed http client first)
@@ -253,6 +276,7 @@ class Orchestrator:
         # 3) second auth session (for IDOR / BOLA cross-tenant checks)
         if self.second_auth_recipe:
             self.http2 = StealthHttpClient(self.config)
+            self.http2.transport = self.transport
             self.http2.attach(scope=self.scope, dashboard=self.dashboard)
             try:
                 self.session2 = await load_session(self.second_auth_recipe, self.http2)
@@ -266,6 +290,7 @@ class Orchestrator:
         # 3b) extra labeled sessions (admin row etc.) for the authz matrix
         for label, path, rank in self.extra_session_specs:
             client = StealthHttpClient(self.config)
+            client.transport = self.transport
             client.attach(scope=self.scope, dashboard=self.dashboard)
             try:
                 store = await load_session(path, client)
@@ -297,8 +322,29 @@ class Orchestrator:
         ])
         n_workers = max(4, min(n_workers, 32))
 
+        # reproducible run manifest (plan 11.2): pinned-input digests recorded
+        # before any work starts; execution rows reference the run id
+        try:
+            from .run_manifest import write_manifest
+            scope_text = Path(self.scope_file).read_text(encoding="utf-8", errors="replace") \
+                if self.scope_file else None
+            self._manifest = write_manifest(self.config, self.target, self.workspace,
+                                            scope_text=scope_text)
+            self._run_id = self._manifest["run_id"]
+        except Exception:
+            self._manifest, self._run_id = {}, ""
+        self.dashboard.event("info", f"run manifest: id={self._run_id}")
+
         with self.dashboard:
             await self._async_setup()
+            if self.resume:
+                await self.queue.restore(self.target_slug)
+                for kind, payload in self.memory.remembered_scan_tasks(self.target_slug):
+                    if payload.get("form") or payload.get("method", "GET").upper() not in {"GET", "HEAD"} or self.config.get("safety", {}).get("aggressive"):
+                        self.dashboard.event("info", "resume: mutation request requires an explicit retest")
+                        continue
+                    await self.queue.put(kind, payload, target=self.target_slug,
+                                         priority=3, producer="orchestrator")
             # seed the initial recon task
             await self.queue.put(initial_kind, {"target": self.target},
                                   target=self.target_slug, priority=1)
@@ -378,6 +424,8 @@ class Orchestrator:
     async def _shutdown_workers(self, workers: list[asyncio.Task]) -> None:
         """Gracefully stop all workers: inject one sentinel per worker, then
         await them with a 10-second grace period."""
+        if getattr(self, "transport", None):
+            self.transport.cancel()
         for _ in workers:
             try:
                 self._q_sentinel = Task(

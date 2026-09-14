@@ -18,6 +18,8 @@ Runs in parallel with the crawler to widen the attack surface:
 """
 from __future__ import annotations
 
+from core.transport import external_tool_path, create_subprocess_exec as managed_create_subprocess_exec
+
 import asyncio
 import json
 import re
@@ -82,7 +84,7 @@ class DiscoveryAgent(BaseAgent):
 
     # ---------- content discovery ----------
     async def _content_discovery(self, base: str, host: str, ctx: "Context") -> None:
-        if shutil.which("ffuf"):
+        if external_tool_path("ffuf", ctx.config):
             try:
                 if await self._run_ffuf(base, host, ctx):
                     return
@@ -127,18 +129,23 @@ class DiscoveryAgent(BaseAgent):
         out_path = ctx.workspace / "discovery" / f"{slugify(host)}_ffuf.json"
         proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await managed_create_subprocess_exec(
                 "ffuf", "-u", f"{base}/FUZZ", "-w", str(wordlist),
                 "-mc", "200,201,204,301,302,401,403", "-fs", "0",
                 "-of", "json", "-o", str(out_path), "-t", "20", "-s",
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=600.0)
+            code = await asyncio.wait_for(proc.wait(), timeout=600.0)
+            if code != 0:
+                return False
         except asyncio.TimeoutError:
             ctx.dashboard.event("err", f"ffuf timed out on {host}")
             return False
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            ctx.dashboard.event("info", f"ffuf adapter failed; using native discovery: {exc}")
+            return False
         finally:
             if proc is not None and proc.returncode is None:
                 try:

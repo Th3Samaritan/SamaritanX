@@ -16,7 +16,7 @@ import tldextract
 # Offline public-suffix extractor: use tldextract's bundled snapshot and
 # never fetch the suffix list over the network. Keeps the tool fully
 # self-contained and silent on offline / proxied hosts.
-_EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
+_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
 
 SAFE_SLUG_RE = re.compile(r"[^a-zA-Z0-9._\-]")

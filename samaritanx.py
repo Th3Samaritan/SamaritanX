@@ -553,7 +553,12 @@ def retest(
             console.print(f"[red]finding {finding_id} not found for {orch.target_slug}[/red]")
             return
         from core.revalidate import revalidate
-        summary = await revalidate(orch.context, [f])
+        from core.transport import current_transport
+        token = current_transport.set(orch.transport)
+        try:
+            summary = await revalidate(orch.context, [f])
+        finally:
+            current_transport.reset(token)
         updated = orch.memory.list_findings(orch.target_slug)
         f2 = next((x for x in updated if x["id"] == finding_id), f)
         meta = f2.get("metadata") or {}
@@ -693,10 +698,92 @@ def auth_check(
     asyncio.run(_do())
 
 
+@app.command("review")
+def review_cmd(
+    target: str,
+    finding_id: int = typer.Option(None, "--finding"),
+    state: str = typer.Option(None, "--state", help="Set a reviewed finding lifecycle state"),
+    note: str = typer.Option("", "--note"),
+    gaps: bool = typer.Option(False, "--gaps"),
+    json_output: bool = typer.Option(False, "--json"),
+    run_retest: bool = typer.Option(False, "--retest", help="Explicitly recheck the selected finding over the network"),
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Review evidence integrity, lifecycle and incomplete coverage without network calls."""
+    from core.memory import Memory
+    from core.review import snapshot, render
+    cfg = load_config(config)
+    root = Path(cfg.get("workspace", {}).get("root", "./workspace"))
+    memory = Memory(cfg.get("memory", {}).get("db_path") or root / ".samaritanx.sqlite")
+    from core.utils import slugify
+    slug = slugify(target)
+    if run_retest:
+        if finding_id is None or state:
+            raise typer.BadParameter("--retest requires --finding and cannot be combined with --state")
+        retest(target, finding_id, config)
+    if state:
+        if finding_id is None or not any(f["id"] == finding_id for f in memory.list_findings(slug)):
+            raise typer.BadParameter("--state requires a --finding belonging to this target")
+        if state == "fixed" and not note.strip():
+            raise typer.BadParameter("marking fixed requires a --note describing the confirmation")
+        try:
+            memory.set_finding_state(finding_id, state, note)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    result = snapshot(memory, slug, finding_id)
+    if json_output:
+        console.print_json(data=result["gaps"] if gaps else result)
+    else:
+        render(console, result, gaps_only=gaps, detail=finding_id is not None)
+    if finding_id is not None:
+        console.print("Use the retest command with this target and finding ID for a fresh network check.")
+
+
+@app.command("workflow-check")
+def workflow_check(
+    observations: Path,
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Audit captured workflow transitions offline against configured expectations."""
+    from core.workflow_policy import evaluate
+    cfg = load_config(config)
+    policy = cfg.get("authorization", {}).get("workflows", [])
+    rows = json.loads(observations.read_text(encoding="utf-8"))
+    console.print_json(data=[evaluate(policy, row) for row in rows])
+
+
 @app.command("version")
 def version():
     """Print the SamaritanX version."""
     console.print(f"SamaritanX {__version__}")
+
+
+@app.command("doctor")
+def doctor(
+    config: Path = typer.Option(None, "--config", "-c"),
+    json_out: bool = typer.Option(False, "--json", help="machine-readable output"),
+    no_binaries: bool = typer.Option(False, "--no-binaries", help="skip version probes of external tools"),
+):
+    """Offline readiness check — explains missing tools before you scan.
+
+    Never contacts providers, downloads anything, or scans targets. Reports
+    workspace writability, database access, browser availability, the Nuclei
+    catalog, LLM configuration and scope-file validity separately, so a
+    missing dependency is actionable instead of a silent empty run."""
+    banner()
+    cfg = load_config(config)
+    from core.readiness import run_checks, format_checks
+    results = run_checks(cfg, scope_file=None, probe_binaries=not no_binaries)
+    if json_out:
+        import json as _json
+        console.print(_json.dumps(results, indent=2, default=str))
+        raise typer.Exit(0 if all(r["status"] in ("ok", "disabled") for r in results) else 1)
+    console.print(format_checks(results))
+    failed = [r for r in results if r["status"] not in ("ok", "disabled")]
+    if failed:
+        console.print(f"\n[red]{len(failed)} check(s) need attention[/red]")
+        raise typer.Exit(1)
+    console.print("\n[green]all readiness checks passed[/green]")
 
 
 memory_app = typer.Typer(help="Inspect SamaritanX memory")

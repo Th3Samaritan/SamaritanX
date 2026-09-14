@@ -33,6 +33,9 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
+      - name: Local accuracy regression gate
+        run: python -m unittest discover -s tests -p test_scanner_lab.py -v
+
       - name: Coverage
         run: |
           coverage run -m unittest discover -s tests

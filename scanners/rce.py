@@ -62,7 +62,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         for p in rce_payloads:
             async with sem:
                 ev = await _request(ctx, url, method, param, p, form)
-            if MARKER_RE.search(ev.response_body or ""):
+            if tb.samples and MARKER_RE.search(ev.response_body or "") and not MARKER_RE.search(base_body):
                 findings.append({
                     "category": "rce",
                     "title": f"OS command injection in `{param}`",
@@ -71,7 +71,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     "evidence": "Injected echo marker (SX_*_OK) returned in response body — confirms RCE.",
                     "request": f"{ev.method} {ev.url}",
                     "response": (ev.response_body or "")[:1500],
-                    "metadata": {"detection": "marker"},
+                    "metadata": {"detection": "marker", "baseline_checked": True},
                 })
                 ctx.memory.record_payload_result(p, "rce", True)
                 return
@@ -159,7 +159,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                     "evidence": "Template engine evaluated injected expression — escalation to RCE likely.",
                     "request": f"{ev.method} {ev.url}",
                     "response": body[:1500],
-                    "metadata": {"detection": "ssti-product"},
+                    "metadata": {"detection": "ssti-product", "baseline_checked": bool(tb.samples)},
                 })
                 ctx.memory.record_payload_result(p, "ssti", True)
                 return
@@ -173,17 +173,15 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         for param, token in oob_tokens.items():
             events = await ctx.oob.poll(token)
             if events:
-                findings.append({
+                from core.oob import build_oob_finding
+                findings.append(build_oob_finding({
                     "category": "rce",
                     "title": f"Blind OS command injection in `{param}` (OOB)",
                     "severity": "critical", "cvss": 9.8,
                     "url": url, "parameter": param, "payload": f"oob://{token}",
-                    "evidence": f"OOB callback received from injected command "
-                                f"({len(events)} interactions) — confirms blind RCE.",
-                    "request": f"{method.upper()} {url}",
-                    "metadata": {"detection": "oob",
-                                 "kinds": sorted({e.get("protocol", "?") for e in events})},
-                })
+                    "_detection": "oob", "_method": method.upper(),
+                    "_request": f"{method.upper()} {url}", "_oob_ref": token,
+                }, events))
     return findings
 
 

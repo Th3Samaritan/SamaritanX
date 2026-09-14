@@ -113,6 +113,18 @@ class _LabHandler(BaseHTTPRequestHandler):
                 self._send(200, b"error: duplicate parameter")
             else:
                 self._send(200, f"ok: {vals[0] if vals else ''}".encode())
+        elif path == "/crlf":
+            import re
+            match = re.search(r"SX-Inject-([a-z0-9]+)", params.get("q", ""), re.I)
+            self._send(200, b"ok", extra={f"SX-Inject-{match[1]}": "pwn"} if match else {})
+        elif path == "/hardened":
+            self._send(200, b"<html>plain page</html>", extra={
+                "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+                "Content-Security-Policy": "default-src 'self'",
+                "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
+                "Permissions-Policy": "camera=()", "Referrer-Policy": "no-referrer"})
+        elif path.startswith("/denied") or path.endswith("/denied"):
+            self._send(403, b"forbidden")
         elif path == "/page":
             self._send(200, b"<html><body>plain page</body></html>")
         elif path == "/":
@@ -145,7 +157,13 @@ class _LabHandler(BaseHTTPRequestHandler):
         path, _, _ = self.path.partition("?")
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(length) if length else b""
-        if path == "/nosql/login":
+        if path == "/vulnerable.xml":
+            self._send(200, b"root:x:0:0:root:/root:/bin/bash")
+        elif path == "/clean.xml":
+            self._send(200, b"<r>External entities disabled</r>")
+        elif path == "/nosql/clean/login":
+            self._send(200, b'{"success": false}', "application/json")
+        elif path == "/nosql/login":
             try:
                 data = json.loads(raw.decode() or "{}")
             except Exception:
@@ -198,6 +216,61 @@ class _FakeContext:
 
 
 class TestScannerAccuracy(unittest.TestCase):
+    def test_local_accuracy_benchmark(self):
+        from core.benchmark import summarize
+        from scanners.xss import scan
+
+        async def measure():
+            cases = []
+            for path, vulnerable in (("/xss", True), ("/xss-encoded", False), ("/page", False)):
+                ctx = _FakeContext(self.base)
+                try:
+                    first = await scan(ctx, self.base + path, ["q"], "GET", None)
+                    second = await scan(ctx, self.base + path, ["q"], "GET", None)
+                    cases.append(dict(vulnerable=vulnerable, detected=bool(first),
+                                      reproduced=bool(first and second), requests=ctx.http.request_count))
+                finally:
+                    await ctx.close()
+            return summarize(cases)
+
+        metrics = self._run(measure())
+        self.assertEqual(metrics["precision"], 1.0)
+        self.assertEqual(metrics["recall"], 1.0)
+        self.assertEqual(metrics["reproducibility"], 1.0)
+        self.assertGreater(metrics["requests_per_verified_finding"], 0)
+
+    def test_vulnerable_and_clean_twins(self):
+        from core.benchmark import summarize
+        from scanners import REGISTRY
+        from bench.coverage import HTTP_FIXTURES
+        fixtures = HTTP_FIXTURES
+
+        async def measure(name, path, clean, params, category):
+            cases = []
+            for route, vulnerable in ((path, True), (clean, False)):
+                ctx = _FakeContext(self.base)
+                try:
+                    _LabHandler.stored = ["Public home page content " * 10]
+                    _LabHandler.last_xfh = ""
+                    first = await REGISTRY[name](ctx, self.base + route, params, "GET", None)
+                    _LabHandler.stored = ["Public home page content " * 10]
+                    _LabHandler.last_xfh = ""
+                    second = await REGISTRY[name](ctx, self.base + route, params, "GET", None)
+                    cases.append({"vulnerable": vulnerable,
+                                  "detected": any(f["category"] == category for f in first),
+                                  "reproduced": any(f["category"] == category for f in second),
+                                  "requests": ctx.http.request_count})
+                finally:
+                    await ctx.close()
+            return summarize(cases)
+
+        for name, path, clean, params, category in fixtures:
+            with self.subTest(scanner=name):
+                result = self._run(measure(name, path, clean, params, category))
+                self.assertEqual(result["precision"], 1.0)
+                self.assertEqual(result["recall"], 1.0)
+                self.assertEqual(result["reproducibility"], 1.0)
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _LabHandler)

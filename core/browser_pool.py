@@ -38,3 +38,21 @@ async def browser_slot(cfg: dict[str, Any]):
         yield
     finally:
         sem.release()
+
+
+async def launch_chromium(pw, *, headless: bool = True, **kwargs):
+    """Launch chromium with graceful runtime fallbacks.
+
+    Playwright's headless mode prefers the chrome-headless-shell build; when
+    only the full chromium build is installed (e.g. `playwright install
+    chromium --no-shell`), headless launches must fall back to the full
+    executable with explicit `executable_path`."""
+    try:
+        return await pw.chromium.launch(headless=headless, **kwargs)
+    except Exception as exc:
+        if headless and ("Executable doesn't exist" in str(exc)
+                         or "headless_shell" in str(exc)):
+            return await pw.chromium.launch(
+                headless=True, executable_path=pw.chromium.executable_path,
+                **kwargs)
+        raise

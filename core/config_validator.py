@@ -79,4 +79,28 @@ def validate_config(cfg: dict[str, Any]) -> list[str]:
         if v < 1 or v > 128:
             messages.append(f"[concurrency].{key} should be 1-128, got {v}")
 
+    scan = cfg.get("scan", {})
+    for key in ("scanner_timeout_seconds", "scanner_request_budget", "recheck_after_seconds"):
+        value = scan.get(key, 1)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            messages.append(f"[scan].{key} must be a positive number")
+    retries = scan.get("scanner_retries", 1)
+    if type(retries) is not int or not 0 <= retries <= 2:
+        messages.append("[scan].scanner_retries must be an integer from 0 to 2")
+    limit = cfg.get("transport", {}).get("operation_budget", 100000)
+    if type(limit) is not int or limit < 1:
+        messages.append("[transport].operation_budget must be a positive integer")
+    external = cfg.get("external_tools", {})
+    for key in ("enabled", "verify_tls"):
+        if key in external and type(external[key]) is not bool:
+            messages.append(f"[external_tools].{key} must be a boolean")
+    external_limit = external.get("request_budget", 250)
+    for key in ("binary_dir", "nuclei_templates"):
+        if key in external and not isinstance(external[key], str):
+            messages.append(f"[external_tools].{key} must be a path string")
+    if type(external_limit) is not int or external_limit < 1:
+        messages.append("[external_tools].request_budget must be a positive integer")
+    age = cfg.get("reporting", {}).get("evidence_max_age_seconds", 86400)
+    if type(age) not in (int, float) or age <= 0:
+        messages.append("[reporting].evidence_max_age_seconds must be positive")
     return messages

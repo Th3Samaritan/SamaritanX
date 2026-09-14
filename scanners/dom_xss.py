@@ -38,9 +38,9 @@ JS_HOOK = r"""
                                         ts: Date.now()}); } catch (e) {}
     };
 
-    // 1) interactive prompts
-    const _alert = window.alert;
-    window.alert = (m) => { tag('alert', m); try { return _alert(m); } catch(e){} };
+    // 1) interactive prompts — tag only, NEVER invoke the native dialog:
+    //    a real alert() blocks headless navigation until Playwright handles it
+    window.alert = (m) => { tag('alert', m); };
     window.confirm = (m) => { tag('confirm', m); return false; };
     window.prompt  = (m) => { tag('prompt', m); return null; };
     const _err = console.error;
@@ -138,11 +138,14 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
 
     async with browser_slot(ctx.config), async_playwright() as pw:
         try:
-            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+            from core.browser_pool import launch_chromium
+            browser = await launch_chromium(pw, headless=True, args=["--no-sandbox"])
         except Exception:
             return findings
-        context = await browser.new_context(ignore_https_errors=True,
+        context = await browser.new_context(service_workers="block", ignore_https_errors=True,
                                             viewport={"width": 1280, "height": 720})
+        from core.transport import guard_browser
+        await guard_browser(context)
         sem = asyncio.Semaphore(2)
 
         async def run_probe(target_url: str, payload: str, token: str,
@@ -211,16 +214,17 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
                 await page.add_init_script(JS_HOOK)
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=15000)
-                    # simulate a hostile origin firing a message
-                    await page.evaluate(f"""
-                        window.postMessage({{
-                            type: 'render',
-                            html: '<img src=x onerror=window.alert(\"{token}\")>',
-                            cmd: 'eval',
-                            payload: 'window.alert(\"{token}\")',
-                            sx: '{token}'
-                        }}, '*');
-                    """)
+                    # simulate a hostile origin firing a message. The token is
+                    # passed as an ARGUMENT — embedding it in the evaluated
+                    # source would make the scanner's own eval() trigger its
+                    # eval hook and false-fire on pages that ignore messages.
+                    await page.evaluate(
+                        "(tok) => { window.postMessage({"
+                        " type: 'render',"
+                        " html: '<img src=x onerror=window.alert(\"'+tok+'\")>',"
+                        " cmd: 'eval',"
+                        " payload: 'window.alert(\"'+tok+'\")',"
+                        " sx: tok }, '*'); }", token)
                     await asyncio.sleep(1.5)
                 except Exception:
                     await page.close(); return

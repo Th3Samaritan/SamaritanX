@@ -27,6 +27,31 @@
 
 ---
 
+## Scan coverage
+
+{% if coverage %}
+{{ coverage.scope }}
+
+| Execution state | Count |
+|---|---:|
+{% for state, count in coverage.counts.items() %}
+| {{ state }} | {{ count }} |
+{% endfor %}
+
+Failed, timed-out, interrupted, budget-exhausted, and skipped checks are untested coverage.
+See `coverage.json` for scanner, endpoint, attempt count, and reason.
+
+{% if coverage.transport %}
+Transport accounting: {{ coverage.transport }}
+{% endif %}
+{% if coverage.finding_states %}
+Finding lifecycle: {{ coverage.finding_states }}
+{% endif %}
+{% else %}
+Coverage information is unavailable for this report.
+{% endif %}
+No verified findings does not establish that the tested application is secure.
+
 ## Detailed findings
 
 {% for f in findings %}
@@ -37,6 +62,10 @@
 {% endif %}- **Category:** `{{ f.category }}`
 - **Confidence:** `{{ (f.confidence_label or 'unknown')|upper }}` ({{ "%.0f"|format((f.confidence or 0)*100) }}%){{ ' — ⚠ manual verification required before submitting' if (f.confidence or 1) < 0.6 else '' }}
 - **URL:** `{{ f.url or "—" }}`
+{% if f.metadata and f.metadata.evidence_bundle %}
+- **Evidence bundle SHA-256:** `{{ f.metadata.evidence_bundle.sha256 }}`
+- **Evidence integrity:** {{ f.metadata.evidence_integrity or 'unavailable' }}
+{% endif %}
 {% if f.parameter %}- **Parameter:** `{{ f.parameter }}`{% endif %}
 
 #### Steps to reproduce
