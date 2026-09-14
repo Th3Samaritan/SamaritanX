@@ -11,12 +11,27 @@ import re
 import time
 from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import quote
 
 
 capture = ContextVar("evidence_capture", default=None)
 _SECRET_KEY = re.compile(r"authorization|cookie|password|passwd|secret|token|api[_-]?key", re.I)
 _INLINE = re.compile(r'(?im)((?:authorization|cookie|set-cookie)\s*:\s*)[^\r\n]+')
 _VALUE = re.compile(r'''(?i)((?:password|passwd|secret|access_token|refresh_token|api_key|token)["']?\s*[:=]\s*["']?)[^&\s"'<>,}]+''')
+
+
+def _secret_variants(secrets) -> list[str]:
+    """Known secrets plus their supported encoded forms (percent single/double)."""
+    variants: set[str] = set()
+    for secret in secrets:
+        text = str(secret)
+        if not text or len(text) < 4:
+            continue
+        variants.add(text)
+        encoded = quote(text, safe="")
+        variants.add(encoded)
+        variants.add(quote(encoded, safe=""))
+    return sorted(variants, key=len, reverse=True)
 
 
 def redact(value, secrets=()):
@@ -29,7 +44,7 @@ def redact(value, secrets=()):
         value = _INLINE.sub(r"\1[REDACTED]", value)
         value = _VALUE.sub(r"\1[REDACTED]", value)
         value = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", value)
-        for secret in sorted((str(s) for s in secrets if s and len(str(s)) >= 4), key=len, reverse=True):
+        for secret in _secret_variants(secrets):
             value = value.replace(secret, "[REDACTED]")
     return value
 

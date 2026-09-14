@@ -343,6 +343,9 @@ see §11.14 (circuit breakers, resumable template batches, database recovery)
 and §11.15 (real-browser/protocol labs, proof decision traces, resource
 regression gates) for delivery evidence.
 
+Status update (2026-09-14): **Milestone 4 is implemented** — see §11.16
+(evidence retention/export controls and conservative cross-tool grouping).
+
 | Priority | Improvement | Outcome | Dependency |
 | --- | --- | --- | --- |
 | P1 | Offline readiness checks | **Implemented** — `core/readiness.py` + `samaritanx.py doctor` (human + `--json`), checks cached by executable hash/config digest, zero network by design. | Catalog investigation. |
@@ -354,8 +357,8 @@ regression gates) for delivery evidence.
 | P2 | Real-browser and protocol labs | **Implemented** — `tests/test_browser_lab.py` (real headless chromium: DOM-XSS, postMessage sinks, multi-step stored XSS) and `tests/test_protocol_lab.py` (real websockets server) against local runtimes; browser launches fall back to the full chromium build when the headless shell is missing. | Existing paired fixtures. |
 | P2 | Proof decision traces | **Implemented** — `core/decision_trace.py`: versioned candidate → verification-method → outcome traces with evidence hashes, attached to verified findings and rendered in review detail; secrets redacted. | Evidence bundles and proof gate. |
 | P2 | Database recovery and migrations | **Implemented** — `core/migrations.py`: ordered transactional migrations with pre-upgrade SQLite backups (failed migrations preserve the old database), `PRAGMA user_version` versioning, offline `integrity_report` (recoverable vs manual), conservative job-lease recovery verified by tests. | Existing SQLite stores. |
-| P3 | Evidence retention and export controls | Proposed | Evidence schema and lifecycle history. |
-| P3 | Cross-tool finding grouping | Proposed | Run manifests and proof traces. |
+| P3 | Evidence retention and export controls | **Implemented** — `core/retention.py`: inventory-first per-class age policy (logs/traces/bundles/lifecycle), dry-run by default, deletion only with `retention.enabled: true` + `--apply`; every removal recorded in `retention/removals.jsonl` and findings flagged `evidence_removed` so a missing artifact is never read as a fix. `core/export_package.py`: allowlisted/bounded profiles, a second redaction pass, and a per-file hash manifest. | Evidence schema and lifecycle history. |
+| P3 | Cross-tool finding grouping | **Implemented** — `core/grouping.py`: conservative fingerprints over family/origin/method/path/parameter/identity/proof; exact groups vs `suggested` (ambiguous) clusters; non-destructive annotation; reversible, audited manual groups in `core/memory.py` (`finding_groups`/`group_history`, add/dissolve). | Run manifests and proof traces. |
 | P3 | Resource regression gates | **Implemented** — `bench/resource_gate.py`: fixed localhost workload with deterministic assertions (SQLite leak delta, detection coverage, bounded request count), artifact written to `workspace/bench/resource-gate.json`. | Stable local workloads. |
 
 ### 11.1 Offline readiness checks
@@ -644,6 +647,40 @@ regression gates) for delivery evidence.
 - Tests: `tests/test_browser_lab.py` (5) + `tests/test_protocol_lab.py` (1)
   + `bench/resource_gate.py`; full suite now 296 unit tests, 146 structural
   checks, compile and whitespace checks passing.
+
+### 11.16 Milestone 4 delivery evidence (2026-09-14)
+
+- **Evidence retention** — `core/retention.py` classifies every workspace
+  artifact into logs, raw response traces, verified bundles or lifecycle
+  metadata, each with an independent age limit (lifecycle metadata keeps
+  longest). `retention` reports an inventory and a dry-run plan and changes
+  nothing; deletion requires both `retention.enabled: true` and `--apply`.
+  Every removal is written to `retention/removals.jsonl` (class, reason,
+  sha256), and findings whose bundle was removed are flagged
+  `evidence_removed` — `proof_gate.poc_status` then returns a candidate with
+  the explicit "absence is not proof of a fix" reason, so cleanup can never
+  manufacture a fix.
+- **Shareable export controls** — `core/export_package.py` builds packages
+  from allowlisted profiles (`shareable`: identifiers + bounded narrative only;
+  `internal`: bounded request/response) with a second redaction pass using the
+  persisted session's known secrets, then writes a `manifest.json` hashing
+  every emitted file. Redaction now also strips percent-encoded (single and
+  double) forms of known secrets; nested JSON, repeated headers and URL query
+  credentials are covered by tests.
+- **Conservative cross-tool grouping** — `core/grouping.py` fingerprints
+  findings on family, origin, method, path, input location, identity boundary
+  and proof boundary; two tools' observations are only an *exact* group when
+  every dimension agrees, while shared-family/origin/path records with a
+  differing method, parameter, tenant or proof state surface as `suggested`
+  with the differing dimensions listed. Annotation is non-destructive and
+  manual groups are stored reversibly and audited (`finding_groups`,
+  `finding_group_members`, `group_history`, schema v9); dissolving or splitting
+  restores the original relationships without deleting any observation.
+- **CLI** — `samaritanx.py retention <target>` (dry-run/`--apply`),
+  `export <target> [--profile] [--out]`, and `group <target>`
+  (`--apply`/`--split`/`--list`).
+- Tests: `tests/test_milestone4.py` (12 acceptance tests); full suite now 308
+  unit tests, 149 structural checks, compile and whitespace checks passing.
 
 ## 12. Proposed delivery sequence
 

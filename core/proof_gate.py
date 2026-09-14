@@ -76,6 +76,8 @@ def poc_status(finding: dict[str, Any]) -> tuple[str, str]:
         return "candidate", "malformed proof metadata"
     if meta.get("lifecycle_state") == "fixed":
         return "candidate", "marked fixed by operator; awaiting a reproduced regression"
+    if meta.get("evidence_removed") is True:
+        return "candidate", "evidence was removed by retention — absence is not proof of a fix"
     if meta.get("evidence_integrity") in {"mismatch", "missing"}:
         return "candidate", "evidence bundle failed integrity verification"
     if meta.get("evidence_expired") is True:

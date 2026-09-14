@@ -786,6 +786,124 @@ def doctor(
     console.print("\n[green]all readiness checks passed[/green]")
 
 
+@app.command("retention")
+def retention_cmd(
+    target: str,
+    apply_: bool = typer.Option(False, "--apply", help="execute the cleanup (requires retention.enabled: true)"),
+    json_output: bool = typer.Option(False, "--json"),
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Inventory evidence classes. Dry-run by default; never deletes without --apply."""
+    from core.retention import plan as retention_plan, apply as retention_apply
+    from core.memory import Memory
+    from core.utils import slugify
+    cfg = load_config(config)
+    root = Path(cfg.get("workspace", {}).get("root", "./workspace"))
+    slug = slugify(target)
+    workspace = root / slug
+    result = retention_plan(workspace, cfg, target=slug)
+    if apply_:
+        memory = Memory(cfg.get("memory", {}).get("db_path") or root / ".samaritanx.sqlite")
+        result = {**result, **retention_apply(result, confirm=True, memory=memory)}
+    if json_output:
+        import json as _json
+        console.print(_json.dumps(result, indent=2, default=str))
+        return
+    table = Table(title=f"Evidence retention — {slug}")
+    for col in ("Class", "Files", "Bytes", "Age limit", "Expired"):
+        table.add_column(col)
+    enabled = result["policy"]["enabled"]
+    for name, info in result["classes"].items():
+        table.add_row(name, str(info["files"]), str(info["bytes"]),
+                      str(info["age_days"]), str(len(info["expired"])))
+    console.print(table)
+    console.print(f"policy enabled: {enabled}  actions: {len(result.get('actions', []))} "
+                  f"({result.get('total_bytes', 0)} bytes)")
+    if not apply_:
+        console.print("dry run — nothing removed; use `retention --apply` when ready")
+    else:
+        console.print(f"[green]removed {len(result.get('deleted', []))} file(s)[/green]"
+                      f"{'' if result.get('applied') else ' — ' + result.get('reason', '')}")
+
+
+@app.command("export")
+def export_cmd(
+    target: str,
+    profile: str = typer.Option(None, "--profile", help="shareable | internal (default from config)"),
+    out: Path = typer.Option(None, "--out", "-o", help="output dir (default workspace/<target>/exports/<profile>)"),
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Build a shareable package: allowlisted fields, bounded excerpts, redacted, hashed."""
+    from core.export_package import build_package, session_secrets, PROFILES
+    from core.memory import Memory
+    from core.proof_gate import partition
+    from core.utils import slugify
+    cfg = load_config(config)
+    root = Path(cfg.get("workspace", {}).get("root", "./workspace"))
+    slug = slugify(target)
+    workspace = root / slug
+    profile = profile or cfg.get("export", {}).get("default_profile", "shareable")
+    if profile not in PROFILES:
+        raise typer.BadParameter(f"unknown profile '{profile}' (choose from {sorted(PROFILES)})")
+    memory = Memory(cfg.get("memory", {}).get("db_path") or root / ".samaritanx.sqlite")
+    verified, _ = partition(memory.list_findings(slug))
+    out_dir = Path(out) if out else workspace / "exports" / profile
+    manifest = build_package(verified, out_dir, profile=profile,
+                             secrets=session_secrets(workspace), target=slug)
+    console.print(f"[green]exported {manifest['finding_count']} verified finding(s)[/green] "
+                  f"({profile}) -> {out_dir} [{len(manifest['files'])} file(s) hashed]")
+
+
+@app.command("group")
+def group_cmd(
+    target: str,
+    apply_ids: str = typer.Option(None, "--apply", help="comma-separated finding ids to relate into one group"),
+    label: str = typer.Option("", "--label"),
+    split: str = typer.Option(None, "--split", help="dissolve a manual group id (restores original relationships)"),
+    list_groups: bool = typer.Option(False, "--list", help="list manual groups"),
+    json_output: bool = typer.Option(False, "--json"),
+    config: Path = typer.Option(None, "--config", "-c"),
+):
+    """Relate duplicate observations conservatively. No finding is ever deleted."""
+    from core.grouping import suggest
+    from core.memory import Memory
+    from core.utils import slugify
+    cfg = load_config(config)
+    root = Path(cfg.get("workspace", {}).get("root", "./workspace"))
+    slug = slugify(target)
+    memory = Memory(cfg.get("memory", {}).get("db_path") or root / ".samaritanx.sqlite")
+    if split:
+        ok = memory.dissolve_group(split)
+        console.print(("[green]dissolved[/green] " if ok else "[red]unknown group[/red] ") + split)
+        return
+    if apply_ids:
+        ids = [int(x) for x in apply_ids.split(",") if x.strip()]
+        group_id = memory.create_group(slug, ids, label=label)
+        console.print(f"[green]grouped[/green] {len(ids)} finding(s) -> {group_id} "
+                      "(observations preserved; use --split to undo)")
+        return
+    findings = memory.list_findings(slug)
+    groups = memory.list_groups(slug) if list_groups else suggest(findings)
+    if json_output:
+        import json as _json
+        console.print(_json.dumps(groups, indent=2, default=str))
+        return
+    if not groups:
+        console.print("[yellow]no grouping suggestions[/yellow]")
+        return
+    table = Table(title="Manual groups" if list_groups else "Grouping suggestions")
+    for col in ("Group", "Confidence", "Members", "Ambiguous on", "Label"):
+        table.add_column(col)
+    for group in groups:
+        members = group.get("finding_ids") or [m["finding_id"] for m in group.get("members", [])]
+        table.add_row(group.get("group_id", ""), group.get("confidence", "manual"),
+                      ", ".join(str(i) for i in members),
+                      ", ".join(group.get("ambiguous_on", [])), group.get("label", ""))
+    console.print(table)
+    console.print("Suggestions are never merged automatically — confirm with "
+                  "`group <target> --apply <ids> --label ...`.")
+
+
 memory_app = typer.Typer(help="Inspect SamaritanX memory")
 app.add_typer(memory_app, name="memory")
 

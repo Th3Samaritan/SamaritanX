@@ -29,6 +29,17 @@ MIGRATIONS: dict[int, list[str]] = {
         "ALTER TABLE scanner_executions ADD COLUMN duration_s REAL",
         "ALTER TABLE scanner_executions ADD COLUMN diagnostics TEXT NOT NULL DEFAULT ''",
     ],
+    # v9: conservative cross-tool grouping (milestone 4) — additive tables only
+    9: [
+        "CREATE TABLE IF NOT EXISTS finding_groups (group_id TEXT PRIMARY KEY, "
+        "target TEXT NOT NULL, label TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', "
+        "created REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS finding_group_members (group_id TEXT NOT NULL, "
+        "finding_id INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'member', added REAL NOT NULL, "
+        "PRIMARY KEY (group_id, finding_id))",
+        "CREATE TABLE IF NOT EXISTS group_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "group_id TEXT, action TEXT, finding_id INTEGER, detail TEXT, updated REAL)",
+    ],
 }
 
 TARGET_VERSION = max(MIGRATIONS) if MIGRATIONS else 0

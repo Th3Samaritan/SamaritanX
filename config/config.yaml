@@ -211,6 +211,20 @@ memory:
   remember_payloads: true
   remember_findings: true
 
+# Evidence retention (plan 11.10). Inventory/dry-run is always safe; deletion
+# only happens when `enabled: true` AND the operator runs `retention --apply`.
+retention:
+  enabled: false
+  logs_days: 30               # *.log files
+  traces_days: 14             # raw recon/crawl/discovery/vulns response traces
+  bundles_days: 90            # verified evidence bundles
+  lifecycle_days: 365         # reports, manifests, session metadata
+
+# Shareable export packages (plan 11.10): allowlisted fields, bounded excerpts,
+# a second redaction pass, and a per-file hash manifest.
+export:
+  default_profile: shareable  # shareable | internal
+
 llm:
   enabled: false                # toggle for AI-assisted reasoning
   provider: "anthropic"         # anthropic | openai | deepseek | openai_compatible

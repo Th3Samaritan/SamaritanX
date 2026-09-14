@@ -13,13 +13,17 @@ def snapshot(memory, target, finding_id=None):
         from .verification import report_freshness
         report_freshness(finding)
         finding.setdefault("metadata", {})["lifecycle_state"] = states.get(finding["id"], "new")
+        finding.setdefault("metadata", {})["groups"] = memory.groups_for_finding(finding["id"])
         artifact = (finding.get("metadata") or {}).get("evidence_bundle")
-        integrity = "unavailable"
-        if artifact:
-            try:
-                integrity = "valid" if verify_bundle(artifact["file"], artifact["sha256"]) else "mismatch"
-            except (OSError, KeyError):
-                integrity = "missing"
+        if (finding.get("metadata") or {}).get("evidence_removed") is True:
+            integrity = "removed"
+        else:
+            integrity = "unavailable"
+            if artifact:
+                try:
+                    integrity = "valid" if verify_bundle(artifact["file"], artifact["sha256"]) else "mismatch"
+                except (OSError, KeyError):
+                    integrity = "missing"
         finding.setdefault("metadata", {})["evidence_integrity"] = integrity
         from .decision_trace import build_trace
         trace = (finding.get("metadata") or {}).get("proof_trace") or build_trace(finding)

@@ -103,4 +103,14 @@ def validate_config(cfg: dict[str, Any]) -> list[str]:
     age = cfg.get("reporting", {}).get("evidence_max_age_seconds", 86400)
     if type(age) not in (int, float) or age <= 0:
         messages.append("[reporting].evidence_max_age_seconds must be positive")
+    retention = cfg.get("retention", {})
+    if "enabled" in retention and type(retention["enabled"]) is not bool:
+        messages.append("[retention].enabled must be a boolean")
+    for key in ("logs_days", "traces_days", "bundles_days", "lifecycle_days"):
+        value = retention.get(key)
+        if value is not None and (type(value) not in (int, float) or value < 0):
+            messages.append(f"[retention].{key} must be a non-negative number")
+    profile = cfg.get("export", {}).get("default_profile")
+    if profile is not None and profile not in ("shareable", "internal"):
+        messages.append(f"[export].default_profile: unknown profile '{profile}'")
     return messages
