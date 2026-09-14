@@ -328,7 +328,7 @@ The completed implementation does not provide the following capabilities. They r
 - Live provider-account validation or third-party scan testing.
 - Real-browser integration coverage for replay-only fixtures.
 - Exhaustive branch coverage for all scanners or all Nuclei templates.
-- Automatic publication, external report submission, or a repository commit.
+- Automatic publication or external report submission.
 
 Further improvements should be driven by measured failures and observed coverage gaps. The immediate next implementation task is the catalog startup investigation in section 8.
 
@@ -338,6 +338,11 @@ Further improvements should be driven by measured failures and observed coverage
 Status update (2026-09-12): **Milestone 1 is implemented** — the four P1 items
 below are done (see §11.13 for delivery evidence). P2/P3 items remain proposed.
 
+Status update (2026-09-14): **Milestone 2 and Milestone 3 are implemented** —
+see §11.14 (circuit breakers, resumable template batches, database recovery)
+and §11.15 (real-browser/protocol labs, proof decision traces, resource
+regression gates) for delivery evidence.
+
 | Priority | Improvement | Outcome | Dependency |
 | --- | --- | --- | --- |
 | P1 | Offline readiness checks | **Implemented** — `core/readiness.py` + `samaritanx.py doctor` (human + `--json`), checks cached by executable hash/config digest, zero network by design. | Catalog investigation. |
@@ -346,12 +351,12 @@ below are done (see §11.13 for delivery evidence). P2/P3 items remain proposed.
 | P1 | Unified safety and credential boundaries | **Implemented** — session credentials are origin-bound (stripped crossing origins), `transport.strict_mutations` rejects unclassified mutations without `safety.aggressive` while sanctioned login flows stay allowed; external gateway mutation policy unchanged. | Shared transport. |
 | P2 | Circuit breakers and fair budgets | **Implemented** — `core/circuit.py`: per-origin closed/open/half-open breakers, deterministic clock, read-only recovery probes, high-latency failure counting; wired into the HTTP client (fast rejection with `circuit_open` reason, blocked accounting) and the execution states. | Structured execution states. |
 | P2 | Resumable template batches | **Implemented** — nuclei groups carry template digests; `--resume` skips completed groups only when the digest is unchanged; per-attempt output files (stale output never imported); parse failures recorded as `output_parse_error`/partial. | Measurements showing batching helps. |
-| P2 | Real-browser and protocol labs | Proposed | Existing paired fixtures. |
-| P2 | Proof decision traces | Proposed | Evidence bundles and proof gate. |
+| P2 | Real-browser and protocol labs | **Implemented** — `tests/test_browser_lab.py` (real headless chromium: DOM-XSS, postMessage sinks, multi-step stored XSS) and `tests/test_protocol_lab.py` (real websockets server) against local runtimes; browser launches fall back to the full chromium build when the headless shell is missing. | Existing paired fixtures. |
+| P2 | Proof decision traces | **Implemented** — `core/decision_trace.py`: versioned candidate → verification-method → outcome traces with evidence hashes, attached to verified findings and rendered in review detail; secrets redacted. | Evidence bundles and proof gate. |
 | P2 | Database recovery and migrations | **Implemented** — `core/migrations.py`: ordered transactional migrations with pre-upgrade SQLite backups (failed migrations preserve the old database), `PRAGMA user_version` versioning, offline `integrity_report` (recoverable vs manual), conservative job-lease recovery verified by tests. | Existing SQLite stores. |
 | P3 | Evidence retention and export controls | Proposed | Evidence schema and lifecycle history. |
 | P3 | Cross-tool finding grouping | Proposed | Run manifests and proof traces. |
-| P3 | Resource regression gates | Proposed | Stable local workloads. |
+| P3 | Resource regression gates | **Implemented** — `bench/resource_gate.py`: fixed localhost workload with deterministic assertions (SQLite leak delta, detection coverage, bounded request count), artifact written to `workspace/bench/resource-gate.json`. | Stable local workloads. |
 
 ### 11.1 Offline readiness checks
 
@@ -607,6 +612,38 @@ below are done (see §11.13 for delivery evidence). P2/P3 items remain proposed.
 - Tests: `tests/test_milestone2.py` (12 tests) + migration/integrity
   integration; full suite now 290 unit tests, 145 structural checks,
   compile and whitespace checks passing.
+
+### 11.15 Milestone 3 delivery evidence (2026-09-14)
+
+- **Real-browser integration lab** — `tests/test_browser_lab.py` runs against
+  a local HTTP lab with real headless chromium: DOM-XSS detection fires only
+  on the vulnerable page (encoded page stays silent), postMessage sinks
+  confirmed on the vulnerable page and ignored on the safe page, and the
+  stored-XSS flow submits a payload over a form and observes execution on the
+  served page (critical finding with `executed_at`/`sinks` metadata). The
+  browser is launched through `core/browser_pool.launch_chromium`, which
+  falls back to the full chromium build when the headless shell is missing.
+- **Protocol integration lab** — `tests/test_protocol_lab.py` drives a real
+  `websockets` server and confirms the SQLi error-detection path against
+  live socket frames.
+- **Proof decision traces** — `core/decision_trace.py` builds versioned
+  traces (candidate → verification method → outcome → evidence hashes);
+  attached to verified findings by the reporting agent and rendered in the
+  review detail view; secrets redacted through the run-manifest redactor.
+- **Resource regression gate** — `bench/resource_gate.py` runs a fixed
+  localhost workload with deterministic assertions (SQLite connection leak
+  delta ≤ 0, sqli/xss/security-header detection, request count ≤ 400) and
+  writes `workspace/bench/resource-gate.json`.
+- **Browser-fidelity fixes** — JS hooks tag `alert`/`confirm`/`prompt`
+  without invoking the native dialog (a real `alert()` blocks headless
+  navigation until Playwright handles it); the dom_xss postMessage probe
+  passes the token as an evaluate argument instead of embedding it in the
+  evaluated source (which self-triggered the `eval` sink); the stored_xss
+  browser session stays inside the `async_playwright()` lifetime (launching
+  inside and driving outside closed the driver connection).
+- Tests: `tests/test_browser_lab.py` (5) + `tests/test_protocol_lab.py` (1)
+  + `bench/resource_gate.py`; full suite now 296 unit tests, 146 structural
+  checks, compile and whitespace checks passing.
 
 ## 12. Proposed delivery sequence
 
