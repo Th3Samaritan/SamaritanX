@@ -139,6 +139,7 @@ class ReportingAgent(BaseAgent):
         coverage["finding_states"] = ctx.memory.finding_states(ctx.target_slug)
         (ctx.workspace / "reports" / "coverage.json").write_text(
             json.dumps(coverage, indent=2), encoding="utf-8")
+        counters = ctx.dashboard.counters()
         bundle = {
             "coverage": coverage,
             "target": ctx.target,
@@ -159,10 +160,10 @@ class ReportingAgent(BaseAgent):
             "proxy": proxy_label,
             "walkthrough": ctx.config.get("reporting", {}).get("include_walkthrough", True),
             "counters": {
-                "subdomains": ctx.dashboard._counters.get("subdomains", 0),
-                "endpoints": ctx.dashboard._counters.get("endpoints", 0),
-                "params": ctx.dashboard._counters.get("params", 0),
-                "requests": ctx.dashboard._counters.get("requests", 0),
+                "subdomains": counters.get("subdomains", 0),
+                "endpoints": counters.get("endpoints", 0),
+                "params": counters.get("params", 0),
+                "requests": counters.get("requests", 0),
             },
         }
 

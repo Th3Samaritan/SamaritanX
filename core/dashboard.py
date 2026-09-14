@@ -95,6 +95,11 @@ class Dashboard:
                 self._progress.advance(tid, n)
                 self._refresh()
 
+    def counters(self) -> dict[str, int]:
+        """Snapshot of the metric counters (a copy, safe for reports)."""
+        with self._lock:
+            return dict(self._counters)
+
     # ---------- rendering ----------
     def _refresh(self) -> None:
         if self._live:

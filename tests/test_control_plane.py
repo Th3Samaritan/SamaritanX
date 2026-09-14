@@ -244,7 +244,7 @@ class ControlPlaneTests(unittest.IsolatedAsyncioTestCase):
         (self.path / "reports").mkdir()
         ctx = SimpleNamespace(memory=memory, target_slug="lab", target="lab", workspace=self.path,
             config={"reporting": {"format": ["markdown"]}}, session=None, http=SimpleNamespace(),
-            dashboard=SimpleNamespace(_counters={}, event=lambda *args: None))
+            dashboard=SimpleNamespace(counters=lambda: {}, event=lambda *args: None))
         with patch("core.llm.triage_impact", new=AsyncMock(return_value={})):
             await ReportingAgent().handle(Task(1, 1, "report", "lab"), ctx)
         report = (self.path / "reports" / "report.md").read_text(encoding="utf-8")

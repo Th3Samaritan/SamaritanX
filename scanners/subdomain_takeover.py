@@ -73,7 +73,6 @@ async def scan_takeover(ctx: "Context", task: Task) -> None:
         async with sem:
             ev = await ctx.http.get(f"https://{host}", bypass_scope=True)
         if fingerprint.lower() in (ev.response_body or "").lower():
-            from agents.base import BaseAgent  # noqa
             ctx.memory.record_finding({
                 "target": ctx.target_slug,
                 "category": "takeover",

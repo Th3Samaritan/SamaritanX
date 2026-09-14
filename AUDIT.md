@@ -68,9 +68,9 @@ It blanks `Authorization`/`Cookie` via request *headers*, but session cookies ar
 
 **L2. Test never awaited.** `tests/test_core.py::TestTaskQueue.test_put_get_join` is an `async def` collected by `unittest`; unittest calls it, gets an un-awaited coroutine, and reports a pass without testing anything (real coverage comes from `test_sync`). Rename it to `_put_get_join` so only the sync wrapper runs it.
 
-**L3. Tight coupling.** `agents/reporting_agent.py` reads `ctx.dashboard._counters` (a private attribute) to populate report stats. Works, but expose a public accessor instead.
+**L3. Tight coupling.** `agents/reporting_agent.py` reads `ctx.dashboard._counters` (a private attribute) to populate report stats. Works, but expose a public accessor instead. *(Fixed: `Dashboard.counters()` now returns a locked snapshot and the reporting agent uses it.)*
 
-**L4. Dead import.** `scanners/subdomain_takeover.py` does `from agents.base import BaseAgent  # noqa` inside `check()` and never uses it.
+**L4. Dead import.** `scanners/subdomain_takeover.py` does `from agents.base import BaseAgent  # noqa` inside `check()` and never uses it. *(Fixed: import removed.)*
 
 **L5. Noisy `tldextract` first-run on offline/proxied hosts.** On a box without direct internet, `tldextract` prints multi-screen tracebacks while it tries (and fails) to fetch the public-suffix list, before silently falling back to its bundled snapshot. It still works, but the output is alarming. Pin it to the offline snapshot to silence it: construct `tldextract.TLDExtract(suffix_list_urls=())` once in `core/utils.py` and reuse it, instead of calling the module-level `tldextract.extract`. (Observed live during the self-test run.)
 
@@ -110,4 +110,4 @@ python3 selftest.py --live
 3. H1 — extend injection surface to path segments + JSON bodies (biggest yield improvement).
 4. M1, M2, M3 — small correctness fixes.
 5. M4 — add an `--aggressive` gate for destructive checks.
-6. L1–L4 — cleanup.
+6. ✅ L1–L4 — cleanup (L2 async test renamed, L3 private counter access replaced, L4 dead import removed; L1 constant now referenced by the CWE map).
