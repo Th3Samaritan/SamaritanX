@@ -23,9 +23,12 @@ offline. Scanners feed it timings / responses they already collect.
 from __future__ import annotations
 
 import math
+import re
+import secrets
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Sequence
+from urllib.parse import urlsplit
 
 
 # --------------------------------------------------------------------------- #
@@ -185,3 +188,44 @@ async def _fire(http, url: str, method: str, **kw):
         return await http.get(url, **kw)
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# SPA / catch-all shell
+# --------------------------------------------------------------------------- #
+_SHELL_WS = re.compile(r"\s+")
+
+
+async def catchall_shell(http, url: str, **kw) -> str | None:
+    """Body the app returns for a guaranteed-missing path (SPA fallback), or None.
+
+    A 200 is not content: SPA and framework catch-alls answer *any* path with
+    the same index shell, so detectors use this baseline to reject a response
+    that is merely that shell rather than privileged or private content.
+    """
+    text = url if "://" in url else "http://" + url
+    parts = urlsplit(text)
+    if not parts.netloc:
+        return None
+    probe = f"{parts.scheme}://{parts.netloc}/sx-catchall-{secrets.token_hex(8)}"
+    ev = await _fire(http, probe, "GET", **kw)
+    if ev is None or getattr(ev, "error", None):
+        return None
+    body = getattr(ev, "response_body", "") or ""
+    return body if len(body) >= 200 else None
+
+
+def _norm(body: str) -> str:
+    return _SHELL_WS.sub(" ", (body or "").strip())
+
+
+def is_catchall(body: str, shell: str | None) -> bool:
+    """True when ``body`` is the same fallback shell (modulo whitespace)."""
+    if not shell or not body:
+        return False
+    a, b = _norm(body), _norm(shell)
+    if len(a) < 200 or not b:
+        return False
+    if abs(len(a) - len(b)) > max(100, int(0.1 * len(b))):
+        return False
+    return a[:500] == b[:500]

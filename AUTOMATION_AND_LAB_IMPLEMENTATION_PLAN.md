@@ -30,7 +30,7 @@ This document describes implementation; the proposed commands and files below do
 | Mobile dynamic | Attach to existing Android/iOS Appium sessions; app identity checks; bounded UI flows | Session provisioning, broader runtime checks, traffic collection and actual device validation |
 | Mobile traffic | Scoped HAR review and sanitized GET/HEAD API seeds | Automated capture, correlation and authenticated backend workflows |
 
-The current measured baseline is 363 unit tests and 162 structural checks
+The current measured baseline is 367 unit tests and 162 structural checks
 passing, plus resource (11/11) and three-adapter smoke gates, with the first
 real Juice Shop runs recorded in §20. Real mobile devices have not been tested
 in this workspace.
@@ -345,7 +345,7 @@ Reverify version-specific requirements during implementation. Preserve `IMPLEMEN
 
 | Gate | Result |
 | --- | --- |
-| `python -m unittest discover -s tests` | **363 passed** |
+| `python -m unittest discover -s tests` | **367 passed** |
 | `python selftest.py` | **162 passed, 0 failed** |
 | `python -m compileall -q core agents scanners reporting assessments bench samaritanx.py` | exit 0 |
 | `python -m bench.resource_gate` | **11/11 passed** (SQLite leak delta 0, 13 requests, memory/startup/cleanup) |
@@ -367,6 +367,8 @@ Command: `python -m bench.juice_shop run --deadline <N> [--authenticated]`
 | `2d31ee1c666d4416926f728a907eebfa` | anon | 300 | anonymous | partial | 3 | 8 | 9 | 244/1050 | completed |
 | `e01eac954c924937821777ce1e581faa` | anon | 600 | anonymous | partial | 3 | 9 | 17 | 389/1330 | completed |
 | `58966544df5f423e8ce3c153b326ed94` | auth | 600 | user-a, user-b | partial | 3 | 9 | 21 | 318/1260 | completed |
+| `d3b5a47210764ccf8d9943d7e3bbbbc9` | auth | 1800 | user-a, user-b | partial | 6 | 14 | 163 | 1047/1715 | completed |
+| `8b6b523bf8e5494eb37bfc7cfa9e0598` | auth | 900 | user-a, user-b | partial | 5 | 10 | 95 | 359/1050 | completed |
 
 The first attempt was blocked by a harness defect: `bench/lab_runtime.command`
 decoded Docker CLI output with the Windows cp1252 codec, crashed the
@@ -426,6 +428,44 @@ every run. The breaker's `last_failure` reason is now captured in its snapshot
 and in `benchmark.json:circuit`. Regression tests:
 `tests/test_milestone2.py` (failure-rate) and
 `tests/test_audit_regressions.py::CircuitPolicyTests` (policy/cancel).
+
+### Adjudication and false-positive detector fixes (2026-09-15)
+
+The 1800 s authenticated run solved **6 challenges** (adding **4 Admin
+Registration** and **98 Deluxe Fraud**) and produced 14 verified findings.
+Adjudicating those findings against the captured evidence separated real bugs
+from framework artifacts:
+
+| Finding | Verdict | Evidence |
+| --- | --- | --- |
+| `idor` BOLA — `/api/Users` full dump | true | response returned every user incl. `admin@juice-sh.op` cross-session |
+| `exposure` `/.well-known/security.txt` | true | real file served (challenge 76) |
+| `security_headers` (6) | true | real missing headers |
+| `broken_auth` `/rest/admin/application-configuration` | true | config JSON served unauthenticated |
+| `broken_auth` `/admin`, `/dashboard` | **false** | SPA catch-all returned index.html for any path |
+| `broken_auth` path-normalization | **false** | variant fell through to the SPA shell |
+| `web_cache_deception` | **false** | public shell served on a `.css` path; no cache |
+| `smuggling` CRLF in `:path` | **false** | server replied `HTTP/1.1 400 Bad Request` — a rejection, not a desync |
+
+Root cause: SPA/framework catch-alls answer *any* path with the same public
+shell (which itself contains identity-shaped strings), so a `200` was being
+read as privileged or private content. Fixes, all generic:
+
+- `core/baseline.py` gained `catchall_shell()` / `is_catchall()` — capture the
+  app's fallback body for a guaranteed-missing path and reject candidate
+  responses that are merely that shell.
+- Wired into `agents/logic_agent._admin_anon`, `scanners/path_normalization.py`
+  and `scanners/web_cache_deception.py`.
+- `scanners/h2_smuggling.py`: the raw-HTTP/1.1 downgrade artifact now only
+  counts a **2xx/3xx** status line; a `4xx/5xx` line is the server rejecting
+  the malformed frame, so it is excluded.
+
+Measured effect (authenticated, 900 s): the smuggling, web-cache-deception,
+`/admin`/`/dashboard` broken-auth and path-normalization false positives are
+gone; the true BOLA, `security.txt` and security-header findings remain.
+Regression tests: `tests/test_audit_regressions.py`
+(`CatchallBaselineTests`, `CatchallDetectorTests`), and the admin-anon /
+paired-fixture fakes now model a 404 catch-all probe.
 
 ### Layer and milestone status
 

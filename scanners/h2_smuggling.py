@@ -55,8 +55,10 @@ _STATIC_EXT = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webp", ".pdf")
 
 # A raw HTTP/1.1 status line has no place inside an HTTP/2 stream (HPACK encodes
-# :status). Seeing one in the bytes we read back is a downgrade artifact.
-_H1_STATUS = re.compile(rb"HTTP/1\.[01] \d{3}")
+# :status). Seeing a *successful* one (2xx/3xx) in the bytes we read back is a
+# downgrade artifact. A 4xx/5xx line is the server correctly *rejecting* the
+# malformed frame — a refusal, not a desync — so it is deliberately excluded.
+_H1_STATUS = re.compile(rb"HTTP/1\.[01] [23]\d\d")
 _HANG = 5.0
 
 

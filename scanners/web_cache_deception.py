@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
+from core.baseline import catchall_shell, is_catchall
 from core.escalation import sensitive_hits, severity_for
 from core.utils import random_token
 from scanners.idor_deep import identity_markers
@@ -72,6 +73,11 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     base = await ctx.http.get(url)
     if base.status >= 400 or not base.response_body:
         return findings
+    # an SPA/framework catch-all serves the same public shell for any path — the
+    # markers in it are not private, so nothing can be "deceived" out of it
+    shell = await catchall_shell(ctx.http, url, no_session=True)
+    if is_catchall(base.response_body, shell):
+        return findings
     base_markers = identity_markers(base.response_body) | {
         s for _, s in sensitive_hits(base.response_body, base.response_headers)}
     if not base_markers:
@@ -83,6 +89,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         authed = await ctx.http.get(durl)
         if authed.status >= 400 or not authed.response_body:
             continue
+        if is_catchall(authed.response_body, shell):
+            continue  # crafted URL fell through to the public SPA shell
         authed_markers = identity_markers(authed.response_body) | {
             s for _, s in sensitive_hits(authed.response_body, authed.response_headers)}
         private_leak = base_markers & authed_markers
@@ -94,6 +102,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         anon = await ctx.http.get(durl, no_session=True)
         if anon.status >= 400 or not anon.response_body:
             continue
+        if is_catchall(anon.response_body, shell):
+            continue  # anonymous response is just the public shell
         anon_markers = identity_markers(anon.response_body) | {
             s for _, s in sensitive_hits(anon.response_body, anon.response_headers)}
         leaked = private_leak & anon_markers

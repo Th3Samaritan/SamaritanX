@@ -69,6 +69,11 @@ class Replay:
 
     async def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
+        # the catch-all probe targets a guaranteed-missing path; a real app
+        # answers it 404, so it must not be confused with real private content
+        if "sx-catchall-" in url:
+            return self.evidence(method, url, 404, "not found",
+                                 {"content-type": "text/plain"})
         body, status, headers = "{}", 200, {"content-type": "application/json"}
         query = parse_qs(urlsplit(url).query)
         values = " ".join(str(v) for v in query.values()) + json.dumps(kwargs.get("json_body", {}))

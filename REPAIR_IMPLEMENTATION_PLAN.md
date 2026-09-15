@@ -95,7 +95,7 @@ Full validation log: `workspace/subfinder-fixed-selftest.txt`.
 
 Re-ran the required gates on the current working tree (Windows host):
 
-- Full unit suite: **363 tests passed**.
+- Full unit suite: **367 tests passed**.
 - Structural self-test: **162 passed, 0 failed**.
 - `compileall` (core, agents, scanners, reporting, assessments, bench,
   samaritanx.py): exit 0.

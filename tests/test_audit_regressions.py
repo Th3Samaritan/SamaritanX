@@ -230,3 +230,63 @@ class CircuitPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client._circuit_registry().breaker("lab.test").state, "closed")
         finally:
             await client.close()
+
+
+class CatchallBaselineTests(unittest.TestCase):
+    SHELL = ("<!doctype html><html><head><title>OWASP Juice Shop</title></head>"
+             "<body><app-root></app-root>" + "x" * 400)
+
+    def test_is_catchall_matches_shell_only(self):
+        from core.baseline import is_catchall
+        self.assertTrue(is_catchall(self.SHELL, self.SHELL))
+        self.assertTrue(is_catchall("  \n" + self.SHELL + "  ", self.SHELL))
+        self.assertFalse(is_catchall('{"error":"unauthorized"}', self.SHELL))
+        self.assertFalse(is_catchall("<html>real private page with secrets</html>", self.SHELL))
+        self.assertFalse(is_catchall("short", self.SHELL))
+
+    def test_smuggling_artifact_ignores_rejection(self):
+        from scanners.h2_smuggling import _downgrade_artifact
+        marker = "sxmarker012345"
+        self.assertIsNone(_downgrade_artifact(
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n", marker))
+        self.assertIsNone(_downgrade_artifact(b"HTTP/1.1 500 Internal Server Error", marker))
+        self.assertIsNotNone(_downgrade_artifact(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", marker))
+        self.assertIsNotNone(_downgrade_artifact(("/" + marker).encode(), marker))
+
+
+class CatchallDetectorTests(unittest.IsolatedAsyncioTestCase):
+    SHELL = ("<!doctype html><html><head><title>OWASP Juice Shop</title></head>"
+             "<body><app-root></app-root>" + "z" * 400)
+
+    async def test_web_cache_deception_rejects_spa_shell(self):
+        from scanners.web_cache_deception import scan
+        shell = self.SHELL
+
+        class Http:
+            session = SimpleNamespace(is_authed=lambda: True)
+
+            async def get(self, url, **kw):
+                return SimpleNamespace(status=200, response_body=shell,
+                                       response_headers={}, url=url, error=None)
+
+        findings = await scan(SimpleNamespace(http=Http()), "http://lab.test/wallet",
+                              [], "GET", None)
+        self.assertEqual(findings, [])
+
+    async def test_path_normalization_rejects_spa_shell(self):
+        from scanners.path_normalization import scan
+        shell = self.SHELL
+        base_url = "http://lab.test/rest/user/change-password"
+
+        class Http:
+            session = None
+
+            async def get(self, url, **kw):
+                status = 401 if url == base_url else 200
+                body = '{"error":"unauthorized"}' if status == 401 else shell
+                return SimpleNamespace(status=status, response_body=body,
+                                       response_headers={}, url=url, error=None)
+
+        findings = await scan(SimpleNamespace(http=Http()), base_url, [], "GET", None)
+        self.assertEqual(findings, [])

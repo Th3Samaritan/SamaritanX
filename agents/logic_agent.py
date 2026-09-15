@@ -174,8 +174,15 @@ class LogicAgent(BaseAgent):
 
     async def _admin_anon(self, endpoints: list[str], ctx: "Context") -> None:
         from core.poc import is_auth_wall, is_static_asset, proof_record
+        from core.baseline import catchall_shell, is_catchall
         from core.escalation import sensitive_hits
         from scanners.idor_deep import identity_markers
+
+        # An SPA/framework catch-all 200s its public shell for every path; that
+        # shell is not privileged content, so baseline it once and reject any
+        # candidate that is merely the same shell.
+        shell = (await catchall_shell(ctx.http, endpoints[0], no_session=True)
+                 if endpoints else None)
 
         async def _anon_get(u: str):
             # zero credentials: no loaded session, no Cookie, no Authorization
@@ -192,6 +199,8 @@ class LogicAgent(BaseAgent):
             if is_static_asset(u_url, ev.response_headers):
                 return False, [], [], "static asset"
             body = ev.response_body or ""
+            if is_catchall(body, shell):
+                return False, [], [], "app catch-all shell (not privileged content)"
             mk = sorted(identity_markers(body))[:6]
             sv = [k for k, _ in sensitive_hits(body, ev.response_headers)]
             if not mk and not sv:

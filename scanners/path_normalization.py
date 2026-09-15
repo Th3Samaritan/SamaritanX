@@ -24,6 +24,7 @@ import asyncio
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
+from core.baseline import catchall_shell, is_catchall
 from core.poc import is_auth_wall, is_static_asset, proof_record
 
 if TYPE_CHECKING:
@@ -85,6 +86,9 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if base_ev.status not in (401, 403):
         return findings
     base_len = len(base_ev.response_body or "")
+    # SPA/framework catch-alls 200 their public shell for unmatched paths; that
+    # is not a bypass, so reject any variant that just falls through to it.
+    shell = await catchall_shell(ctx.http, url)
 
     sem = asyncio.Semaphore(8)
 
@@ -95,6 +99,8 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
         if ev.status not in range(200, 300) or ev.status in (204,):
             return
         body = ev.response_body or ""
+        if is_catchall(body, shell):
+            return
         if header:
             clean = await ctx.http.get(variant, allow_redirects=False)
             if clean.status == ev.status and clean.response_body == body:

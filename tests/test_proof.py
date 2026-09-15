@@ -87,6 +87,10 @@ class _FakeHTTP:
         self._ev = ev
 
     async def get(self, url, **kw):
+        # the catch-all probe targets a guaranteed-missing path; a real app
+        # answers it 404, so the shell baseline is empty
+        if "sx-catchall-" in url:
+            return _FakeEvidence(404, {"content-type": "text/plain"}, "not found")
         return self._ev
 
 
