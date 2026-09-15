@@ -95,7 +95,7 @@ Full validation log: `workspace/subfinder-fixed-selftest.txt`.
 
 Re-ran the required gates on the current working tree (Windows host):
 
-- Full unit suite: **359 tests passed**.
+- Full unit suite: **363 tests passed**.
 - Structural self-test: **162 passed, 0 failed**.
 - `compileall` (core, agents, scanners, reporting, assessments, bench,
   samaritanx.py): exit 0.
@@ -113,3 +113,17 @@ cp1252 codec, so a non-ASCII byte killed the subprocess reader thread, left
 `'NoneType' object has no attribute 'strip'`. The helper now forces
 `encoding="utf-8", errors="replace"` and tolerates missing `stderr`/`stdout`;
 `tests/test_assessment_automation.RuntimeDecodingTests` covers both paths.
+
+Two further transport defects were found and repaired while running the real
+lab benchmark (details and measurements in the automation plan §20):
+
+- `TransportBlocked` policy/budget denials and `asyncio.CancelledError` were
+  recorded as origin circuit failures, so policy denials and deadline
+  cancellations opened the breaker and blocked healthy tests.
+- The breaker opened on absolute failure counts alone; it now also requires a
+  minimum failure rate so isolated timeouts cannot take a healthy origin down.
+
+Effect on the local lab: blocked scanner executions 330 → 0 and completed
+executions 433 → 498 at the same 600 s budget. Regression tests:
+`tests/test_audit_regressions.py::CircuitPolicyTests` and the failure-rate
+cases in `tests/test_milestone2.py`.

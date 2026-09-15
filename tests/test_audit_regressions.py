@@ -183,3 +183,50 @@ class AdditionalFailurePaths(unittest.IsolatedAsyncioTestCase):
             template.write_text('second')
             self.assertTrue(before)
             self.assertNotEqual(before, template_selection_digest(config))
+
+
+class CircuitPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Local policy blocks and cancellations are not origin failures."""
+
+    async def _client(self, **breaker):
+        cfg = {"stealth": {"enabled": False},
+               "transport": {"circuit_breaker": {"enabled": True, **breaker}}}
+        client = StealthHttpClient(cfg)
+        await client.close()
+        return client
+
+    async def test_policy_block_does_not_trip_origin_breaker(self):
+        from core.transport import TransportBlocked
+        client = await self._client(failure_threshold=2, window_s=60, cooldown_s=30)
+
+        def blocked(request):
+            raise TransportBlocked("scope denied")
+
+        raw = httpx.AsyncClient(transport=httpx.MockTransport(blocked))
+        client._client = raw
+        client._clients = [raw]
+        try:
+            for _ in range(5):
+                evidence = await client.get("http://lab.test/")
+                self.assertIn("TransportBlocked", evidence.error)
+            breaker = client._circuit_registry().breaker("lab.test")
+            self.assertEqual(breaker.state, "closed")
+            self.assertEqual(len(breaker._failures), 0)
+        finally:
+            await client.close()
+
+    async def test_cancellation_does_not_trip_origin_breaker(self):
+        client = await self._client(failure_threshold=1)
+
+        def cancelled(request):
+            raise asyncio.CancelledError()
+
+        raw = httpx.AsyncClient(transport=httpx.MockTransport(cancelled))
+        client._client = raw
+        client._clients = [raw]
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await client.get("http://lab.test/")
+            self.assertEqual(client._circuit_registry().breaker("lab.test").state, "closed")
+        finally:
+            await client.close()

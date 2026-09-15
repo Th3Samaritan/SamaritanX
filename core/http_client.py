@@ -481,13 +481,13 @@ class StealthHttpClient:
                 wait = min(wait, 120.0)
                 self._host_buckets[host].slow_down(wait, factor=0.2)
                 self._host_buckets[host].record_error()
-                breaker.record_failure(elapsed_s)
+                breaker.record_failure(elapsed_s, reason=f"status {resp.status_code}")
                 if self.dashboard:
                     self.dashboard.event("info",
                         f"backoff: host={host} status={resp.status_code} cooldown={wait:.0f}s")
             elif resp.status_code >= 500:
                 self._host_buckets[host].record_error()
-                breaker.record_failure(elapsed_s)
+                breaker.record_failure(elapsed_s, reason=f"status {resp.status_code}")
             else:
                 self._host_buckets[host].record_success()
                 breaker.record_success()
@@ -526,10 +526,16 @@ class StealthHttpClient:
                        "identity": "anonymous" if no_session else getattr(self.session, "label", "anonymous")},
             )
         except asyncio.CancelledError:
-            breaker.record_failure()
+            # cancellation is a local scheduling decision (scanner timeout,
+            # shutdown), never an origin fault — counting it as a failure let
+            # deadline cancellations open the breaker and block healthy tests
             raise
         except Exception as exc:
-            breaker.record_failure()
+            # local policy/budget decisions (scope, local-only, mutation,
+            # scanner budget) are not origin failures either
+            from core.scan_execution import RequestBudgetExceeded
+            if not isinstance(exc, RequestBudgetExceeded):
+                breaker.record_failure(reason=type(exc).__name__)
             return HttpEvidence(
                 method=method.upper(),
                 url=url,

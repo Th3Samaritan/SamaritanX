@@ -87,6 +87,25 @@ class TestCircuitBreaker(unittest.TestCase):
         b.record_failure(latency_s=0.1)
         self.assertFalse(b.allows("GET"))           # 35s latency + 2 = threshold 3
 
+    def test_healthy_origin_survives_isolated_timeouts(self):
+        clock = FakeClock()
+        b = self._breaker(clock)
+        for _ in range(3):
+            for _ in range(5):
+                b.record_success()
+            b.record_failure(reason="ReadTimeout")
+        self.assertEqual(b.state, "closed")          # 3/18 failures < 50%
+        self.assertEqual(b.last_failure, "ReadTimeout")
+        self.assertTrue(b.allows("GET"))
+
+    def test_predominantly_failing_origin_still_opens(self):
+        clock = FakeClock()
+        b = self._breaker(clock)
+        for _ in range(3):
+            b.record_failure(reason="status 503")
+        b.record_success()                           # 3/4 failures >= 50%
+        self.assertEqual(b.state, "open")
+
     def test_failing_origin_cannot_starve_healthy_one(self):
         from core.circuit import CircuitRegistry
         clock = FakeClock()

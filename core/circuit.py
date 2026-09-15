@@ -30,6 +30,10 @@ class CircuitConfig:
     half_open_probes: int = 2         # max recovery probes while half-open
     latency_high_s: float = 30.0      # a single response this slow also counts
     probe_policy: str = "read_only"   # recovery probes must be GET/HEAD
+    # A mostly-healthy origin must not trip on a few isolated timeouts: opening
+    # additionally requires the failures to be at least this share of the
+    # window's outcomes. 0 disables the rate condition (pure count threshold).
+    min_failure_rate: float = 0.5
 
 
 class CircuitOpen(Exception):
@@ -43,7 +47,9 @@ class CircuitBreaker:
         self.cfg = cfg
         self.clock = clock or time.monotonic
         self.state = "closed"
+        self.last_failure = ""
         self._failures: deque[float] = deque()
+        self._successes: deque[float] = deque()
         self._opened_at = 0.0
         self._half_open_used = 0
 
@@ -69,25 +75,46 @@ class CircuitBreaker:
         return True
 
     # ---- outcomes ----
-    def record_failure(self, latency_s: float | None = None) -> None:
+    def record_failure(self, latency_s: float | None = None, reason: str = "") -> None:
         now = self.clock()
         self._trim(now)
         self._failures.append(now)
+        if reason:
+            self.last_failure = reason
         if latency_s is not None and latency_s >= self.cfg.latency_high_s:
             self._failures.append(now)
-        if self.state == "half_open" or len(self._failures) >= self.cfg.failure_threshold:
+            self.last_failure = f"high latency {latency_s:.1f}s"
+        if self.state == "half_open" or self._should_open():
             self._open(now)
 
     def record_success(self) -> None:
+        now = self.clock()
         if self.state == "half_open":
             self.state = "closed"
             self._failures.clear()
-        # successes do not shorten the failure window; only time does
+            self._successes.clear()
+            return
+        # successes do not shorten the failure window; they widen the
+        # denominator so a healthy origin cannot trip on isolated failures
+        self._successes.append(now)
+        self._trim(now)
+
+    def _should_open(self) -> bool:
+        failures = len(self._failures)
+        if failures < self.cfg.failure_threshold:
+            return False
+        rate = self.cfg.min_failure_rate
+        if rate <= 0:
+            return True
+        total = failures + len(self._successes)
+        return failures / total >= rate
 
     def _trim(self, now: float) -> None:
         cutoff = now - self.cfg.window_s
         while self._failures and self._failures[0] < cutoff:
             self._failures.popleft()
+        while self._successes and self._successes[0] < cutoff:
+            self._successes.popleft()
 
     def _open(self, now: float) -> None:
         self.state = "open"
@@ -101,7 +128,8 @@ class CircuitBreaker:
     def snapshot(self) -> dict:
         return {"state": self.state,
                 "failures_in_window": len(self._failures),
-                "opened_at": getattr(self, "_opened_at", 0.0)}
+                "opened_at": getattr(self, "_opened_at", 0.0),
+                "last_failure": getattr(self, "last_failure", "")}
 
 
 class CircuitRegistry:
@@ -116,6 +144,7 @@ class CircuitRegistry:
             cooldown_s=float(cfg.get("cooldown_s", 30)),
             half_open_probes=int(cfg.get("half_open_probes", 2)),
             latency_high_s=float(cfg.get("latency_high_s", 30)),
+            min_failure_rate=float(cfg.get("min_failure_rate", 0.5)),
         )
         self._clock = clock
         self._breakers: dict[str, CircuitBreaker] = {}

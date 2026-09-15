@@ -30,7 +30,7 @@ This document describes implementation; the proposed commands and files below do
 | Mobile dynamic | Attach to existing Android/iOS Appium sessions; app identity checks; bounded UI flows | Session provisioning, broader runtime checks, traffic collection and actual device validation |
 | Mobile traffic | Scoped HAR review and sanitized GET/HEAD API seeds | Automated capture, correlation and authenticated backend workflows |
 
-The current measured baseline is 359 unit tests and 162 structural checks
+The current measured baseline is 363 unit tests and 162 structural checks
 passing, plus resource (11/11) and three-adapter smoke gates, with the first
 real Juice Shop runs recorded in §20. Real mobile devices have not been tested
 in this workspace.
@@ -345,7 +345,7 @@ Reverify version-specific requirements during implementation. Preserve `IMPLEMEN
 
 | Gate | Result |
 | --- | --- |
-| `python -m unittest discover -s tests` | **359 passed** |
+| `python -m unittest discover -s tests` | **363 passed** |
 | `python selftest.py` | **162 passed, 0 failed** |
 | `python -m compileall -q core agents scanners reporting assessments bench samaritanx.py` | exit 0 |
 | `python -m bench.resource_gate` | **11/11 passed** (SQLite leak delta 0, 13 requests, memory/startup/cleanup) |
@@ -393,6 +393,39 @@ remained after any run. Artifacts:
 `workspace/juice-shop/<run-id>/benchmark.json`, `benchmark.md`,
 `challenges-before.json`, `challenges-after.json`, `lab.log`, and
 `scan/<origin-slug>/reports/{report.md,findings.json,candidates.json,coverage.json}`.
+
+### Iteration: circuit-breaker correctness (2026-09-15)
+
+Two transport defects were reproduced and fixed while raising coverage:
+
+- **Local policy/budget/cancel outcomes were counted as origin failures.**
+  `TransportBlocked` (scope, local-only, mutation and run-budget denials) and
+  `asyncio.CancelledError` were caught by the generic handler in
+  `core/http_client.py` and recorded as circuit failures, so policy denials
+  and deadline cancellations opened the breaker and blocked healthy
+  same-origin tests. Neither is recorded now: cancellation re-raises and the
+  handler checks `RequestBudgetExceeded` before counting a failure.
+- **Absolute failure counts ignored the healthy majority.** The breaker opened
+  after 5 failures in 60 s even when hundreds of requests had succeeded; on
+  the lab the trigger was `ReadTimeout` / `status 500`. `core/circuit.py` now
+  additionally requires a minimum failure *rate* (`min_failure_rate`, default
+  0.5) inside the rolling window.
+
+Measured effect on the local lab (anonymous, 600 s each):
+
+| Run id | Cycle | Blocked | Completed | Challenges solved | Verified |
+| --- | --- | --- | --- | --- | --- |
+| `e01eac95` | before fixes | 240 | 389 | 3 | 9 |
+| `11f52fa1` | policy/cancel fix | 324 | 476 | 3 | 9 |
+| `47cdd076` | diagnostics (`last_failure=ReadTimeout`) | 330 | 433 | 3 | 9 |
+| `fec01ff9` | failure-rate gate | **0** | **498** | **4** | **10** |
+
+The fourth challenge is **97 Exposed Metrics** (Observability Failures);
+27 Error Handling, 59 Outdated Allowlist and 76 Security Policy are solved on
+every run. The breaker's `last_failure` reason is now captured in its snapshot
+and in `benchmark.json:circuit`. Regression tests:
+`tests/test_milestone2.py` (failure-rate) and
+`tests/test_audit_regressions.py::CircuitPolicyTests` (policy/cancel).
 
 ### Layer and milestone status
 

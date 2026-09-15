@@ -67,6 +67,10 @@ def run(output, deadline=180, keep=False, distribution=None, authenticated=False
                             execution=orch.memory.execution_summary(orch.target_slug)))
         _atomic(reports / "coverage.json", orch.memory.execution_coverage(orch.target_slug))
         result["deadline_reached"] = orch.deadline_reached
+        try:
+            result["circuit"] = orch.http._circuit_registry().snapshot()
+        except Exception:
+            result["circuit"] = {}
         if result["status"] != "invalid":
             result["status"] = "partial" if orch.deadline_reached else "completed"
         code = 0 if result["status"] == "completed" else 2
