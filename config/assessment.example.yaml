@@ -1,0 +1,10 @@
+version: 1
+output: ../workspace/assessments
+phases:
+  - id: android-static
+    kind: mobile-static
+    artifact: ../workspace/mobile-lab/fixture.apk
+    required: true
+# Add independent local-audit, mobile-traffic, mobile-dynamic or web phases.
+# Web requires target and scope; dynamic requires platform, app_id, session_id.
+# File paths are relative to this profile. Use dedicated auth recipes for secrets.

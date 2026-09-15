@@ -1,6 +1,7 @@
 """Run actual adapter binaries against localhost and an in-process passive-provider stub."""
 import asyncio
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
@@ -11,6 +12,31 @@ import httpx
 
 from core.external_tools import Gateway
 from core.transport import TransportController, current_transport, create_subprocess_exec
+
+
+class SmokeTimeout(TimeoutError):
+    def __init__(self, timeout, stdout=b"", stderr=b""):
+        super().__init__(f"adapter exceeded {timeout:g}s; process terminated")
+        self.stdout = stdout.decode("utf-8", "replace")[-3000:]
+        self.stderr = stderr.decode("utf-8", "replace")[-3000:]
+
+
+async def collect_output(process, timeout):
+    communication = asyncio.create_task(process.communicate())
+    try:
+        return await asyncio.wait_for(asyncio.shield(communication), timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        stdout, stderr = b"", b""
+        try:
+            stdout, stderr = await asyncio.wait_for(communication, 5)
+        except Exception as exc:
+            stderr = f"output collection after termination: {type(exc).__name__}: {exc}".encode()
+        raise SmokeTimeout(timeout, stdout, stderr) from None
+    except asyncio.CancelledError:
+        process.kill()
+        await asyncio.gather(communication, return_exceptions=True)
+        raise
 
 
 class LocalHandler(BaseHTTPRequestHandler):
@@ -59,7 +85,7 @@ http:
             commands = {
                 "ffuf": ["ffuf", "-u", base + "/FUZZ", "-w", str(words), "-o", str(output), "-of", "json", "-s"],
                 "nuclei": ["nuclei", "-u", base, "-t", str(template), "-o", str(output), "-jsonl", "-silent"],
-                "subfinder": ["subfinder", "-d", "fixture.test", "-s", "crtsh", "-silent"],
+                "subfinder": ["subfinder", "-d", "fixture.test", "-s", "hackertarget", "-silent"],
             }
             for name, args in commands.items():
                 output.unlink(missing_ok=True)
@@ -69,10 +95,10 @@ http:
 
                 def provider(request):
                     upstream_requests.append(str(request.url))
-                    # All subfinder traffic ends here, including unexpected endpoints.
-                    if request.url.host == "crt.sh":
-                        return httpx.Response(200, stream=httpx.ByteStream(b'[{"name_value":"found.fixture.test"}]'),
-                                              headers={"content-type": "application/json"})
+                    # All proxied provider traffic ends here, including unexpected endpoints.
+                    if request.url.host == "api.hackertarget.com" and request.url.path == "/hostsearch/":
+                        return httpx.Response(200, stream=httpx.ByteStream(b'found.fixture.test,192.0.2.1\n'),
+                                              headers={"content-type": "text/plain"})
                     return httpx.Response(403, stream=httpx.ByteStream(b"outside local fixture"))
 
                 original_start = Gateway.start
@@ -83,12 +109,14 @@ http:
                         gateway.upstream = httpx.AsyncClient(transport=httpx.MockTransport(provider))
                     return await original_start(gateway)
 
+                started = time.monotonic()
+                process = None
                 token = current_transport.set(controller)
                 try:
                     with patch.object(Gateway, "start", start):
                         process = await create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
                                                                stderr=asyncio.subprocess.PIPE)
-                        stdout, stderr = await asyncio.wait_for(process.communicate(), 90)
+                        stdout, stderr = await collect_output(process, 30)
                     artifact = output.read_text(encoding="utf-8") if output.exists() else stdout.decode(errors="replace")
                     expected = {"ffuf": "/hit", "nuclei": "sx-local-adapter-smoke", "subfinder": "found.fixture.test"}[name]
                     passed = process.returncode == 0 and controller.used > 0 and expected in artifact
@@ -97,10 +125,12 @@ http:
                                      "stdout": stdout.decode(errors="replace")[-3000:],
                                      "stderr": stderr.decode(errors="replace")[-3000:]}
                 except Exception as exc:
-                    results[name] = {"passed": False, "error": str(exc), "operations": controller.used,
+                    results[name] = {"passed": False, "error": f"{type(exc).__name__}: {exc}", "operations": controller.used,
+                                     "stdout": getattr(exc, "stdout", ""), "stderr": getattr(exc, "stderr", ""),
                                      "upstream_requests": upstream_requests}
                 finally:
                     current_transport.reset(token)
+                results[name]["duration_s"] = round(time.monotonic() - started, 3)
                 print(name, json.dumps(results[name]), flush=True)
     finally:
         server.shutdown()

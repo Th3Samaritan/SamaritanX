@@ -33,7 +33,7 @@ class ScreenshotAgent(BaseAgent):
 
     async def handle(self, task: Task, ctx: "Context") -> None:
         try:
-            from playwright.async_api import async_playwright
+            from core.browser_pool import managed_playwright as async_playwright
         except ImportError:
             return
         from core.browser_pool import browser_slot

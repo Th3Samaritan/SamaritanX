@@ -154,14 +154,19 @@ and `workspace/tools/*manifest.json`. These runtime artifacts are gitignored.
 To reproduce on Windows AMD64:
 
 ```bash
-python -m bench.install_smoke_tools
-python -m bench.install_smoke_tools --templates-only
+python -m bench.install_smoke_tools --version "ffuf=<tag>" --version "nuclei=<tag>" --version "subfinder=<tag>"
+python -m bench.install_smoke_tools --templates-only --template-version "<tag>" --template-sha256 "<sha256>"
 python -m bench.adapter_smoke
 ```
 
-Installation downloads official GitHub releases; binary archives are checked
-against their published checksums. The template source archive is fetched over
-HTTPS from the official tagged release, with its digest recorded. The smoke
+Replace the quoted placeholders with explicit release tags and a trusted template
+archive SHA-256. Binary archives are verified against published checksums and
+stored under `workspace/tools/versions`. An atomic `active.json` selects each
+verified executable; legacy binaries remain available until a version is activated.
+Use `--activate TOOL TAG` to select an installed version or `--rollback TOOL` to
+restore its previous verified version. Add `--no-activate` to stage an installation.
+Template versions are immutable directories; set `external_tools.nuclei_templates`
+to the printed `http` directory after installation. The smoke
 harness sends no scan requests to third-party targets.
 
 Native fallbacks remain available where implemented. Skips are visible in job or
@@ -473,3 +478,47 @@ This is offensive tooling. Only point it at:
 ## License
 
 MIT — do whatever you want, attribution appreciated, no warranty.
+
+### Scheduling and persistent budgets
+
+Tasks and scanner slots rotate across ready origins and scanner kinds. Priority
+orders work within each lane. The transport budget is persisted in the memory
+SQLite database against the run manifest ID. Resume retains that ID and consumed
+operations; raising the configured limit cannot reset an existing run budget.
+A legacy run without a persisted ledger cannot be resumed with an assumed zero
+usage count; it requires an explicitly new run.
+Admitted operations remain charged after cancellation; cancelled work still
+waiting for a scanner slot releases that slot without a transport charge.
+
+The default 100,000-operation budget reserves 2,000 operations for cached clean
+baseline requests and 5,000 for fresh verification. Configure these with
+`transport.baseline_reserve` and `transport.verification_reserve`; their sum must
+fit the run budget. Reservations protect those operations from ordinary probes.
+
+`python -m bench.resource_gate` checks local accuracy, requests, SQLite handles,
+three startup samples, Python and process memory peaks, and real child/socket
+cleanup. Limits can be overridden under `resource_limits` using
+`startup_median_s`, `peak_python_mib`, and `peak_process_mib`. HTTP/2 acceptance
+uses `python -m unittest discover -s tests -p test_http2_lab.py` on loopback only.
+
+### Managed subfinder source boundary
+
+The managed adapter uses only `hackertarget`, whose HTTP request is routed through
+the gateway. Explicit `crtsh`, mixed lists and other unreviewed sources are rejected
+before a process starts. Subfinder 2.16.0's `crtsh` source opens PostgreSQL directly
+before its HTTP fallback, so an HTTP proxy cannot constrain that source. Earlier
+crtsh-based smoke passes did not establish that all provider traffic was proxied.
+The corrected smoke uses an in-process `api.hackertarget.com` emulator and records
+per-tool duration and bounded stdout/stderr on timeout. This validates that source,
+not every subfinder provider. The gateway remains a cooperative adapter, not an OS
+network sandbox.
+
+Upstream source review: [crtsh](https://github.com/projectdiscovery/subfinder/blob/v2.16.0/pkg/subscraping/sources/crtsh/crtsh.go)
+and [hackertarget](https://github.com/projectdiscovery/subfinder/blob/v2.16.0/pkg/subscraping/sources/hackertarget/hackertarget.go).
+
+### Mobile and local privilege assessment
+
+Android/iOS static and Appium-based dynamic assessment, scoped mobile HAR analysis,
+and read-only Windows/Linux privilege-policy review are available. See
+[MOBILE_AND_LOCAL_ASSESSMENT.md](MOBILE_AND_LOCAL_ASSESSMENT.md) for commands, device
+requirements, evidence boundaries and coverage limits.

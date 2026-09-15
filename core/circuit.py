@@ -75,7 +75,7 @@ class CircuitBreaker:
         self._failures.append(now)
         if latency_s is not None and latency_s >= self.cfg.latency_high_s:
             self._failures.append(now)
-        if len(self._failures) >= self.cfg.failure_threshold:
+        if self.state == "half_open" or len(self._failures) >= self.cfg.failure_threshold:
             self._open(now)
 
     def record_success(self) -> None:

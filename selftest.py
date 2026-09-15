@@ -63,7 +63,7 @@ def section(title: str) -> None:
 def check_imports() -> None:
     section("module imports")
     modules: list[str] = []
-    for pkg in ("core", "agents", "scanners", "reporting"):
+    for pkg in ("core", "agents", "scanners", "reporting", "assessments"):
         for f in sorted((ROOT / pkg).glob("*.py")):
             if f.stem == "__init__":
                 continue

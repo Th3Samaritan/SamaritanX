@@ -69,6 +69,22 @@ from agents.screenshot_agent import ScreenshotAgent  # noqa: E402
 from agents.reporting_agent import ReportingAgent  # noqa: E402
 
 app = typer.Typer(add_completion=False, help="Agentic bug-bounty framework — operator: th3Samaritan")
+from assessments.cli import register as register_assessments
+register_assessments(app)
+
+@app.command("assess")
+def assess_profile(profile: Path = typer.Option(..., "--profile", exists=True, dir_okay=False),
+                   preflight: bool = typer.Option(False, "--preflight")):
+    """Execute a versioned assessment profile with separate phase outcomes."""
+    from core.assessment_runner import run_profile
+    import json
+    try:
+        result, code = run_profile(profile, check_only=preflight)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(result, indent=2))
+    raise typer.Exit(code)
+
 console = Console()
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "config.yaml"
 __version__ = "1.0.0"
@@ -117,11 +133,14 @@ def banner() -> None:
 def run_scan(target: str, *, config: Path | None = None, scope: Path | None = None,
              only: str = "", deadline: float = 0.0, rate: float = 0.0,
              no_pdf: bool = True, no_screenshots: bool = True,
-             no_oob: bool = True) -> None:
+             no_oob: bool = True, workspace: Path | None = None) -> None:
     """Programmatic entry point used by bench.runner and embedders.
 
     Runs the full agent pipeline synchronously and writes the workspace."""
     cfg = load_config(config)
+    if workspace is not None:
+        cfg.setdefault("workspace", {})["root"] = str(workspace)
+        cfg.setdefault("memory", {})["db_path"] = str(Path(workspace) / ".samaritanx.sqlite")
     if only:
         cfg.setdefault("scanners", {})["enabled"] = [s.strip() for s in only.split(",") if s.strip()]
     if rate > 0:
@@ -209,6 +228,7 @@ def scan(
     resume: bool = typer.Option(False, "--resume", help="reuse memory state from a prior run (skip already-completed phases)"),
     deadline: float = typer.Option(0.0, "--deadline", help="max scan duration in seconds (0 = no limit). Kills the run gracefully when exceeded"),
     task_timeout: float = typer.Option(60.0, "--task-timeout", help="max seconds a single agent task may run before being cancelled"),
+    api_seeds: Path = typer.Option(None, "--api-seeds", help="read-only API seeds exported by mobile-traffic"),
     wordlist: Path = typer.Option(None, "--wordlist", help="custom wordlist for content discovery"),
     tor: bool = typer.Option(False, "--tor", help="route all traffic via Tor (socks5://127.0.0.1:9050)"),
     proxy: str = typer.Option("", "--proxy", help="HTTP/SOCKS proxy URL (overrides config)"),
@@ -238,6 +258,9 @@ def scan(
         console.print("[yellow]config warnings:[/yellow]")
         for msg in cfg_issues:
             console.print(f"  [dim]- {msg}[/dim]")
+
+    if api_seeds:
+        cfg.setdefault("scan", {})["api_seed_file"] = str(api_seeds)
 
     # CLI overrides
     if profile:

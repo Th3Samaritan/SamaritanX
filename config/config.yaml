@@ -243,6 +243,8 @@ hackerone:
 
 # Explicit expectations are required before shared identity markers prove BOLA.
 transport:
+  baseline_reserve: 2000
+  verification_reserve: 5000
   operation_budget: 100000           # HTTP hops, browser requests, raw connections/writes
   strict_mutations: false            # when true: unclassified state-changing requests
                                      # require safety.aggressive (auth login flows stay

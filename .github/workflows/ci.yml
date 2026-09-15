@@ -50,3 +50,25 @@ jobs:
 
       - name: Structural self-test (imports, registry, config, routing)
         run: python selftest.py
+
+      - name: Real HTTP/2 integration lab
+        run: python -m unittest discover -s tests -p test_http2_lab.py -v
+
+      - name: Local resource regression gate
+        run: python -m bench.resource_gate
+
+  browser-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies and Chromium
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Require browser capabilities and execute integration tests
+        run: |
+          python -c "from core.readiness import _check_browser; r = _check_browser({}); print(r); assert r['status'] == 'ok'"
+          python -c "import unittest; suite = unittest.defaultTestLoader.discover('tests', pattern='test_browser_lab.py'); result = unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)"

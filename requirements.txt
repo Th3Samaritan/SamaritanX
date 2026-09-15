@@ -47,3 +47,6 @@ websockets>=12.0
 # Optional LLM reasoning layer
 anthropic>=0.39.0
 openai>=1.30.0
+
+# Untrusted APK manifests and mobile UI hierarchies
+defusedxml>=0.7.1

@@ -150,6 +150,11 @@ class _ScopeRedirectBlocked(Exception):
 
 _bypass_var: "ContextVar[bool]" = ContextVar("sx_bypass_scope", default=False)
 _sanctioned_var: "ContextVar[bool]" = ContextVar("sx_sanctioned_mutation", default=False)
+_credential_origin = ContextVar("sx_credential_origin", default=None)
+
+def _request_origin(url):
+    parsed = httpx.URL(url)
+    return (parsed.scheme, parsed.host, parsed.port or (443 if parsed.scheme == "https" else 80))
 
 # header names that may carry credentials — never forwarded across origins
 _CRED_HEADER_RE = re.compile(r"(authorization|cookie|proxy-authorization|x-api-key|"
@@ -268,6 +273,12 @@ class StealthHttpClient:
         from core.transport import current_transport
         from core.scan_execution import request_budget
         controller = getattr(self, "transport", None) or current_transport.get()
+        origin = _credential_origin.get()
+        if origin is not None and _request_origin(request.url) != origin:
+            # HTTPX only strips standard authorization on redirects.
+            for name in list(request.headers):
+                if _CRED_HEADER_RE.search(name):
+                    del request.headers[name]
         bypass = _bypass_var.get()
         mutating = request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
         sanctioned = _sanctioned_var.get()
@@ -431,6 +442,7 @@ class StealthHttpClient:
             self._pool_idx = (self._pool_idx + 1) % len(self._clients)
             client = self._clients[self._pool_idx]
         _tok = _bypass_var.set(bypass_scope)
+        _origin_tok = _credential_origin.set(_request_origin(url))
         try:
             try:
                 resp = await client.request(
@@ -446,6 +458,7 @@ class StealthHttpClient:
                 )
             finally:
                 _bypass_var.reset(_tok)
+                _credential_origin.reset(_origin_tok)
             body = ""
             try:
                 body = resp.text
@@ -475,7 +488,7 @@ class StealthHttpClient:
             elif resp.status_code >= 500:
                 self._host_buckets[host].record_error()
                 breaker.record_failure(elapsed_s)
-            elif resp.status_code < 400:
+            else:
                 self._host_buckets[host].record_success()
                 breaker.record_success()
 
@@ -512,6 +525,9 @@ class StealthHttpClient:
                 extra={"set_cookie_headers": set_cookies,
                        "identity": "anonymous" if no_session else getattr(self.session, "label", "anonymous")},
             )
+        except asyncio.CancelledError:
+            breaker.record_failure()
+            raise
         except Exception as exc:
             breaker.record_failure()
             return HttpEvidence(

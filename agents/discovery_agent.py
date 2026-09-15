@@ -72,19 +72,21 @@ class DiscoveryAgent(BaseAgent):
             return
         ctx.dashboard.event("info", f"discovery: {host}")
 
-        await asyncio.gather(
-            self._content_discovery(base, host, ctx),
-            self._historical_urls(host, ctx),
-            self._cloud_buckets(ctx),
-            self._github_dorks(ctx),
-            self._js_endpoints(base, ctx),
-            self._openapi(base, host, ctx),
-        )
+        cfg = ctx.config.get("discovery", {})
+        local_only = ctx.config.get("recon", {}).get("local_only", False)
+        jobs = [self._content_discovery(base, host, ctx), self._js_endpoints(base, ctx)]
+        if cfg.get("openapi", True):
+            jobs.append(self._openapi(base, host, ctx))
+        if not local_only:
+            if cfg.get("wayback", True): jobs.append(self._historical_urls(host, ctx))
+            if cfg.get("cloud_buckets", True): jobs.append(self._cloud_buckets(ctx))
+            if cfg.get("github_dorks", True): jobs.append(self._github_dorks(ctx))
+        await asyncio.gather(*jobs)
         ctx.memory.mark_completed(ctx.target_slug, f"discover:{host}")
 
     # ---------- content discovery ----------
     async def _content_discovery(self, base: str, host: str, ctx: "Context") -> None:
-        if external_tool_path("ffuf", ctx.config):
+        if ctx.config.get("discovery", {}).get("ffuf", True) and external_tool_path("ffuf", ctx.config):
             try:
                 if await self._run_ffuf(base, host, ctx):
                     return
@@ -102,11 +104,25 @@ class DiscoveryAgent(BaseAgent):
         sem = asyncio.Semaphore(int(ctx.config.get("concurrency", {}).get("scanner_workers", 8)))
         hits: list[dict] = []
 
+        import hashlib
+        import secrets
+        from core.transport import operation_purpose
+        token = operation_purpose.set("baseline")
+        try:
+            controls = [await ctx.http.get(urljoin(base + "/", "sx-missing-" + secrets.token_hex(12)), allow_redirects=False) for _ in range(2)]
+        finally:
+            operation_purpose.reset(token)
+        def signature(ev):
+            return ev.status, hashlib.sha256((ev.response_body or "").encode()).hexdigest()
+        wildcard = signature(controls[0]) if all(not ev.error and ev.status and ev.response_body for ev in controls) and signature(controls[0]) == signature(controls[1]) else None
+
         async def probe(word: str) -> None:
             url = urljoin(base + "/", word)
             async with sem:
                 ev = await ctx.http.get(url, allow_redirects=False)
             ctx.dashboard.advance(f"discovery:{host}")
+            if wildcard and signature(ev) == wildcard:
+                return
             if ev.status in (200, 201, 204, 301, 302, 401, 403):
                 hits.append({"url": url, "status": ev.status,
                              "size": len(ev.response_body or ""),

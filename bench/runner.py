@@ -36,12 +36,12 @@ from core.utils import slugify
 
 def _load(path: Path) -> list[dict]:
     if not path.exists():
-        return []
+        raise FileNotFoundError(f"benchmark report missing: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else data.get("findings", [])
-    except Exception:
-        return []
+    except Exception as exc:
+        raise ValueError(f"invalid benchmark report: {path}") from exc
 
 
 def _answers_by_target(answers: list[dict]) -> dict[str, list[dict]]:
@@ -97,9 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         for target in _answers_by_target(answers):
             print(f"[bench] scanning {target} …", file=sys.stderr)
             try:
-                run_scan(target, rate=args.rate, deadline=args.deadline)
+                run_scan(target, rate=args.rate, deadline=args.deadline, workspace=args.workspace)
             except Exception as exc:  # noqa: BLE001
                 print(f"[bench] scan of {target} failed: {exc}", file=sys.stderr)
+                return 1
 
     result = score_existing(args.answers, args.workspace)
     print(format_scoreboard(result))

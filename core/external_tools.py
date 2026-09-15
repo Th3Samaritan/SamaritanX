@@ -61,6 +61,16 @@ def command(tool_args, proxy):
         "nuclei": ["-proxy", proxy, "-proxy-internal", "-type", "http", "-ni", "-duc"],
         "subfinder": ["-proxy", proxy, "-duc"],
     }[tool]
+    if tool == "subfinder":
+        # crtsh attempts direct PostgreSQL before HTTP; proxy flags cannot
+        # constrain it. Permit only the reviewed HTTP source, including when
+        # the caller omits -s (subfinder's defaults include crtsh).
+        if "-s" in seen:
+            sources = str(tool_args[tool_args.index("-s") + 1]).split(",")
+            if sources != ["hackertarget"]:
+                raise TransportBlocked("managed subfinder supports only the HTTP source hackertarget")
+        else:
+            extra.extend(["-s", "hackertarget"])
     return [str(a) for a in tool_args] + extra
 
 

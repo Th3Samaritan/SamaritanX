@@ -10,6 +10,8 @@ from .req_cache import BaselineCache
 async def fresh_check(ctx, finding, checker):
     fresh = copy.copy(ctx)
     fresh.cache = BaselineCache(ttl=0)
+    from .transport import operation_purpose
+    token = operation_purpose.set("verification")
     clients = []
     try:
         for attr in ("http", "http2"):
@@ -44,6 +46,7 @@ async def fresh_check(ctx, finding, checker):
                 return None
         return await checker(fresh, finding)
     finally:
+        operation_purpose.reset(token)
         for client in clients:
             await client.close()
 

@@ -9,13 +9,14 @@ from __future__ import annotations
 
 from core.transport import external_tool_path, TransportBlocked, create_subprocess_exec as managed_create_subprocess_exec
 
+import uuid
 import asyncio
 import json
 import shutil
 import time
 from typing import TYPE_CHECKING
 
-from core.task_queue import Task
+from core.task_queue import Task, FairSlots
 from core.utils import host_of
 from scanners import REGISTRY, HIGH_VALUE
 from scanners.subdomain_takeover import scan_takeover
@@ -97,8 +98,8 @@ class VulnerabilityAgent(BaseAgent):
     async def _safe(self, name, fn, ctx, url, params, method, form, key=None):
         if self._scanner_slots is None:
             cap = max(1, min(128, int(ctx.config.get("concurrency", {}).get("scanner_workers", 12))))
-            self._scanner_slots = asyncio.Semaphore(cap)
-        async with self._scanner_slots:
+            self._scanner_slots = FairSlots(cap)
+        async with self._scanner_slots.slot(url, name):
             return await self._execute(name, fn, ctx, url, params, method, form, key)
 
     async def _execute(self, name, fn, ctx, url, params, method, form, key=None):
@@ -202,7 +203,7 @@ class VulnerabilityAgent(BaseAgent):
         per_group_timeout = float(ctx.config.get("external_tools", {}).get("nuclei_group_timeout", 120))
 
         for label, template_arg in groups:
-            batch_out = ctx.workspace / "vulns" / f"{slugify(host)}_nuclei_{label}.jsonl"
+            batch_out = ctx.workspace / "vulns" / f"{slugify(host)}_nuclei_{label}_{uuid.uuid4().hex}.jsonl"
             key = f"external:nuclei:{host}:{label}"
             run_id = getattr(ctx, "run_id", "") or ""
 
@@ -211,7 +212,8 @@ class VulnerabilityAgent(BaseAgent):
             # invalidate the resume decision
             from core.run_manifest import template_selection_digest
             group_cfg = dict(ctx.config)
-            group_cfg.setdefault("external_tools", {})["nuclei_templates"] = template_arg
+            group_cfg["external_tools"] = dict(ctx.config.get("external_tools") or {})
+            group_cfg["external_tools"]["nuclei_templates"] = template_arg
             group_digest = template_selection_digest(group_cfg)
             if ctx.resume:
                 prev_ctx = {}
@@ -235,10 +237,6 @@ class VulnerabilityAgent(BaseAgent):
                                                  "label": label, "host": host})
             # unique output per attempt: stale output from a previous attempt
             # must never be imported
-            try:
-                batch_out.unlink(missing_ok=True)
-            except Exception:
-                pass
 
             proc = None
             t0 = time.perf_counter()

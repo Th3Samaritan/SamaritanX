@@ -30,19 +30,26 @@ def build_trace(finding: dict[str, Any]) -> dict[str, Any]:
     meta = finding.get("metadata") or {}
     poc = meta.get("poc") if isinstance(meta.get("poc"), dict) else {}
     status, reason = poc_status(finding)
+    baseline = meta.get("verification_baseline") or {}
+    if not isinstance(baseline, dict):
+        baseline = {}
+    excerpt = baseline.get("response_excerpt")
     trace = {
         "version": TRACE_VERSION,
         "gate_decision": status,          # verified | candidate (from the gate)
         "gate_reason": reason,            # stable reason code/explanation
         "baseline": {
-            "response_captured": bool(finding.get("response")),
-            "baseline_hash": evidence_hash(finding.get("response")),
+            "response_captured": excerpt is not None,
+            "baseline_hash": evidence_hash(excerpt),
+            "hash_scope": "response_excerpt" if excerpt is not None else None,
+            "source": "verification_baseline" if excerpt is not None else None,
         },
         "observation": {
             "detection": meta.get("detection"),
             "category": finding.get("category"),
             "parameter": finding.get("parameter"),
             "evidence_hash": evidence_hash(finding.get("evidence")),
+            "response_hash": evidence_hash(finding.get("response")),
         },
         "verification": {
             "revalidated": meta.get("revalidated"),

@@ -17,6 +17,8 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
+from contextlib import asynccontextmanager
 
 
 @dataclass(order=True)
@@ -31,11 +33,86 @@ class Task:
     owner: str = field(default="", compare=False)
 
 
+class FairPriorityQueue(asyncio.Queue):
+    """Round-robin origins and scanner kinds; priority orders each lane.
+
+    Newly ready lanes receive a turn before recently served lanes. A busy
+    origin cannot monopolize workers by flooding the queue with one scanner.
+    """
+    def _init(self, maxsize):
+        self._queue = []
+        self._origins, self._lanes = {}, {}
+        self._turn = 0
+
+    @staticmethod
+    def lane(task):
+        url = task.payload.get("url") or task.payload.get("target") or task.target
+        parsed = urlsplit(str(url) if "://" in str(url) else "http://" + str(url))
+        return (parsed.netloc.lower(), task.kind)
+
+    def _put(self, task):
+        self._queue.append(task)
+
+    def _get(self):
+        def rank(task):
+            origin, kind = self.lane(task)
+            return (task.priority >= 99999, self._origins.get(origin, 0),
+                    self._lanes.get((origin, kind), 0), task.priority, task.seq)
+        index = min(range(len(self._queue)), key=lambda i: rank(self._queue[i]))
+        task = self._queue.pop(index)
+        origin, kind = self.lane(task)
+        self._turn += 1
+        self._origins[origin] = self._turn
+        self._lanes[(origin, kind)] = self._turn
+        if not self._queue:
+            self._origins.clear()
+            self._lanes.clear()
+        return task
+
+
+class FairSlots:
+    """Bounded execution slots shared fairly by origin and scanner."""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.available = capacity
+        self.queue = FairPriorityQueue()
+        self.waiters = {}
+        self.sequence = itertools.count()
+
+    def _dispatch(self):
+        while self.available and not self.queue.empty():
+            task = self.queue.get_nowait()
+            self.queue.task_done()
+            future = self.waiters.pop(task.seq)
+            if future.cancelled():
+                continue
+            self.available -= 1
+            future.set_result(True)
+
+    @asynccontextmanager
+    async def slot(self, url, scanner):
+        sequence = next(self.sequence)
+        future = asyncio.get_running_loop().create_future()
+        self.waiters[sequence] = future
+        self.queue.put_nowait(Task(5, sequence, scanner, "", {"url": url}))
+        asyncio.get_running_loop().call_soon(self._dispatch)
+        acquired = False
+        try:
+            await future
+            acquired = True
+            yield
+        finally:
+            if acquired or (future.done() and not future.cancelled()):
+                self.available += 1
+            future.cancel()
+            self._dispatch()
+
+
 class TaskQueue:
     """An async priority queue with simple per-kind subscription routing."""
 
     def __init__(self, store=None, lease_seconds=60) -> None:
-        self._q: asyncio.PriorityQueue[Task] = asyncio.PriorityQueue()
+        self._q: asyncio.Queue[Task] = FairPriorityQueue()
         self._counter = itertools.count()
         self._stats: dict[str, int] = {}
         self.store = store

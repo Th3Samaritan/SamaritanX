@@ -44,8 +44,13 @@ class BaselineCache:
         fn = getattr(http, "request", None)
         if fn is None:
             return None
-        ev = await fn(method.upper(), url, headers=headers, cookies=cookies,
-                      allow_redirects=allow_redirects)
+        from .transport import operation_purpose
+        token = operation_purpose.set("baseline")
+        try:
+            ev = await fn(method.upper(), url, headers=headers, cookies=cookies,
+                          allow_redirects=allow_redirects)
+        finally:
+            operation_purpose.reset(token)
         # only cache clean, successful, error-free responses
         if ev is not None and not getattr(ev, "error", None) and \
                 200 <= (getattr(ev, "status", 0) or 0) < 400:

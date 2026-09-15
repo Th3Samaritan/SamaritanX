@@ -127,7 +127,7 @@ async def scan(ctx: "Context", url: str, params: list[str], method: str = "GET",
     if method.upper() != "GET":
         return []
     try:
-        from playwright.async_api import async_playwright
+        from core.browser_pool import managed_playwright as async_playwright
     except ImportError:
         return []
 

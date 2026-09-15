@@ -431,7 +431,7 @@ class CrawlerAgent(BaseAgent):
 
     async def _render_with_browser(self, seed_url: str, state: CrawlState, ctx: "Context") -> None:
         try:
-            from playwright.async_api import async_playwright
+            from core.browser_pool import managed_playwright as async_playwright
         except ImportError:
             ctx.dashboard.event("info",
                 "crawler: Playwright unavailable — JS render + authenticated XHR "

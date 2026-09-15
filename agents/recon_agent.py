@@ -104,6 +104,21 @@ class ReconAgent(BaseAgent):
             )
             ctx.dashboard.event("ok", f"recon: live {entry['url']} -> crawler + discovery")
 
+        if ctx.config.get("recon", {}).get("local_only", False):
+            from urllib.parse import urlsplit
+            import ipaddress
+            parsed = urlsplit(target_url)
+            if parsed.scheme not in {"http", "https"} or parsed.username or not ipaddress.ip_address(parsed.hostname).is_loopback:
+                raise ValueError("local-only recon requires an explicit loopback origin")
+            ev = await asyncio.wait_for(ctx.http.get(target_url), timeout=15)
+            if ev.error or not ev.status:
+                raise RuntimeError("local lab is not reachable")
+            await emit_live({"url": target_url, "host": target_host, "status": ev.status,
+                             "title": self._extract_title(ev.response_body),
+                             "tech": self._fingerprint(ev.response_headers, ev.response_body)})
+            ctx.memory.mark_completed(ctx.target_slug, "recon")
+            return
+
         # 0) Probe the target host FIRST and emit immediately. This guarantees
         #    the pipeline progresses to crawl/scan within seconds even if
         #    subdomain enumeration is slow or finds nothing.

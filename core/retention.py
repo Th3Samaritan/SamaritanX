@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -160,34 +161,46 @@ def apply(plan_dict: dict, *, confirm: bool = False, memory=None) -> dict:
                 "reason": "retention disabled — set retention.enabled: true to delete"}
     records: list[dict] = []
     deleted: list[str] = []
+    completed: list[dict] = []
+    errors: list[dict] = []
+    workspace = Path(plan_dict["workspace"]).resolve()
+    out = _removals_path(workspace)
+
+    def journal(record):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
     for action in plan_dict.get("actions", []):
         path = Path(action["path"])
-        raw = None
         try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(workspace) or resolved == out.resolve():
+                raise ValueError("retention path outside managed workspace or targets journal")
             raw = path.read_bytes()
+            record = {"class": action["class"], "path": str(path),
+                      "reason": action["reason"],
+                      "sha256": hashlib.sha256(raw).hexdigest()}
+            # Persist intent before deletion so journal failures leave evidence intact.
+            journal({**record, "status": "pending", "requested_at": time.time()})
             path.unlink()
-        except OSError:
+        except (OSError, ValueError) as exc:
+            errors.append({"path": str(path), "error": str(exc)})
             continue
-        records.append({
-            "removed_at": time.time(),
-            "class": action["class"],
-            "path": str(path),
-            "reason": action["reason"],
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        })
+        completed.append(action)
         deleted.append(str(path))
-    if records:
-        out = _removals_path(Path(plan_dict["workspace"]))
+        record.update(status="removed", removed_at=time.time())
+        records.append(record)
         try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            with out.open("a", encoding="utf-8") as fh:
-                for record in records:
-                    fh.write(json.dumps(record) + "\n")
-        except OSError:
-            pass
-    marked = mark_removed_bundles(plan_dict, memory)
+            journal(record)
+        except OSError as exc:
+            errors.append({"path": str(path), "error": f"completion journal: {exc}"})
+    marked = mark_removed_bundles({**plan_dict, "actions": completed}, memory)
     return {"applied": True, "deleted": deleted, "records": records,
-            "findings_marked": marked, "reason": "cleanup applied"}
+            "findings_marked": marked, "errors": errors,
+            "reason": "cleanup partially failed" if errors else "cleanup applied"}
 
 
 def mark_removed_bundles(plan_dict: dict, memory) -> int:
@@ -220,7 +233,9 @@ def removal_records(workspace) -> list[dict]:
         line = line.strip()
         if line:
             try:
-                out.append(json.loads(line))
+                record = json.loads(line)
+                if record.get("status", "removed") == "removed":
+                    out.append(record)
             except json.JSONDecodeError:
                 continue
     return out

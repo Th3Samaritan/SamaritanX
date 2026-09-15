@@ -251,6 +251,7 @@ class Orchestrator:
             # block access to external recon/passive-intel services.
         from .transport import TransportController
         self.transport = TransportController(self.config, self.scope, self.target)
+        self.transport.bind_ledger(self.memory.db_path, self._run_id, resume=self.resume)
         self.http.transport = self.transport
         self.http.attach(scope=self.scope, dashboard=self.dashboard)
 
@@ -305,16 +306,18 @@ class Orchestrator:
         # 4) OOB collaborator — start the background poller so callbacks that
         # arrive after a scanner has moved on are still accumulated and can
         # upgrade findings at finalize.
-        self.oob = await OOBClient.create(self.config)
-        try:
-            await self.oob.start_polling(
-                interval=float(self.config.get("oob", {}).get("poll_interval", 5.0)))
-        except Exception:
-            pass
-        self.dashboard.event("info", f"oob: backend={self.oob.kind} "
-                                     f"{'registered' if self.oob.registered else 'unavailable'}")
+        if self.config.get("oob", {}).get("enabled", True):
+            self.oob = await OOBClient.create(self.config)
+            try:
+                await self.oob.start_polling(
+                    interval=float(self.config.get("oob", {}).get("poll_interval", 5.0)))
+            except Exception:
+                pass
+            self.dashboard.event("info", f"oob: backend={self.oob.kind} "
+                                         f"{'registered' if self.oob.registered else 'unavailable'}")
 
     async def run(self, *, initial_kind: str = "recon") -> None:
+        self.deadline_reached = False
         n_workers = sum([
             int(self.config.get("concurrency", {}).get("recon_workers", 4)),
             int(self.config.get("concurrency", {}).get("crawler_workers", 4)),
@@ -329,10 +332,10 @@ class Orchestrator:
             scope_text = Path(self.scope_file).read_text(encoding="utf-8", errors="replace") \
                 if self.scope_file else None
             self._manifest = write_manifest(self.config, self.target, self.workspace,
-                                            scope_text=scope_text)
+                                            scope_text=scope_text, resume=self.resume)
             self._run_id = self._manifest["run_id"]
-        except Exception:
-            self._manifest, self._run_id = {}, ""
+        except Exception as exc:
+            raise RuntimeError("run manifest required for durable operation accounting") from exc
         self.dashboard.event("info", f"run manifest: id={self._run_id}")
 
         with self.dashboard:
@@ -345,6 +348,12 @@ class Orchestrator:
                         continue
                     await self.queue.put(kind, payload, target=self.target_slug,
                                          priority=3, producer="orchestrator")
+            seed_file = self.config.get("scan", {}).get("api_seed_file")
+            if seed_file:
+                from assessments.mobile_traffic import enqueue_seeds
+                counts = await enqueue_seeds(seed_file, self.queue, self.transport,
+                    self.target_slug, passive=self.config.get("recon", {}).get("passive_only", False))
+                self.dashboard.event("info", f"mobile API seeds: {counts}")
             # seed the initial recon task
             await self.queue.put(initial_kind, {"target": self.target},
                                   target=self.target_slug, priority=1)
@@ -359,6 +368,7 @@ class Orchestrator:
                                       priority=1, producer="orchestrator")
                 await self._join_with_deadline("phase2")
             except asyncio.TimeoutError:
+                self.deadline_reached = True
                 self.dashboard.event("err", "global scan deadline reached — stopping")
                 # deliver whatever we found even when the deadline cut phase 2
                 await self._final_report()

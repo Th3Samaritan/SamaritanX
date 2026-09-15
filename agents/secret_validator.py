@@ -59,6 +59,8 @@ class SecretValidatorAgent(BaseAgent):
     handles = ("validate_secrets",)
 
     async def handle(self, task: Task, ctx: "Context") -> None:
+        if not ctx.config.get("secret_validation", {}).get("enabled", True):
+            return
         findings = ctx.memory.list_findings(ctx.target_slug)
         targets = [f for f in findings if f.get("category") == "secret_exposure"]
         if not targets:

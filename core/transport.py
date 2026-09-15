@@ -28,6 +28,7 @@ class TransportBlocked(RequestBudgetExceeded):
 
 
 current_transport = ContextVar("transport_controller", default=None)
+operation_purpose = ContextVar("operation_purpose", default="active")
 current_phase = ContextVar("transport_phase", default="active")
 
 # Provider hosts reachable with bypass_scope=True (secret validators, OOB
@@ -56,6 +57,10 @@ DEFAULT_PROVIDER_HOSTS = (
 def external_tool_path(name, config):
     directory = config.get("external_tools", {}).get("binary_dir")
     if directory:
+        from .tool_installation import active_binary
+        selected = active_binary(Path(directory), name)
+        if selected:
+            return str(selected)
         path = Path(directory) / (name + (".exe" if os.name == "nt" else ""))
         if path.is_file():
             return str(path.resolve())
@@ -78,6 +83,12 @@ class TransportController:
         self.rate = float(config.get("stealth", {}).get("rate_limit_rps", 6))
         self.per_host_rate = float(config.get("stealth", {}).get("per_host_rps", 2))
         self.used = 0
+        self.ledger = None
+        self.purpose_counts = Counter()
+        self.reserves = {name: max(0, int(cfg.get(name + "_reserve", 0)))
+                         for name in ("baseline", "verification")}
+        if sum(self.reserves.values()) > self.limit:
+            raise ValueError("reserved operations exceed the run budget")
         self.counts = Counter()
         self.blocked = Counter()
         self.cancelled = False
@@ -85,6 +96,13 @@ class TransportController:
         self._hosts = {}
         self._lock = asyncio.Lock()
         self.connections = set()
+
+    def bind_ledger(self, path, run_id, *, resume=False):
+        from .operation_ledger import OperationLedger
+        self.ledger = OperationLedger(path, run_id, self.limit, self.reserves, resume=resume)
+        self.limit, self.reserves = self.ledger.limit, self.ledger.reserves
+        self.purpose_counts = Counter(self.ledger.counts())
+        self.used = sum(self.purpose_counts.values())
 
     def cancel(self):
         self.cancelled = True
@@ -97,6 +115,11 @@ class TransportController:
     async def check_scope(self, url, kind="http"):
         if self.cancelled:
             raise TransportBlocked("run cancelled")
+        if self.config.get("recon", {}).get("local_only", False):
+            expected, actual = urlparse(self.target), urlparse(url)
+            if (actual.scheme, actual.hostname, actual.port) != (expected.scheme, expected.hostname, expected.port):
+                self.blocked["scope"] += 1
+                raise TransportBlocked("local-only assessment forbids off-origin traffic")
         if kind == "external_provider":
             if not self._provider_allowed(url):
                 self.blocked["provider_denied"] += 1
@@ -147,13 +170,20 @@ class TransportController:
             self.blocked["mutation"] += 1
             raise TransportBlocked("state-changing operation blocked (safety.aggressive off)")
         async with self._lock:
-            if self.used >= self.limit:
-                self.blocked["budget"] += 1
-                raise TransportBlocked("run operation budget exhausted")
+            from .operation_ledger import available
+            purpose = operation_purpose.get()
             budget = request_budget.get()
+            if budget is not None and budget.used >= budget.limit:
+                budget.take()
+            admitted = (self.ledger.take(purpose) if self.ledger else
+                        self.used + 1 if available(self.purpose_counts, self.limit, self.reserves, purpose) else None)
+            if admitted is None:
+                self.blocked["budget"] += 1
+                raise TransportBlocked("run operation budget exhausted or reserved")
             if budget is not None:
                 budget.take()
-            self.used += 1
+            self.used = admitted
+            self.purpose_counts[purpose] += 1
             self.counts[kind] += 1
             host = urlparse(url).netloc
             now = time.monotonic()
@@ -165,8 +195,12 @@ class TransportController:
             raise TransportBlocked("run cancelled")
 
     def snapshot(self):
+        if self.ledger:
+            self.purpose_counts = Counter(self.ledger.counts())
+            self.used = sum(self.purpose_counts.values())
         return {"operations": self.used, "limit": self.limit,
-                "by_transport": dict(self.counts), "blocked": dict(self.blocked)}
+                "by_transport": dict(self.counts), "by_purpose": dict(self.purpose_counts),
+                "reserved": dict(self.reserves), "blocked": dict(self.blocked)}
 
 
 async def guard_browser(context):
@@ -179,7 +213,9 @@ async def guard_browser(context):
 
     async def route_handler(route):
         try:
-            await controller.admit(route.request.url, "browser")
+            method = getattr(route.request, "method", "GET").upper()
+            await controller.admit(route.request.url, "browser",
+                                   mutating=method not in {"GET", "HEAD", "OPTIONS"})
             await route.continue_()
         except TransportBlocked:
             await route.abort()
@@ -210,6 +246,17 @@ class BudgetedWriter:
                 self.writer.write(data)
             self.pending.clear()
         await self.writer.drain()
+
+    def close(self):
+        self.pending.clear()
+        self.writer.close()
+        self.controller.connections.discard(self.writer)
+
+    async def wait_closed(self):
+        try:
+            await self.writer.wait_closed()
+        finally:
+            self.controller.connections.discard(self.writer)
 
     def __getattr__(self, name):
         return getattr(self.writer, name)

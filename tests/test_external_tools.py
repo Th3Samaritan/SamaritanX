@@ -32,6 +32,17 @@ class AdapterCommands(unittest.TestCase):
         self.assertEqual(argv[argv.index("-type") + 1], "http")
         self.assertIn("-proxy", command(["subfinder", "-d", "lab"], proxy))
 
+    def test_subfinder_defaults_to_reviewed_http_source(self):
+        argv = command(["subfinder", "-d", "fixture.test"], "http://localhost:1")
+        self.assertEqual(argv[argv.index("-s") + 1], "hackertarget")
+        explicit = command(["subfinder", "-d", "fixture.test", "-s", "hackertarget"], "http://localhost:1")
+        self.assertEqual(explicit.count("-s"), 1)
+
+    def test_subfinder_blocks_direct_database_and_unreviewed_sources(self):
+        for source in ("crtsh", "crtsh,hackertarget", "hackertarget,crtsh", "all", "sources.txt", "", "hackertarget,"):
+            with self.subTest(source=source), self.assertRaises(TransportBlocked):
+                command(["subfinder", "-d", "fixture.test", "-s", source], "http://localhost:1")
+
     def test_unsupported_commands_fail_closed(self):
         for argv in ([], ["python", "script.py"], ["amass", "enum", "-passive", "-norecursive", "-d", "lab"],
                      ["nuclei", "-u", "http://lab"],
@@ -153,3 +164,22 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await managed.wait(), 0)
         self.assertFalse(self.gateway.server.is_serving())
         self.assertNotIn(managed, self.controller.external_processes)
+
+
+class SmokeDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timeout_preserves_partial_output_and_reaps_process(self):
+        from bench.adapter_smoke import collect_output, SmokeTimeout
+        import sys
+        process = await asyncio.create_subprocess_exec(sys.executable, "-u", "-c",
+            "import sys,time; print('starting', flush=True); print('waiting for fixture',file=sys.stderr,flush=True); time.sleep(30)",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            with self.assertRaises(SmokeTimeout) as caught:
+                await collect_output(process, 1)
+            self.assertIn("starting", caught.exception.stdout)
+            self.assertIn("waiting for fixture", caught.exception.stderr)
+            self.assertIsNotNone(process.returncode)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()

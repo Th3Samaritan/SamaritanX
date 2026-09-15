@@ -1,0 +1,6 @@
+{
+  "steps": [
+    {"action": "type", "using": "accessibility id", "selector": "login_password", "value_env": "SX_TEST_PASSWORD"},
+    {"action": "click", "using": "accessibility id", "selector": "login_submit"}
+  ]
+}

@@ -65,28 +65,29 @@ def tool_hashes(config: dict) -> dict[str, str]:
 
 
 def template_selection_digest(config: dict, cap: int = 4000) -> str:
-    """Digest of the selected template files (relpath + content hash).
+    """Hash every selected path and its contents, including single-file selections.
 
-    Bounded: beyond `cap` files, the digest covers the sorted name list plus
-    the total count — still changes when templates are added/removed/edited.
+    ``cap`` remains accepted for callers of the old API, but never truncates
+    coverage: an unhashed template cannot safely participate in resume.
     """
     tpl = config.get("external_tools", {}).get("nuclei_templates")
     if not tpl:
         return ""
     root = Path(tpl)
-    if not root.is_dir():
+    if not root.exists():
         return ""
-    entries = []
-    count = 0
-    for p in sorted(root.rglob("*.yaml")):
-        count += 1
-        if count <= cap:
-            try:
-                entries.append((str(p.relative_to(root)), _hash_file(p)))
-            except Exception:
-                entries.append((str(p.relative_to(root)), "unreadable"))
-    material = json.dumps({"count": count, "entries": entries}, sort_keys=True)
-    return hashlib.sha256(material.encode()).hexdigest()
+    files = [root] if root.is_file() else sorted(
+        p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".yaml", ".yml"})
+    digest = hashlib.sha256()
+    for path in files:
+        name = path.name if root.is_file() else path.relative_to(root).as_posix()
+        content = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                content.update(block)
+        digest.update(json.dumps([name, content.hexdigest()]).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def scope_digest(scope_text: str | None) -> str:
@@ -130,14 +131,18 @@ def input_digest(manifest: dict) -> str:
 
 
 def write_manifest(config: dict, target: str, workspace: Path, *,
-                   scope_text: str | None = None) -> dict:
+                   scope_text: str | None = None, resume: bool = False) -> dict:
     manifest = create_run_manifest(config, target, scope_text=scope_text)
     out = Path(workspace) / "run_manifest.json"
-    try:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    if resume:
+        previous = json.loads(out.read_text(encoding="utf-8"))
+        if previous.get("target") != target or not previous.get("run_id"):
+            raise ValueError("resume requires the original target run manifest")
+        manifest["run_id"] = previous["run_id"]
+        manifest["resumed_from_input_digest"] = previous.get("input_digest")
+    from .tool_installation import _atomic
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _atomic(out, manifest)
     return manifest
 
 

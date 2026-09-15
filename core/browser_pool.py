@@ -56,3 +56,29 @@ async def launch_chromium(pw, *, headless: bool = True, **kwargs):
                 headless=True, executable_path=pw.chromium.executable_path,
                 **kwargs)
         raise
+
+
+@asynccontextmanager
+async def managed_playwright():
+    """Let the driver finish teardown even when a scanner deadline cancels its task."""
+    from playwright.async_api import async_playwright
+    manager = async_playwright()
+    started = asyncio.create_task(manager.__aenter__())
+    try:
+        pw = await asyncio.shield(started)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.wait_for(asyncio.shield(started), 15)
+        finally:
+            stop = asyncio.create_task(manager.__aexit__(None, None, None))
+            await asyncio.wait_for(asyncio.shield(stop), 15)
+        raise
+    try:
+        yield pw
+    finally:
+        stop = asyncio.create_task(manager.__aexit__(None, None, None))
+        try:
+            await asyncio.wait_for(asyncio.shield(stop), 15)
+        except asyncio.CancelledError:
+            await asyncio.wait_for(asyncio.shield(stop), 15)
+            raise

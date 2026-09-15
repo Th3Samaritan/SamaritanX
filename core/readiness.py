@@ -91,7 +91,12 @@ def _check_database(db_path: str) -> dict:
 def _check_browser(config: dict) -> dict:
     """Import-level + executable-path check only — no launch, no network."""
     try:
-        from playwright.async_api import async_playwright  # noqa: F401
+        from playwright.async_api import BrowserContext, async_playwright  # noqa: F401
+        if not all(callable(getattr(BrowserContext, name, None))
+                   for name in ("route", "route_web_socket")):
+            return {"capability": "browser_interception", "status": "unavailable",
+                    "detail": "playwright lacks required HTTP/WebSocket routing APIs",
+                    "affects": "all managed browser operations"}
     except Exception as exc:
         return {"capability": "browser_interception", "status": "missing",
                 "detail": f"playwright import failed: {exc}",

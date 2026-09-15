@@ -59,7 +59,7 @@ REASON_CODES = {
 def engine_version():
     root = Path(__file__).resolve().parent.parent
     digest = hashlib.sha256()
-    for folder in ("core", "scanners", "agents"):
+    for folder in ("core", "scanners", "agents", "assessments"):
         for path in sorted((root / folder).glob("*.py")):
             digest.update(str(path.relative_to(root)).encode())
             digest.update(path.read_bytes())

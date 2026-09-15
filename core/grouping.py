@@ -41,8 +41,13 @@ def _origin(url: str) -> str:
 
 def _identity(finding: dict) -> str:
     meta = finding.get("metadata") or {}
-    return str(meta.get("identity") or meta.get("session")
-               or meta.get("session_a") or "anonymous")
+    fields = ("identity", "session", "session_a", "session_b", "owner", "viewer",
+              "tenant", "tenant_a", "tenant_b", "owner_tenant", "viewer_tenant",
+              "role", "owner_role", "viewer_role", "actor")
+    boundary = {key: meta[key] for key in fields if meta.get(key) is not None}
+    if not boundary and (finding.get("category") or "").lower() in {"idor", "authz", "bola"}:
+        boundary = {"unknown_boundary_finding": finding.get("id", id(finding))}
+    return json.dumps(boundary, sort_keys=True, default=str) if boundary else "anonymous"
 
 
 def _proof(finding: dict) -> str:

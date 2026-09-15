@@ -2,6 +2,8 @@
 
 Updated: 2026-09-11
 
+Audit update (2026-09-14): the eight reproduced defects have been repaired and regression-tested. See [REPAIR_IMPLEMENTATION_PLAN.md](REPAIR_IMPLEMENTATION_PLAN.md) for changes and validation results. The remaining versioned-installation, scheduling, durable-budget, HTTP/2 and resource-gate work is now implemented; hosted CI execution remains unverified.
+
 ## 1. Objective and scope
 
 Make scanner regression coverage explicit, make supported external tools observable through the managed transport, and enable those adapters with reproducible local validation.
@@ -210,8 +212,8 @@ Subfinder's provider response is emulated; this does not establish that a real p
 Reproduction commands, from the repository root on Windows AMD64:
 
 ```powershell
-python -m bench.install_smoke_tools
-python -m bench.install_smoke_tools --templates-only
+python -m bench.install_smoke_tools --version "ffuf=<tag>" --version "nuclei=<tag>" --version "subfinder=<tag>"
+python -m bench.install_smoke_tools --templates-only --template-version "<tag>" --template-sha256 "<sha256>"
 python -m bench.adapter_smoke
 ```
 
